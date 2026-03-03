@@ -189,8 +189,8 @@
                             Margin="0,0,0,8"
                             ToolTip="Open or paste an execution plan (independent of any server)">
                         <StackPanel Orientation="Horizontal">
-                            <!-- <TextBlock Text="&#xE9F5;" FontFamily="Segoe MDL2 Assets" FontSize="12" VerticalAlignment="Center" Margin="0,0,6,0"/> -->
-                            <TextBlock Text="Open External Plan" VerticalAlignment="Center"/>
+                            <TextBlock Text="&#x1F50D;" FontSize="12" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                            <TextBlock Text="Open Plan Viewer" VerticalAlignment="Center"/>
                         </StackPanel>
                     </Button>
                     <Separator Margin="0,0,0,8"/>
