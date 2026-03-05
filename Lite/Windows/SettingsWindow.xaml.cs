@@ -117,10 +117,12 @@ public partial class SettingsWindow : Window
         SaveCsvSeparator();
         SaveColorTheme();
         SaveTimeDisplayMode();
-        SaveAlertSettings();
+        bool alertsValid = SaveAlertSettings();
         SaveSmtpSettings();
 
         _saved = true;
+
+        if (!alertsValid) return;
 
         var message = mcpChanged
             ? "Settings saved. MCP changes take effect after restarting the application."
@@ -450,7 +452,7 @@ public partial class SettingsWindow : Window
         UpdateAlertControlStates();
     }
 
-    private void SaveAlertSettings()
+    private bool SaveAlertSettings()
     {
         App.MinimizeToTray = MinimizeToTrayCheckBox.IsChecked == true;
         App.AlertsEnabled = AlertsEnabledCheckBox.IsChecked == true;
@@ -494,8 +496,10 @@ public partial class SettingsWindow : Window
         if (validationErrors.Count > 0)
         {
             MessageBox.Show(
+                "Some alert settings have invalid values and were not changed:\n\n" +
                 string.Join("\n", validationErrors),
                 "Settings", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return false;
         }
 
         var settingsPath = Path.Combine(App.ConfigDirectory, "settings.json");
@@ -544,6 +548,7 @@ public partial class SettingsWindow : Window
         {
             AppLogger.Error("Settings", $"Failed to save alert settings: {ex.Message}");
         }
+        return true;
     }
 
     private void AlertsEnabledCheckBox_Changed(object sender, RoutedEventArgs e)

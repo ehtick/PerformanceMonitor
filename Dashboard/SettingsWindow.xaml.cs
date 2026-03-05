@@ -632,6 +632,7 @@ namespace PerformanceMonitorDashboard
                     "Some alert thresholds have invalid values and were not changed:\n\n" +
                     string.Join("\n", validationErrors),
                     "Validation", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
             }
 
             // Save SMTP email settings
