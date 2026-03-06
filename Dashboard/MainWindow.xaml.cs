@@ -188,7 +188,7 @@ namespace PerformanceMonitorDashboard
             }
         }
 
-        private void StartMcpServerIfEnabled()
+        private async void StartMcpServerIfEnabled()
         {
             var prefs = _preferencesService.GetPreferences();
             if (!prefs.McpEnabled)
@@ -198,6 +198,13 @@ namespace PerformanceMonitorDashboard
 
             try
             {
+                bool portInUse = await PortUtilityService.IsTcpPortListeningAsync(prefs.McpPort);
+                if (portInUse)
+                {
+                    Logger.Error($"[MCP] Port {prefs.McpPort} is already in use — MCP server not started");
+                    return;
+                }
+
                 _mcpHostService = new McpHostService(_serverManager, _credentialService, prefs.McpPort);
                 _mcpCts = new CancellationTokenSource();
                 _ = _mcpHostService.StartAsync(_mcpCts.Token);

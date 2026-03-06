@@ -129,8 +129,16 @@ public partial class MainWindow : Window
             var mcpSettings = McpSettings.Load(App.ConfigDirectory);
             if (mcpSettings.Enabled)
             {
-                _mcpService = new McpHostService(_dataService, _serverManager, mcpSettings.Port);
-                _ = _mcpService.StartAsync(_backgroundCts!.Token);
+                bool portInUse = await PortUtilityService.IsTcpPortListeningAsync(mcpSettings.Port);
+                if (portInUse)
+                {
+                    AppLogger.Error("MCP", $"Port {mcpSettings.Port} is already in use — MCP server not started");
+                }
+                else
+                {
+                    _mcpService = new McpHostService(_dataService, _serverManager, mcpSettings.Port);
+                    _ = _mcpService.StartAsync(_backgroundCts!.Token);
+                }
             }
 
             // Load servers

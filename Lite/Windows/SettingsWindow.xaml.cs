@@ -10,6 +10,7 @@ using System;
 using System.IO;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using PerformanceMonitorLite.Mcp;
@@ -149,6 +150,18 @@ public partial class SettingsWindow : Window
             var oldPort = root["mcp_port"]?.GetValue<int>() ?? 5151;
             var newEnabled = McpEnabledCheckBox.IsChecked == true;
             int.TryParse(McpPortTextBox.Text, out var newPort);
+
+            if (newEnabled && newPort != oldPort)
+            {
+                bool inUse = Task.Run(() => PortUtilityService.IsTcpPortListeningAsync(newPort)).GetAwaiter().GetResult();
+                if (inUse)
+                {
+                    MessageBox.Show(
+                        $"Port {newPort} is already in use. Choose a different port for the MCP server.",
+                        "Port Conflict", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return false;
+                }
+            }
 
             root["mcp_enabled"] = newEnabled;
 

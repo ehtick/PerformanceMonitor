@@ -8,6 +8,7 @@ using System;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using PerformanceMonitorDashboard.Helpers;
@@ -641,6 +642,17 @@ namespace PerformanceMonitorDashboard
             prefs.McpEnabled = McpEnabledCheckBox.IsChecked == true;
             if (int.TryParse(McpPortTextBox.Text, out int mcpPort) && mcpPort > 0 && mcpPort <= 65535)
             {
+                if (prefs.McpEnabled && mcpPort != prefs.McpPort)
+                {
+                    bool inUse = Task.Run(() => PortUtilityService.IsTcpPortListeningAsync(mcpPort)).GetAwaiter().GetResult();
+                    if (inUse)
+                    {
+                        MessageBox.Show(
+                            $"Port {mcpPort} is already in use. Choose a different port for the MCP server.",
+                            "Port Conflict", MessageBoxButton.OK, MessageBoxImage.Warning);
+                        return;
+                    }
+                }
                 prefs.McpPort = mcpPort;
             }
 
