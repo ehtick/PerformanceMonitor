@@ -9,6 +9,8 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using PerformanceMonitorDashboard.Helpers;
@@ -475,6 +477,20 @@ namespace PerformanceMonitorDashboard
             McpPortTextBox.IsEnabled = McpEnabledCheckBox.IsChecked == true;
         }
 
+        private async void AutoPortButton_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                int port = await PortUtilityService.GetFreeTcpPortAsync();
+                McpPortTextBox.Text = port.ToString();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Could not find an available port: {ex.Message}",
+                    "Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        }
+
         private void UpdateMcpStatus(Models.UserPreferences prefs)
         {
             if (prefs.McpEnabled)
@@ -498,7 +514,7 @@ namespace PerformanceMonitorDashboard
             McpStatusText.Text = "Copied to clipboard!";
         }
 
-        private void OkButton_Click(object sender, RoutedEventArgs e)
+        private async void OkButton_Click(object sender, RoutedEventArgs e)
         {
             var prefs = _preferencesService.GetPreferences();
 
@@ -654,17 +670,24 @@ namespace PerformanceMonitorDashboard
             }
 
             // Save MCP server settings
+            bool mcpWasEnabled = prefs.McpEnabled;
             prefs.McpEnabled = McpEnabledCheckBox.IsChecked == true;
-            if (int.TryParse(McpPortTextBox.Text, out int mcpPort) && mcpPort > 0 && mcpPort <= 65535)
+            if (int.TryParse(McpPortTextBox.Text, out int mcpPort) && mcpPort >= 1024 && mcpPort <= IPEndPoint.MaxPort)
             {
+                if (prefs.McpEnabled && (mcpPort != prefs.McpPort || !mcpWasEnabled))
+                {
+                    // CanBindTcpPortAsync attempts an actual bind, which is more reliable
+                    // than checking listeners (TOCTOU is still possible but less likely)
+                    bool canBind = await PortUtilityService.CanBindTcpPortAsync(mcpPort, IPAddress.Loopback);
+                    if (!canBind)
+                    {
+                        validationErrors.Add($"Port {mcpPort} is already in use. Choose a different port for the MCP server.");
+                    }
+                }
                 prefs.McpPort = mcpPort;
             }
             else
-                validationErrors.Add("MCP port failed validation - must be a valid TCP port number.");
-
-            _preferencesService.SavePreferences(prefs);
-
-            _saved = true;
+                validationErrors.Add($"MCP port must be between 1024 and {IPEndPoint.MaxPort}.\nPorts 0–1023 are well-known privileged ports reserved by the operating system.");
 
             if (validationErrors.Count > 0)
             {
@@ -675,6 +698,8 @@ namespace PerformanceMonitorDashboard
             }
             else
             {
+                _preferencesService.SavePreferences(prefs);
+                _saved = true;
                 DialogResult = true;
                 Close();
             }

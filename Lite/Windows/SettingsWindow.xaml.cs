@@ -9,8 +9,10 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using PerformanceMonitorLite.Mcp;
@@ -162,10 +164,10 @@ public partial class SettingsWindow : Window
         UpdateCollectionStatus();
     }
 
-    private void SaveButton_Click(object sender, RoutedEventArgs e)
+    private async void SaveButton_Click(object sender, RoutedEventArgs e)
     {
         _scheduleManager.SaveSchedules();
-        var (mcpChanged, mcpValid) = SaveMcpSettings();
+        var (mcpChanged, mcpValid) = await SaveMcpSettingsAsync();
         SaveDefaultTimeRange();
         SaveConnectionTimeout();
         SaveCsvSeparator();
@@ -175,6 +177,7 @@ public partial class SettingsWindow : Window
         SaveSmtpSettings();
 
         _saved = true;
+        if (mcpChanged) McpSettingsChanged = true;
 
         if (!alertsValid || !mcpValid) return;
 
@@ -184,7 +187,7 @@ public partial class SettingsWindow : Window
         MessageBox.Show(message, "Settings", MessageBoxButton.OK, MessageBoxImage.Information);
     }
 
-    private (bool Changed, bool Valid) SaveMcpSettings()
+    private async Task<(bool Changed, bool Valid)> SaveMcpSettingsAsync()
     {
         var settingsPath = Path.Combine(App.ConfigDirectory, "settings.json");
 
@@ -206,10 +209,32 @@ public partial class SettingsWindow : Window
             var newEnabled = McpEnabledCheckBox.IsChecked == true;
             int.TryParse(McpPortTextBox.Text, out var newPort);
 
+            if (newEnabled && (newPort != oldPort || !oldEnabled))
+            {
+                if (newPort < 1024 || newPort > IPEndPoint.MaxPort)
+                {
+                    MessageBox.Show(
+                        $"MCP port must be between 1024 and {IPEndPoint.MaxPort}.\nPorts 0–1023 are well-known privileged ports reserved by the operating system.",
+                        "Validation", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return (true, false);
+                }
+
+                // CanBindTcpPortAsync attempts an actual bind, which is more reliable
+                // than checking listeners (TOCTOU is still possible but less likely)
+                bool canBind = await PortUtilityService.CanBindTcpPortAsync(newPort, IPAddress.Loopback);
+                if (!canBind)
+                {
+                    MessageBox.Show(
+                        $"Port {newPort} is already in use. Choose a different port for the MCP server.",
+                        "Port Conflict", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return (true, false);
+                }
+            }
+
             root["mcp_enabled"] = newEnabled;
 
             bool portValid = true;
-            if (newPort > 0 && newPort < 65536)
+            if (newPort >= 1024 && newPort <= IPEndPoint.MaxPort)
             {
                 root["mcp_port"] = newPort;
             }
@@ -298,6 +323,20 @@ public partial class SettingsWindow : Window
         McpStatusText.Text = "Copied to clipboard!";
     }
 
+    private async void AutoPortButton_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            int port = await PortUtilityService.GetFreeTcpPortAsync();
+            McpPortTextBox.Text = port.ToString();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Could not find an available port: {ex.Message}",
+                "Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
     private void LoadConnectionTimeout()
     {
         ConnectionTimeoutBox.Text = App.ConnectionTimeoutSeconds.ToString();
@@ -384,6 +423,7 @@ public partial class SettingsWindow : Window
     private bool _isLoadingTheme;
     private readonly string _originalTheme = Helpers.ThemeManager.CurrentTheme;
     private bool _saved;
+    public bool McpSettingsChanged { get; private set; }
 
     private void ColorThemeCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
