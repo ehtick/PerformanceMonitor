@@ -332,7 +332,7 @@ Both editions include a real-time alert engine that monitors for performance iss
 
 All thresholds are configurable in Settings.
 
-**Poison wait types** monitored: `THREADPOOL` (worker thread exhaustion), `RESOURCE_SEMAPHORE` (memory grant pressure), and `RESOURCE_SEMAPHORE_QUERY_COMPILE` (compilation memory pressure). These waits indicate severe resource starvation and should never occur under normal operation.
+**Poison wait types** monitored: [`THREADPOOL`](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-os-wait-stats-transact-sql#threadpool) (worker thread exhaustion), [`RESOURCE_SEMAPHORE`](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-os-wait-stats-transact-sql#resource_semaphore) (memory grant pressure), and [`RESOURCE_SEMAPHORE_QUERY_COMPILE`](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-os-wait-stats-transact-sql#resource_semaphore_query_compile) (compilation memory pressure). These waits indicate severe resource starvation and should never occur under normal operation.
 
 ### Notification Channels
 
