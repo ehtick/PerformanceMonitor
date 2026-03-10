@@ -323,10 +323,16 @@ Both editions include a real-time alert engine that monitors for performance iss
 |---|---|---|
 | **Blocking** | 30 seconds (Full), 5 seconds (Lite) | Fires when the longest blocked session exceeds the threshold |
 | **Deadlocks** | 1 | Fires when new deadlocks are detected since the last check |
+| **Poison waits** | 100 ms avg | Fires when any poison wait type exceeds the average-ms-per-wait threshold |
+| **Long-running queries** | 5 minutes | Fires when any query exceeds the elapsed-time threshold |
+| **TempDB space** | 80% | Fires when TempDB usage exceeds the percentage threshold |
+| **Long-running agent jobs** | 3× average | Fires when a job's current duration exceeds a multiple of its historical average |
 | **High CPU** | 90% (Full), 80% (Lite) | Fires when total CPU (SQL + other) exceeds the threshold |
 | **Connection changes** | N/A | Fires when a monitored server goes offline or comes back online |
 
 All thresholds are configurable in Settings.
+
+**Poison wait types** monitored: `THREADPOOL` (worker thread exhaustion), `RESOURCE_SEMAPHORE` (memory grant pressure), and `RESOURCE_SEMAPHORE_QUERY_COMPILE` (compilation memory pressure). These waits indicate severe resource starvation and should never occur under normal operation.
 
 ### Notification Channels
 
