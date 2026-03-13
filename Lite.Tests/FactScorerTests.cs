@@ -159,11 +159,10 @@ public class FactScorerTests : IDisposable
         var cx = facts.First(f => f.Key == "CXPACKET");
 
         // CXPACKET base ≈ 1.0 (combined CX fraction > threshold)
-        // SOS at 41.7% > 25% (+0.3), THREADPOOL noise (50s < 1h floor, no boost),
-        // CTFP=5 (+0.3), MAXDOP=0 (+0.2)
-        // severity = 1.0 * (1.0 + 0.3 + 0.3 + 0.2) = 1.8
+        // SOS at 41.7% > 25% (+0.3), CTFP=5 (+0.3), MAXDOP=0 (+0.2),
+        // CPU at 90% (+0.2) → total boost ≥ 1.0, hits 2.0 cap
         Assert.True(cx.Severity > cx.BaseSeverity, "CXPACKET should be amplified by SOS + config");
-        Assert.InRange(cx.Severity, 1.7, 1.9);
+        Assert.InRange(cx.Severity, 1.7, 2.0);
 
         var sosAmp = cx.AmplifierResults.First(a => a.Description.Contains("SOS_SCHEDULER_YIELD"));
         Assert.True(sosAmp.Matched);

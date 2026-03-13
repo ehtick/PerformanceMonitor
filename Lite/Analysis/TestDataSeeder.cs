@@ -85,6 +85,21 @@ public class TestDataSeeder
         await SeedMemoryStatsAsync(totalPhysicalMb: 65_536, bufferPoolMb: 56_000, targetMb: 57_344);
         await SeedFileSizeAsync(totalDataSizeMb: 512_000); // 500GB data on 64GB RAM
         await SeedServerEditionAsync(edition: 2, majorVersion: 16); // Standard 2022
+
+        // Corroborating context from new collectors
+        await SeedCpuUtilizationAsync(85, 5);
+        await SeedIoLatencyAsync(totalReads: 1_000_000, stallReadMs: 35_000_000, // 35ms avg read
+                                  totalWrites: 200_000, stallWriteMs: 2_000_000); // 10ms avg write
+        await SeedPerfmonAsync(ple: 120); // Low PLE — buffer pool under pressure
+        await SeedMemoryClerksAsync(new Dictionary<string, double>
+        {
+            ["MEMORYCLERK_SQLBUFFERPOOL"] = 54_000,
+            ["MEMORYCLERK_SQLQUERYPLAN"] = 1_500,
+        });
+        await SeedTempDbAsync(reservedMb: 600, unallocatedMb: 400); // 60% — moderate
+        await SeedMemoryGrantsAsync(maxWaiters: 3);
+        await SeedServerPropertiesAsync(cpuCount: 16, htRatio: 2, physicalMemMb: 65_536);
+        await SeedDiskSpaceAsync(("D:\\", 1_000_000, 150_000)); // 15% free
     }
 
     /// <summary>
@@ -116,6 +131,13 @@ public class TestDataSeeder
         await SeedMemoryStatsAsync(totalPhysicalMb: 131_072, bufferPoolMb: 122_880, targetMb: 122_880);
         await SeedFileSizeAsync(totalDataSizeMb: 204_800); // 200GB
         await SeedServerEditionAsync(edition: 3, majorVersion: 16); // Enterprise 2022
+
+        // Corroborating context: high CPU, high DOP queries
+        await SeedCpuUtilizationAsync(90, 5);
+        await SeedQueryStatsAsync(totalSpills: 500, highDopQueryCount: 15);
+        await SeedServerPropertiesAsync(cpuCount: 32, htRatio: 2, physicalMemMb: 131_072,
+            edition: "Enterprise Edition");
+        await SeedPerfmonAsync(ple: 800);
     }
 
     /// <summary>
@@ -143,6 +165,19 @@ public class TestDataSeeder
         await SeedMemoryStatsAsync(totalPhysicalMb: 131_072, bufferPoolMb: 100_000, targetMb: 122_880);
         await SeedFileSizeAsync(totalDataSizeMb: 102_400); // 100GB
         await SeedServerEditionAsync(edition: 3, majorVersion: 16); // Enterprise 2022
+
+        // Clean server context — all healthy values (very low to keep severities near zero)
+        await SeedCpuUtilizationAsync(5, 3);
+        await SeedIoLatencyAsync(totalReads: 500_000, stallReadMs: 500_000, // 1ms avg read
+                                  totalWrites: 200_000, stallWriteMs: 100_000); // 0.5ms avg write
+        await SeedTempDbAsync(reservedMb: 100, unallocatedMb: 900); // 10% — healthy
+        await SeedPerfmonAsync(ple: 5_000); // Excellent PLE
+        await SeedDatabaseConfigAsync(
+            ("AppDB1", true, false, false, "CHECKSUM"),
+            ("AppDB2", true, false, false, "CHECKSUM"));
+        await SeedServerPropertiesAsync(cpuCount: 16, htRatio: 2, physicalMemMb: 131_072,
+            edition: "Enterprise Edition");
+        await SeedDiskSpaceAsync(("D:\\", 2_000_000, 900_000)); // 45% free — healthy
     }
 
     /// <summary>
@@ -277,6 +312,12 @@ public class TestDataSeeder
         await SeedBlockingEventsAsync(40, avgWaitTimeMs: 20_000, sleepingBlockerCount: 3, distinctBlockers: 6);
         // 8 deadlocks (~2/hr) — reader/writer deadlocks (RCSI would eliminate)
         await SeedDeadlocksAsync(8);
+
+        // RCSI off on multiple databases — the key recommendation
+        await SeedDatabaseConfigAsync(
+            ("AppDB1", false, false, false, "CHECKSUM"),
+            ("AppDB2", false, false, false, "CHECKSUM"),
+            ("ReportDB", false, false, false, "CHECKSUM"));
     }
 
     /// <summary>
@@ -372,6 +413,14 @@ public class TestDataSeeder
         await SeedMemoryStatsAsync(totalPhysicalMb: 65_536, bufferPoolMb: 40_000, targetMb: 57_344);
         await SeedFileSizeAsync(totalDataSizeMb: 307_200); // 300GB
         await SeedServerEditionAsync(edition: 2, majorVersion: 16); // Standard 2022
+
+        // Cascade evidence: grant waiters + spills + I/O + low PLE
+        await SeedMemoryGrantsAsync(maxWaiters: 5, timeoutErrors: 3);
+        await SeedQueryStatsAsync(totalSpills: 2_000, highDopQueryCount: 5);
+        await SeedIoLatencyAsync(totalReads: 800_000, stallReadMs: 28_000_000, // 35ms avg read
+                                  totalWrites: 200_000, stallWriteMs: 3_000_000);
+        await SeedPerfmonAsync(ple: 200);
+        await SeedServerPropertiesAsync(cpuCount: 16, htRatio: 2, physicalMemMb: 65_536);
     }
 
     /// <summary>
@@ -419,6 +468,39 @@ public class TestDataSeeder
         await SeedMemoryStatsAsync(totalPhysicalMb: 65_536, bufferPoolMb: 58_000, targetMb: 65_536);
         await SeedFileSizeAsync(totalDataSizeMb: 1_024_000); // 1TB
         await SeedServerEditionAsync(edition: 2, majorVersion: 15); // Standard 2019
+
+        // New collectors — full coverage
+        await SeedCpuUtilizationAsync(95, 10); // 95% SQL + 10% other = pegged
+        await SeedIoLatencyAsync(totalReads: 2_000_000, stallReadMs: 100_000_000, // 50ms avg read
+                                  totalWrites: 500_000, stallWriteMs: 15_000_000); // 30ms avg write
+        await SeedTempDbAsync(reservedMb: 9_000, unallocatedMb: 1_000); // 90% full
+        await SeedMemoryGrantsAsync(maxWaiters: 8, maxGrantees: 5, timeoutErrors: 10, forcedGrants: 5);
+        await SeedQueryStatsAsync(totalSpills: 5_000, highDopQueryCount: 20);
+        await SeedPerfmonAsync(ple: 45); // Critically low PLE
+        await SeedMemoryClerksAsync(new Dictionary<string, double>
+        {
+            ["MEMORYCLERK_SQLBUFFERPOOL"] = 50_000,
+            ["MEMORYCLERK_SQLQUERYPLAN"] = 4_000,
+            ["MEMORYCLERK_SQLOPTIMIZER"] = 1_500,
+            ["CACHESTORE_OBJCP"] = 2_000,
+            ["CACHESTORE_SQLCP"] = 3_500,
+        });
+        await SeedDatabaseConfigAsync(
+            ("AppDB1", false, true, false, "NONE"),       // RCSI off, auto_shrink, bad page_verify
+            ("AppDB2", false, false, true, "CHECKSUM"),    // RCSI off, auto_close
+            ("AppDB3", true, false, false, "CHECKSUM"));   // OK
+        await SeedProcedureStatsAsync(distinctProcs: 25, totalExecs: 500_000, totalCpuUs: 50_000_000_000);
+        await SeedActiveQueriesAsync(longRunning: 8, blocked: 5, parallel: 6, maxElapsedMs: 300_000, maxDop: 16);
+        await SeedRunningJobsAsync(totalJobs: 5, runningLong: 3, maxPctAvg: 400, maxDurationSeconds: 10_800);
+        await SeedSessionStatsAsync(
+            ("WebApp", 200, 15, 180),
+            ("ReportingService", 50, 8, 40),
+            ("SQLAgent", 10, 3, 7));
+        await SeedTraceFlagsAsync(1118, 3226, 2371);
+        await SeedServerPropertiesAsync(cpuCount: 16, htRatio: 2, physicalMemMb: 65_536);
+        await SeedDiskSpaceAsync(
+            ("C:\\", 500_000, 35_000),   // 7% free — critical
+            ("D:\\", 2_000_000, 140_000)); // 7% free — critical
     }
 
     /// <summary>
@@ -433,7 +515,8 @@ public class TestDataSeeder
             "query_stats", "procedure_stats", "query_store_stats",
             "query_snapshots", "tempdb_stats", "perfmon_stats",
             "blocked_process_reports", "deadlocks", "memory_grant_stats",
-            "waiting_tasks", "servers"
+            "waiting_tasks", "servers", "running_jobs", "session_stats",
+            "trace_flags", "server_properties", "database_size_stats"
         };
 
         using var readLock = _duckDb.AcquireReadLock();
@@ -726,6 +809,590 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)";
             cmd.Parameters.Add(new DuckDBParameter { Value = value });
             cmd.Parameters.Add(new DuckDBParameter { Value = true });
             cmd.Parameters.Add(new DuckDBParameter { Value = true });
+
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    /// <summary>
+    /// Seeds cpu_utilization_stats across 16 collection points.
+    /// </summary>
+    internal async Task SeedCpuUtilizationAsync(int avgSqlCpu, int avgOtherCpu)
+    {
+        using var readLock = _duckDb.AcquireReadLock();
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync();
+
+        for (var i = 0; i < 16; i++)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO cpu_utilization_stats
+    (collection_id, collection_time, server_id, server_name,
+     sample_time, sqlserver_cpu_utilization, other_process_cpu_utilization)
+VALUES ($1, $2, $3, $4, $5, $6, $7)";
+
+            var t = TestPeriodStart.AddMinutes(i * 15);
+            cmd.Parameters.Add(new DuckDBParameter { Value = _nextId-- });
+            cmd.Parameters.Add(new DuckDBParameter { Value = t });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerName });
+            cmd.Parameters.Add(new DuckDBParameter { Value = t });
+            cmd.Parameters.Add(new DuckDBParameter { Value = avgSqlCpu });
+            cmd.Parameters.Add(new DuckDBParameter { Value = avgOtherCpu });
+
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    /// <summary>
+    /// Seeds file_io_stats with I/O latency delta data across 16 collection points.
+    /// totalReads/totalWrites are the total I/O count over the period;
+    /// stallReadMs/stallWriteMs are total stall times.
+    /// Average latency = stallMs / ioCount.
+    /// </summary>
+    internal async Task SeedIoLatencyAsync(long totalReads, long stallReadMs,
+        long totalWrites, long stallWriteMs)
+    {
+        using var readLock = _duckDb.AcquireReadLock();
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync();
+
+        var deltaReads = totalReads / 16;
+        var deltaStallRead = stallReadMs / 16;
+        var deltaWrites = totalWrites / 16;
+        var deltaStallWrite = stallWriteMs / 16;
+
+        for (var i = 0; i < 16; i++)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO file_io_stats
+    (collection_id, collection_time, server_id, server_name,
+     database_name, file_name, file_type, size_mb,
+     num_of_reads, num_of_writes, read_bytes, write_bytes,
+     io_stall_read_ms, io_stall_write_ms,
+     delta_reads, delta_writes, delta_stall_read_ms, delta_stall_write_ms)
+VALUES ($1, $2, $3, $4, $5, $6, $7, 0,
+        $8, $9, 0, 0, $10, $11, $12, $13, $14, $15)";
+
+            var t = TestPeriodStart.AddMinutes(i * 15);
+            cmd.Parameters.Add(new DuckDBParameter { Value = _nextId-- });
+            cmd.Parameters.Add(new DuckDBParameter { Value = t });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerName });
+            cmd.Parameters.Add(new DuckDBParameter { Value = "UserDB" });
+            cmd.Parameters.Add(new DuckDBParameter { Value = "UserDB.mdf" });
+            cmd.Parameters.Add(new DuckDBParameter { Value = "ROWS" });
+            cmd.Parameters.Add(new DuckDBParameter { Value = (long)(deltaReads * (i + 1)) }); // cumulative
+            cmd.Parameters.Add(new DuckDBParameter { Value = (long)(deltaWrites * (i + 1)) });
+            cmd.Parameters.Add(new DuckDBParameter { Value = (long)(deltaStallRead * (i + 1)) });
+            cmd.Parameters.Add(new DuckDBParameter { Value = (long)(deltaStallWrite * (i + 1)) });
+            cmd.Parameters.Add(new DuckDBParameter { Value = deltaReads });
+            cmd.Parameters.Add(new DuckDBParameter { Value = deltaWrites });
+            cmd.Parameters.Add(new DuckDBParameter { Value = deltaStallRead });
+            cmd.Parameters.Add(new DuckDBParameter { Value = deltaStallWrite });
+
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    /// <summary>
+    /// Seeds tempdb_stats across 16 collection points.
+    /// </summary>
+    internal async Task SeedTempDbAsync(double reservedMb, double unallocatedMb,
+        double userObjectMb = 0, double internalObjectMb = 0, double versionStoreMb = 0)
+    {
+        if (userObjectMb == 0) userObjectMb = reservedMb * 0.6;
+        if (internalObjectMb == 0) internalObjectMb = reservedMb * 0.3;
+        if (versionStoreMb == 0) versionStoreMb = reservedMb * 0.1;
+
+        using var readLock = _duckDb.AcquireReadLock();
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync();
+
+        for (var i = 0; i < 16; i++)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO tempdb_stats
+    (collection_id, collection_time, server_id, server_name,
+     user_object_reserved_mb, internal_object_reserved_mb,
+     version_store_reserved_mb, total_reserved_mb, unallocated_mb)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)";
+
+            var t = TestPeriodStart.AddMinutes(i * 15);
+            cmd.Parameters.Add(new DuckDBParameter { Value = _nextId-- });
+            cmd.Parameters.Add(new DuckDBParameter { Value = t });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerName });
+            cmd.Parameters.Add(new DuckDBParameter { Value = userObjectMb });
+            cmd.Parameters.Add(new DuckDBParameter { Value = internalObjectMb });
+            cmd.Parameters.Add(new DuckDBParameter { Value = versionStoreMb });
+            cmd.Parameters.Add(new DuckDBParameter { Value = reservedMb });
+            cmd.Parameters.Add(new DuckDBParameter { Value = unallocatedMb });
+
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    /// <summary>
+    /// Seeds memory_grant_stats across 16 collection points.
+    /// </summary>
+    internal async Task SeedMemoryGrantsAsync(int maxWaiters, int maxGrantees = 10,
+        long timeoutErrors = 0, long forcedGrants = 0)
+    {
+        using var readLock = _duckDb.AcquireReadLock();
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync();
+
+        var timeoutDeltaPerPoint = timeoutErrors / 16;
+        var forcedDeltaPerPoint = forcedGrants / 16;
+
+        for (var i = 0; i < 16; i++)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO memory_grant_stats
+    (collection_id, collection_time, server_id, server_name,
+     resource_semaphore_id, waiter_count, grantee_count,
+     timeout_error_count_delta, forced_grant_count_delta)
+VALUES ($1, $2, $3, $4, 0, $5, $6, $7, $8)";
+
+            var t = TestPeriodStart.AddMinutes(i * 15);
+            cmd.Parameters.Add(new DuckDBParameter { Value = _nextId-- });
+            cmd.Parameters.Add(new DuckDBParameter { Value = t });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerName });
+            cmd.Parameters.Add(new DuckDBParameter { Value = maxWaiters });
+            cmd.Parameters.Add(new DuckDBParameter { Value = maxGrantees });
+            cmd.Parameters.Add(new DuckDBParameter { Value = timeoutDeltaPerPoint });
+            cmd.Parameters.Add(new DuckDBParameter { Value = forcedDeltaPerPoint });
+
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    /// <summary>
+    /// Seeds query_stats with aggregate spill and DOP data.
+    /// Creates individual query entries that the collector aggregates.
+    /// </summary>
+    internal async Task SeedQueryStatsAsync(long totalSpills, int highDopQueryCount,
+        long totalExecutions = 10_000)
+    {
+        using var readLock = _duckDb.AcquireReadLock();
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync();
+
+        // Spilling queries
+        var spillingQueries = Math.Max(1, (int)(totalSpills / 100)); // ~100 spills per query
+        var spillsPerQuery = totalSpills / spillingQueries;
+        var execsPerQuery = totalExecutions / (spillingQueries + highDopQueryCount + 5);
+
+        var totalQueries = spillingQueries + highDopQueryCount;
+        var intervalMinutes = 240.0 / Math.Max(totalQueries, 1);
+
+        for (var i = 0; i < spillingQueries; i++)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO query_stats
+    (collection_id, collection_time, server_id, server_name,
+     query_hash, delta_spills, max_dop, delta_execution_count,
+     delta_worker_time, delta_elapsed_time)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
+
+            var t = TestPeriodStart.AddMinutes(i * intervalMinutes);
+            cmd.Parameters.Add(new DuckDBParameter { Value = _nextId-- });
+            cmd.Parameters.Add(new DuckDBParameter { Value = t });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerName });
+            cmd.Parameters.Add(new DuckDBParameter { Value = $"0xSPILL{i:D4}" });
+            cmd.Parameters.Add(new DuckDBParameter { Value = spillsPerQuery });
+            cmd.Parameters.Add(new DuckDBParameter { Value = 4 }); // normal DOP
+            cmd.Parameters.Add(new DuckDBParameter { Value = execsPerQuery });
+            cmd.Parameters.Add(new DuckDBParameter { Value = execsPerQuery * 50_000L }); // 50ms avg CPU
+            cmd.Parameters.Add(new DuckDBParameter { Value = execsPerQuery * 100_000L });
+
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        // High-DOP queries
+        for (var i = 0; i < highDopQueryCount; i++)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO query_stats
+    (collection_id, collection_time, server_id, server_name,
+     query_hash, delta_spills, max_dop, delta_execution_count,
+     delta_worker_time, delta_elapsed_time)
+VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9)";
+
+            var t = TestPeriodStart.AddMinutes((spillingQueries + i) * intervalMinutes);
+            cmd.Parameters.Add(new DuckDBParameter { Value = _nextId-- });
+            cmd.Parameters.Add(new DuckDBParameter { Value = t });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerName });
+            cmd.Parameters.Add(new DuckDBParameter { Value = $"0xHDOP{i:D4}" });
+            cmd.Parameters.Add(new DuckDBParameter { Value = 16 + (i % 16) }); // DOP > 8
+            cmd.Parameters.Add(new DuckDBParameter { Value = execsPerQuery });
+            cmd.Parameters.Add(new DuckDBParameter { Value = execsPerQuery * 200_000L });
+            cmd.Parameters.Add(new DuckDBParameter { Value = execsPerQuery * 50_000L });
+
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    /// <summary>
+    /// Seeds perfmon_stats with key counters. PLE uses cntr_value (absolute);
+    /// rate counters use delta_cntr_value.
+    /// </summary>
+    internal async Task SeedPerfmonAsync(long ple, long batchReqSec = 500,
+        long compilationsSec = 50, long recompilationsSec = 5)
+    {
+        using var readLock = _duckDb.AcquireReadLock();
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync();
+
+        var counters = new (string name, long cntrValue, long deltaValue)[]
+        {
+            ("Page life expectancy", ple, 0),
+            ("Batch Requests/sec", batchReqSec * 60, batchReqSec), // cntr = cumulative, delta = rate
+            ("SQL Compilations/sec", compilationsSec * 60, compilationsSec),
+            ("SQL Re-Compilations/sec", recompilationsSec * 60, recompilationsSec)
+        };
+
+        foreach (var (name, cntr, delta) in counters)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO perfmon_stats
+    (collection_id, collection_time, server_id, server_name,
+     object_name, counter_name, cntr_value, delta_cntr_value, sample_interval_seconds)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 60)";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = _nextId-- });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestPeriodEnd });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerName });
+            cmd.Parameters.Add(new DuckDBParameter { Value = "SQLServer:Buffer Manager" });
+            cmd.Parameters.Add(new DuckDBParameter { Value = name });
+            cmd.Parameters.Add(new DuckDBParameter { Value = cntr });
+            cmd.Parameters.Add(new DuckDBParameter { Value = delta });
+
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    /// <summary>
+    /// Seeds memory_clerks with clerk type → MB mappings.
+    /// </summary>
+    internal async Task SeedMemoryClerksAsync(Dictionary<string, double> clerks)
+    {
+        using var readLock = _duckDb.AcquireReadLock();
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync();
+
+        foreach (var (clerkType, memoryMb) in clerks)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO memory_clerks
+    (collection_id, collection_time, server_id, server_name, clerk_type, memory_mb)
+VALUES ($1, $2, $3, $4, $5, $6)";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = _nextId-- });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestPeriodEnd });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerName });
+            cmd.Parameters.Add(new DuckDBParameter { Value = clerkType });
+            cmd.Parameters.Add(new DuckDBParameter { Value = memoryMb });
+
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    /// <summary>
+    /// Seeds database_config with per-database configuration flags.
+    /// </summary>
+    internal async Task SeedDatabaseConfigAsync(
+        params (string dbName, bool rcsiOn, bool autoShrink, bool autoClose, string pageVerify)[] databases)
+    {
+        using var readLock = _duckDb.AcquireReadLock();
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync();
+
+        foreach (var (dbName, rcsiOn, autoShrink, autoClose, pageVerify) in databases)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO database_config
+    (config_id, capture_time, server_id, server_name, database_name,
+     recovery_model, is_auto_shrink_on, is_auto_close_on,
+     is_read_committed_snapshot_on, is_auto_create_stats_on,
+     is_auto_update_stats_on, page_verify_option, is_query_store_on)
+VALUES ($1, $2, $3, $4, $5, 'FULL', $6, $7, $8, true, true, $9, false)";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = _nextId-- });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestPeriodEnd });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerName });
+            cmd.Parameters.Add(new DuckDBParameter { Value = dbName });
+            cmd.Parameters.Add(new DuckDBParameter { Value = autoShrink });
+            cmd.Parameters.Add(new DuckDBParameter { Value = autoClose });
+            cmd.Parameters.Add(new DuckDBParameter { Value = rcsiOn });
+            cmd.Parameters.Add(new DuckDBParameter { Value = pageVerify });
+
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    /// <summary>
+    /// Seeds procedure_stats with aggregate execution data.
+    /// </summary>
+    internal async Task SeedProcedureStatsAsync(int distinctProcs, long totalExecs, long totalCpuUs)
+    {
+        using var readLock = _duckDb.AcquireReadLock();
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync();
+
+        var execsPerProc = totalExecs / distinctProcs;
+        var cpuPerProc = totalCpuUs / distinctProcs;
+
+        for (var i = 0; i < distinctProcs; i++)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO procedure_stats
+    (collection_id, collection_time, server_id, server_name,
+     database_name, schema_name, object_name,
+     delta_execution_count, delta_worker_time, delta_elapsed_time, delta_logical_reads)
+VALUES ($1, $2, $3, $4, $5, 'dbo', $6, $7, $8, $9, $10)";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = _nextId-- });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestPeriodEnd.AddMinutes(-i) });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerName });
+            cmd.Parameters.Add(new DuckDBParameter { Value = "UserDB" });
+            cmd.Parameters.Add(new DuckDBParameter { Value = $"usp_TestProc_{i}" });
+            cmd.Parameters.Add(new DuckDBParameter { Value = execsPerProc });
+            cmd.Parameters.Add(new DuckDBParameter { Value = cpuPerProc });
+            cmd.Parameters.Add(new DuckDBParameter { Value = cpuPerProc * 2 }); // elapsed ~2x CPU
+            cmd.Parameters.Add(new DuckDBParameter { Value = execsPerProc * 1000L }); // 1000 reads/exec
+
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    /// <summary>
+    /// Seeds query_snapshots (active queries) with snapshot data.
+    /// </summary>
+    internal async Task SeedActiveQueriesAsync(int longRunning, int blocked,
+        int parallel, long maxElapsedMs = 120_000, int maxDop = 8)
+    {
+        using var readLock = _duckDb.AcquireReadLock();
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync();
+
+        var total = longRunning + blocked + parallel + 5; // +5 short normal queries
+
+        for (var i = 0; i < total; i++)
+        {
+            var isLongRunning = i < longRunning;
+            var isBlocked = i >= longRunning && i < longRunning + blocked;
+            var isParallel = i >= longRunning + blocked && i < longRunning + blocked + parallel;
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO query_snapshots
+    (collection_id, collection_time, server_id, server_name,
+     session_id, total_elapsed_time_ms, blocking_session_id,
+     dop, status, cpu_time_ms)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
+
+            var t = TestPeriodStart.AddMinutes(i * 5);
+            cmd.Parameters.Add(new DuckDBParameter { Value = _nextId-- });
+            cmd.Parameters.Add(new DuckDBParameter { Value = t });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerName });
+            cmd.Parameters.Add(new DuckDBParameter { Value = 50 + i });
+            cmd.Parameters.Add(new DuckDBParameter { Value = isLongRunning ? maxElapsedMs : 5_000L });
+            cmd.Parameters.Add(new DuckDBParameter { Value = isBlocked ? 51 : 0 });
+            cmd.Parameters.Add(new DuckDBParameter { Value = isParallel ? maxDop : 1 });
+            cmd.Parameters.Add(new DuckDBParameter { Value = isBlocked ? "suspended" : "running" });
+            cmd.Parameters.Add(new DuckDBParameter { Value = isLongRunning ? maxElapsedMs / 2 : 2_000L });
+
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    /// <summary>
+    /// Seeds running_jobs with job execution data.
+    /// </summary>
+    internal async Task SeedRunningJobsAsync(int totalJobs, int runningLong,
+        double maxPctAvg = 300, long maxDurationSeconds = 7200)
+    {
+        using var readLock = _duckDb.AcquireReadLock();
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync();
+
+        for (var i = 0; i < totalJobs; i++)
+        {
+            var isLong = i < runningLong;
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO running_jobs
+    (collection_time, server_id, server_name, job_name, job_id,
+     job_enabled, start_time, current_duration_seconds,
+     avg_duration_seconds, p95_duration_seconds, successful_run_count,
+     is_running_long, percent_of_average)
+VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8, $9, 100, $10, $11)";
+
+            var t = TestPeriodEnd.AddMinutes(-10);
+            cmd.Parameters.Add(new DuckDBParameter { Value = t });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerName });
+            cmd.Parameters.Add(new DuckDBParameter { Value = $"Test Job {i}" });
+            cmd.Parameters.Add(new DuckDBParameter { Value = Guid.NewGuid().ToString() });
+            cmd.Parameters.Add(new DuckDBParameter { Value = t.AddSeconds(-(isLong ? maxDurationSeconds : 300)) });
+            cmd.Parameters.Add(new DuckDBParameter { Value = isLong ? maxDurationSeconds : 300L });
+            cmd.Parameters.Add(new DuckDBParameter { Value = isLong ? maxDurationSeconds / 3 : 300L }); // avg
+            cmd.Parameters.Add(new DuckDBParameter { Value = isLong ? maxDurationSeconds / 2 : 400L }); // p95
+            cmd.Parameters.Add(new DuckDBParameter { Value = isLong });
+            cmd.Parameters.Add(new DuckDBParameter { Value = isLong ? maxPctAvg : 100.0 });
+
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    /// <summary>
+    /// Seeds session_stats with per-application connection data.
+    /// </summary>
+    internal async Task SeedSessionStatsAsync(
+        params (string appName, int connections, int running, int sleeping)[] apps)
+    {
+        using var readLock = _duckDb.AcquireReadLock();
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync();
+
+        foreach (var (appName, conns, running, sleeping) in apps)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO session_stats
+    (collection_id, collection_time, server_id, server_name,
+     program_name, connection_count, running_count, sleeping_count, dormant_count)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0)";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = _nextId-- });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestPeriodEnd });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerName });
+            cmd.Parameters.Add(new DuckDBParameter { Value = appName });
+            cmd.Parameters.Add(new DuckDBParameter { Value = conns });
+            cmd.Parameters.Add(new DuckDBParameter { Value = running });
+            cmd.Parameters.Add(new DuckDBParameter { Value = sleeping });
+
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    /// <summary>
+    /// Seeds trace_flags with active global flags.
+    /// </summary>
+    internal async Task SeedTraceFlagsAsync(params int[] flags)
+    {
+        using var readLock = _duckDb.AcquireReadLock();
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync();
+
+        foreach (var flag in flags)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO trace_flags
+    (config_id, capture_time, server_id, server_name,
+     trace_flag, status, is_global, is_session)
+VALUES ($1, $2, $3, $4, $5, true, true, false)";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = _nextId-- });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestPeriodEnd });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerName });
+            cmd.Parameters.Add(new DuckDBParameter { Value = flag });
+
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    /// <summary>
+    /// Seeds server_properties with hardware/edition info.
+    /// </summary>
+    internal async Task SeedServerPropertiesAsync(int cpuCount, int htRatio,
+        long physicalMemMb, int socketCount = 2, int coresPerSocket = 0,
+        bool hadrEnabled = false, string edition = "Standard Edition")
+    {
+        if (coresPerSocket == 0) coresPerSocket = cpuCount / (socketCount * 2); // assume HT
+
+        using var readLock = _duckDb.AcquireReadLock();
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync();
+
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = @"
+INSERT INTO server_properties
+    (collection_id, collection_time, server_id, server_name,
+     edition, product_version, product_level, engine_edition,
+     cpu_count, hyperthread_ratio, physical_memory_mb,
+     socket_count, cores_per_socket, is_hadr_enabled)
+VALUES ($1, $2, $3, $4, $5, '16.0.4150.1', 'RTM', 2,
+        $6, $7, $8, $9, $10, $11)";
+
+        cmd.Parameters.Add(new DuckDBParameter { Value = _nextId-- });
+        cmd.Parameters.Add(new DuckDBParameter { Value = TestPeriodEnd });
+        cmd.Parameters.Add(new DuckDBParameter { Value = TestServerId });
+        cmd.Parameters.Add(new DuckDBParameter { Value = TestServerName });
+        cmd.Parameters.Add(new DuckDBParameter { Value = edition });
+        cmd.Parameters.Add(new DuckDBParameter { Value = cpuCount });
+        cmd.Parameters.Add(new DuckDBParameter { Value = htRatio });
+        cmd.Parameters.Add(new DuckDBParameter { Value = physicalMemMb });
+        cmd.Parameters.Add(new DuckDBParameter { Value = socketCount });
+        cmd.Parameters.Add(new DuckDBParameter { Value = coresPerSocket });
+        cmd.Parameters.Add(new DuckDBParameter { Value = hadrEnabled });
+
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>
+    /// Seeds database_size_stats with volume-level disk space data.
+    /// </summary>
+    internal async Task SeedDiskSpaceAsync(
+        params (string mountPoint, double totalMb, double freeMb)[] volumes)
+    {
+        using var readLock = _duckDb.AcquireReadLock();
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync();
+
+        foreach (var (mountPoint, totalMb, freeMb) in volumes)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO database_size_stats
+    (collection_id, collection_time, server_id, server_name,
+     database_name, database_id, file_id, file_type_desc, file_name, physical_name,
+     total_size_mb, used_size_mb,
+     volume_mount_point, volume_total_mb, volume_free_mb)
+VALUES ($1, $2, $3, $4, 'UserDB', 5, 1, 'ROWS', 'UserDB', 'D:\Data\UserDB.mdf',
+        1000, 800, $5, $6, $7)";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = _nextId-- });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestPeriodEnd });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = TestServerName });
+            cmd.Parameters.Add(new DuckDBParameter { Value = mountPoint });
+            cmd.Parameters.Add(new DuckDBParameter { Value = totalMb });
+            cmd.Parameters.Add(new DuckDBParameter { Value = freeMb });
 
             await cmd.ExecuteNonQueryAsync();
         }

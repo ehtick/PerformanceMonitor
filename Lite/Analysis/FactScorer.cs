@@ -196,7 +196,7 @@ public class FactScorer
         return fact.Key switch
         {
             // PLE: lower is worse. Invert: concerning < 300, critical < 60
-            "PERFMON_PLE" when fact.Value <= 0 => 0.0,
+            "PERFMON_PLE" when fact.Value <= 0 => 1.0,
             "PERFMON_PLE" when fact.Value < 60 => 1.0,
             "PERFMON_PLE" when fact.Value < 300 => 0.5 + 0.5 * (300 - fact.Value) / 240,
             "PERFMON_PLE" => 0.0,
