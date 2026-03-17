@@ -1306,14 +1306,10 @@ SELECT TOP(@topN)
     executions =
         SUM(qs.execution_count_delta),
     query_preview =
-        LEFT
+        CONVERT
         (
-            CONVERT
-            (
-                nvarchar(max),
-                DECOMPRESS(qs.query_text)
-            ),
-            200
+            nvarchar(max),
+            DECOMPRESS(qs.query_text)
         )
 FROM collect.query_stats AS qs
 WHERE qs.collection_time >= DATEADD(HOUR, -@hoursBack, SYSDATETIME())
@@ -1434,7 +1430,7 @@ WITH
                 SELECT TOP (1)
                     CASE
                         WHEN qs2.query_text IS NOT NULL
-                        THEN LEFT(CAST(DECOMPRESS(qs2.query_text) AS nvarchar(max)), 200)
+                        THEN CAST(DECOMPRESS(qs2.query_text) AS nvarchar(max))
                         ELSE N''
                     END
                 FROM collect.query_stats AS qs2

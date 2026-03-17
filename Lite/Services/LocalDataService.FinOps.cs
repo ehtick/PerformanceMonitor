@@ -1201,7 +1201,7 @@ SELECT
     SUM(delta_logical_reads) AS total_reads,
     CAST(SUM(delta_logical_reads) * 1.0 / NULLIF(SUM(delta_execution_count), 0) AS DECIMAL(19,0)) AS avg_reads,
     SUM(delta_execution_count) AS executions,
-    LEFT(query_text, 200) AS query_preview
+    query_text AS query_preview
 FROM v_query_stats
 WHERE server_id = $1
 AND   collection_time >= $2
@@ -1259,7 +1259,7 @@ SELECT
     SUM(delta_logical_reads) AS total_reads,
     SUM(delta_logical_writes) AS total_writes,
     SUM(COALESCE(max_grant_kb, 0)) / 1024.0 AS total_memory_mb,
-    (SELECT LEFT(qs2.query_text, 200) FROM query_stats qs2
+    (SELECT qs2.query_text FROM query_stats qs2
      WHERE qs2.query_hash = qs.query_hash
      AND qs2.server_id = $1
      AND qs2.collection_time >= $2
