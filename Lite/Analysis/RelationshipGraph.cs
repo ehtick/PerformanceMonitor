@@ -69,6 +69,7 @@ public class RelationshipGraph
         BuildMemoryPressureEdges();
         BuildBlockingEdges();
         BuildIoPressureEdges();
+        BuildLatchEdges();
         BuildTempDbEdges();
         BuildQueryEdges();
     }
@@ -250,6 +251,21 @@ public class RelationshipGraph
         AddEdge("WRITELOG", "IO_WRITE_LATENCY_MS", "log_io",
             "Write latency elevated — disk confirms log I/O bottleneck",
             facts => HasFact(facts, "IO_WRITE_LATENCY_MS") && facts["IO_WRITE_LATENCY_MS"].BaseSeverity > 0);
+    }
+
+    /* ── Latch Contention ── */
+
+    private void BuildLatchEdges()
+    {
+        // LATCH_EX → TEMPDB_USAGE (latch contention often from TempDB allocation)
+        AddEdge("LATCH_EX", "TEMPDB_USAGE", "latch_contention",
+            "TempDB usage — latch contention may be on TempDB allocation pages",
+            facts => HasFact(facts, "TEMPDB_USAGE") && facts["TEMPDB_USAGE"].BaseSeverity > 0);
+
+        // LATCH_EX → CXPACKET (parallel operations amplifying latch contention)
+        AddEdge("LATCH_EX", "CXPACKET", "latch_contention",
+            "Parallelism waits — parallel operations amplifying page latch contention",
+            facts => HasFact(facts, "CXPACKET") && facts["CXPACKET"].Severity >= 0.5);
     }
 
     /* ── TempDB ── */

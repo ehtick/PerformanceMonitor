@@ -295,6 +295,7 @@ public class FactScorer
             "CXPACKET" => CxPacketAmplifiers(),
             "THREADPOOL" => ThreadpoolAmplifiers(),
             "PAGEIOLATCH_SH" or "PAGEIOLATCH_EX" => PageiolatchAmplifiers(),
+            "LATCH_EX" or "LATCH_SH" => LatchAmplifiers(),
             "BLOCKING_EVENTS" => BlockingEventsAmplifiers(),
             "DEADLOCKS" => DeadlockAmplifiers(),
             "LCK" => LckAmplifiers(),
@@ -417,6 +418,33 @@ public class FactScorer
             Description = "Memory grant waiters present — grants competing with buffer pool",
             Boost = 0.2,
             Predicate = facts => facts.TryGetValue("MEMORY_GRANT_PENDING", out var mg) && mg.Value >= 1
+        }
+    ];
+
+    /// <summary>
+    /// LATCH_EX/LATCH_SH: in-memory page latch contention.
+    /// Common causes: TempDB allocation contention, hot page updates,
+    /// parallel insert into heaps or narrow indexes.
+    /// </summary>
+    private static List<AmplifierDefinition> LatchAmplifiers() =>
+    [
+        new()
+        {
+            Description = "TempDB usage elevated — latch contention likely on TempDB allocation pages",
+            Boost = 0.3,
+            Predicate = facts => facts.TryGetValue("TEMPDB_USAGE", out var t) && t.BaseSeverity > 0
+        },
+        new()
+        {
+            Description = "CXPACKET significant — parallel operations amplifying latch contention",
+            Boost = 0.2,
+            Predicate = facts => HasSignificantWait(facts, "CXPACKET", 0.10)
+        },
+        new()
+        {
+            Description = "SOS_SCHEDULER_YIELD elevated — latch spinning contributing to CPU pressure",
+            Boost = 0.2,
+            Predicate = facts => HasSignificantWait(facts, "SOS_SCHEDULER_YIELD", 0.15)
         }
     ];
 
@@ -714,6 +742,11 @@ public class FactScorer
 
             // Schema locks — DDL operations, index rebuilds
             "SCH_M" => (0.01, null),
+
+            // Latch contention — page latch (not I/O latch) indicates
+            // in-memory contention, often TempDB allocation or hot pages
+            "LATCH_EX" => (0.25, null),
+            "LATCH_SH" => (0.25, null),
 
             _ => null
         };

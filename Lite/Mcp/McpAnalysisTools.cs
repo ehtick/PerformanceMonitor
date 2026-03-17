@@ -714,6 +714,17 @@ internal static class ToolRecommendations
             new("get_memory_clerks", "See where memory is allocated"),
             new("get_memory_trend", "Track memory usage over time")
         ],
+        ["LATCH_EX"] =
+        [
+            new("get_tempdb_trend", "Check TempDB for allocation contention"),
+            new("get_top_queries_by_cpu", "Find queries causing latch contention"),
+            new("get_wait_trend", "Track latch contention trend", new() { ["wait_type"] = "LATCH_EX" })
+        ],
+        ["LATCH_SH"] =
+        [
+            new("get_tempdb_trend", "Check TempDB for allocation contention"),
+            new("get_wait_trend", "Track latch contention trend", new() { ["wait_type"] = "LATCH_SH" })
+        ],
         ["DB_CONFIG"] =
         [
             new("audit_config", "Check server-level configuration"),
