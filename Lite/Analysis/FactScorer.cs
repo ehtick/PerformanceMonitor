@@ -36,6 +36,7 @@ public class FactScorer
                 "database_config" => ScoreDatabaseConfigFact(fact),
                 "jobs" => ScoreJobFact(fact),
                 "disk" => ScoreDiskFact(fact),
+                "bad_actor" => ScoreBadActorFact(fact),
                 _ => 0.0
             };
         }
@@ -43,7 +44,7 @@ public class FactScorer
         // Build lookup for amplifier evaluation (include context facts that amplifiers reference)
         var contextSources = new HashSet<string>
             { "config", "cpu", "io", "tempdb", "memory", "queries", "perfmon",
-              "database_config", "jobs", "sessions", "disk" };
+              "database_config", "jobs", "sessions", "disk", "bad_actor" };
         var factsByKey = facts
             .Where(f => f.BaseSeverity > 0 || contextSources.Contains(f.Source))
             .ToDictionary(f => f.Key, f => f);
@@ -263,6 +264,40 @@ public class FactScorer
         if (freePct < 0.10) return 0.5 + 0.5 * (0.10 - freePct) / 0.05;
         if (freePct < 0.20) return 0.5 * (0.20 - freePct) / 0.10;
         return 0.0;
+    }
+
+    /// <summary>
+    /// Scores bad actor queries using execution count tier x per-execution impact.
+    /// A query running 100K times at 1ms CPU is different from 100K times at 5s CPU.
+    /// The tier gets it in the door, per-execution impact determines how bad it is.
+    /// </summary>
+    private static double ScoreBadActorFact(Fact fact)
+    {
+        var execCount = fact.Metadata.GetValueOrDefault("execution_count");
+        var avgCpuMs = fact.Metadata.GetValueOrDefault("avg_cpu_ms");
+        var avgReads = fact.Metadata.GetValueOrDefault("avg_reads");
+
+        // Execution count tier base — higher tiers for more frequent queries
+        var tierBase = execCount switch
+        {
+            < 1_000 => 0.5,
+            < 10_000 => 0.7,
+            < 100_000 => 0.85,
+            _ => 1.0
+        };
+
+        // Per-execution impact: use the worse of CPU or reads
+        // CPU: concerning at 50ms, critical at 2000ms
+        var cpuImpact = ApplyThresholdFormula(avgCpuMs, 50, 2000);
+        // Reads: concerning at 5K, critical at 250K
+        var readsImpact = ApplyThresholdFormula(avgReads, 5_000, 250_000);
+
+        var impact = Math.Max(cpuImpact, readsImpact);
+
+        // Final: tier * impact. Both must be meaningful.
+        // A high-frequency query with trivial per-execution cost won't score.
+        // A heavy query that only runs once won't score high either.
+        return tierBase * impact;
     }
 
     /// <summary>

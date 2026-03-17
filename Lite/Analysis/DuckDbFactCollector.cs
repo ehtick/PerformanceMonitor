@@ -39,6 +39,7 @@ public class DuckDbFactCollector : IFactCollector
         await CollectTempDbFactsAsync(context, facts);
         await CollectMemoryGrantFactsAsync(context, facts);
         await CollectQueryStatsFactsAsync(context, facts);
+        await CollectBadActorFactsAsync(context, facts);
         await CollectPerfmonFactsAsync(context, facts);
         await CollectMemoryClerkFactsAsync(context, facts);
         await CollectDatabaseConfigFactsAsync(context, facts);
@@ -746,6 +747,97 @@ AND   delta_execution_count > 0";
                         ["high_dop_query_count"] = highDopQueries,
                         ["total_cpu_time_us"] = totalCpuTimeUs,
                         ["total_executions"] = totalExecutions
+                    }
+                });
+            }
+        }
+        catch { /* Table may not exist or have no data */ }
+    }
+
+    /// <summary>
+    /// Identifies individual queries that are consistently terrible ("bad actors").
+    /// These queries don't necessarily cause server-level symptoms but waste resources
+    /// on every execution. Detection uses execution count tiers x per-execution impact.
+    /// Top 5 worst offenders become individual BAD_ACTOR facts.
+    /// </summary>
+    private async Task CollectBadActorFactsAsync(AnalysisContext context, List<Fact> facts)
+    {
+        try
+        {
+            using var readLock = _duckDb.AcquireReadLock();
+            using var connection = _duckDb.CreateConnection();
+            await connection.OpenAsync();
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+SELECT
+    database_name,
+    query_hash,
+    SUM(delta_execution_count)::BIGINT AS exec_count,
+    CASE WHEN SUM(delta_execution_count) > 0
+         THEN SUM(delta_worker_time)::DOUBLE / SUM(delta_execution_count) / 1000.0
+         ELSE 0 END AS avg_cpu_ms,
+    CASE WHEN SUM(delta_execution_count) > 0
+         THEN SUM(delta_elapsed_time)::DOUBLE / SUM(delta_execution_count) / 1000.0
+         ELSE 0 END AS avg_elapsed_ms,
+    CASE WHEN SUM(delta_execution_count) > 0
+         THEN SUM(delta_logical_reads)::DOUBLE / SUM(delta_execution_count)
+         ELSE 0 END AS avg_reads,
+    SUM(delta_worker_time)::BIGINT AS total_cpu_us,
+    SUM(delta_logical_reads)::BIGINT AS total_reads,
+    SUM(delta_spills)::BIGINT AS total_spills,
+    MAX(max_dop) AS max_dop,
+    LEFT(MAX(query_text), 200) AS query_text
+FROM v_query_stats
+WHERE server_id = $1
+AND   collection_time >= $2
+AND   collection_time <= $3
+AND   delta_execution_count > 0
+GROUP BY database_name, query_hash
+HAVING SUM(delta_execution_count) >= 100
+ORDER BY SUM(delta_worker_time)::DOUBLE / GREATEST(SUM(delta_execution_count), 1) *
+         LN(GREATEST(SUM(delta_execution_count), 1)) DESC
+LIMIT 5";
+
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.ServerId });
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.TimeRangeStart });
+            cmd.Parameters.Add(new DuckDBParameter { Value = context.TimeRangeEnd });
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                var dbName = reader.IsDBNull(0) ? "" : reader.GetString(0);
+                var queryHash = reader.IsDBNull(1) ? "" : reader.GetString(1);
+                var execCount = reader.IsDBNull(2) ? 0L : Convert.ToInt64(reader.GetValue(2));
+                var avgCpuMs = reader.IsDBNull(3) ? 0.0 : Convert.ToDouble(reader.GetValue(3));
+                var avgElapsedMs = reader.IsDBNull(4) ? 0.0 : Convert.ToDouble(reader.GetValue(4));
+                var avgReads = reader.IsDBNull(5) ? 0.0 : Convert.ToDouble(reader.GetValue(5));
+                var totalCpuUs = reader.IsDBNull(6) ? 0L : Convert.ToInt64(reader.GetValue(6));
+                var totalReads = reader.IsDBNull(7) ? 0L : Convert.ToInt64(reader.GetValue(7));
+                var totalSpills = reader.IsDBNull(8) ? 0L : Convert.ToInt64(reader.GetValue(8));
+                var maxDop = reader.IsDBNull(9) ? 0 : Convert.ToInt32(reader.GetValue(9));
+                var queryText = reader.IsDBNull(10) ? "" : reader.GetString(10);
+
+                // Skip low-impact queries — need meaningful per-execution cost
+                if (avgCpuMs < 10 && avgReads < 1000) continue;
+
+                facts.Add(new Fact
+                {
+                    Source = "bad_actor",
+                    Key = $"BAD_ACTOR_{queryHash}",
+                    Value = avgCpuMs, // Primary scoring dimension
+                    ServerId = context.ServerId,
+                    DatabaseName = dbName,
+                    Metadata = new Dictionary<string, double>
+                    {
+                        ["execution_count"] = execCount,
+                        ["avg_cpu_ms"] = avgCpuMs,
+                        ["avg_elapsed_ms"] = avgElapsedMs,
+                        ["avg_reads"] = avgReads,
+                        ["total_cpu_us"] = totalCpuUs,
+                        ["total_reads"] = totalReads,
+                        ["total_spills"] = totalSpills,
+                        ["max_dop"] = maxDop
                     }
                 });
             }
