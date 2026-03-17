@@ -212,6 +212,20 @@ public class RelationshipGraph
             "Reader lock waits present — RCSI could prevent reader/writer deadlocks",
             facts => HasFact(facts, "LCK_M_S") && facts["LCK_M_S"].BaseSeverity > 0);
 
+        // LCK_M_S → DB_CONFIG (reader/writer contention → RCSI recommendation)
+        AddEdge("LCK_M_S", "DB_CONFIG", "lock_contention",
+            "Databases without RCSI — readers blocked by writers could be eliminated",
+            facts => HasFact(facts, "DB_CONFIG")
+                  && facts["DB_CONFIG"].Metadata.GetValueOrDefault("rcsi_off_count") > 0
+                  && facts["DB_CONFIG"].BaseSeverity > 0);
+
+        // DB_CONFIG → LCK_M_S (RCSI-off confirmed by reader/writer lock contention)
+        AddEdge("DB_CONFIG", "LCK_M_S", "config_issue",
+            "LCK_M_S waits — readers blocked by writers, RCSI would eliminate these",
+            facts => HasFact(facts, "LCK_M_S") && facts["LCK_M_S"].BaseSeverity > 0
+                  && HasFact(facts, "DB_CONFIG")
+                  && facts["DB_CONFIG"].Metadata.GetValueOrDefault("rcsi_off_count") > 0);
+
         // THREADPOOL → BLOCKING_EVENTS (blocking causing thread buildup)
         AddEdge("THREADPOOL", "BLOCKING_EVENTS", "thread_exhaustion",
             "Blocking events present — blocked queries holding worker threads",

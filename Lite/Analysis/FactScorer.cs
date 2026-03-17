@@ -205,7 +205,10 @@ public class FactScorer
     }
 
     /// <summary>
-    /// Scores database configuration facts. Auto-shrink and auto-close are always bad.
+    /// Scores database configuration facts.
+    /// Auto-shrink and auto-close are always bad.
+    /// RCSI-off gets a low base that only becomes visible through amplifiers
+    /// when reader/writer lock contention (LCK_M_S, LCK_M_IS) is present.
     /// </summary>
     private static double ScoreDatabaseConfigFact(Fact fact)
     {
@@ -214,12 +217,21 @@ public class FactScorer
         var autoShrink = fact.Metadata.GetValueOrDefault("auto_shrink_on_count");
         var autoClose = fact.Metadata.GetValueOrDefault("auto_close_on_count");
         var pageVerifyBad = fact.Metadata.GetValueOrDefault("page_verify_not_checksum_count");
+        var rcsiOff = fact.Metadata.GetValueOrDefault("rcsi_off_count");
 
-        // Any auto_shrink or auto_close is concerning
+        var score = 0.0;
+
+        // Auto-shrink, auto-close, bad page verify are always concerning
         if (autoShrink > 0 || autoClose > 0 || pageVerifyBad > 0)
-            return Math.Min((autoShrink + autoClose + pageVerifyBad) * 0.3, 1.0);
+            score = Math.Max(score, Math.Min((autoShrink + autoClose + pageVerifyBad) * 0.3, 1.0));
 
-        return 0.0;
+        // RCSI-off: low base (0.3) — below display threshold alone.
+        // Amplifiers for LCK_M_S/LCK_M_IS push it above 0.5 when reader/writer
+        // contention confirms RCSI would help.
+        if (rcsiOff > 0)
+            score = Math.Max(score, 0.3);
+
+        return score;
     }
 
     /// <summary>
@@ -507,6 +519,10 @@ public class FactScorer
 
     /// <summary>
     /// DB_CONFIG: database misconfiguration amplified by related symptoms.
+    /// RCSI-off amplifiers only fire when reader/writer lock contention is present —
+    /// LCK_M_S (shared lock waits) and LCK_M_IS (intent-shared) are readers blocked
+    /// by writers. RCSI eliminates these. Writer/writer conflicts (LCK_M_X, LCK_M_U)
+    /// are NOT helped by RCSI and should not trigger this amplifier.
     /// </summary>
     private static List<AmplifierDefinition> DbConfigAmplifiers() =>
     [
@@ -515,6 +531,32 @@ public class FactScorer
             Description = "I/O latency elevated — auto_shrink may be causing fragmentation and I/O pressure",
             Boost = 0.3,
             Predicate = facts => facts.TryGetValue("IO_READ_LATENCY_MS", out var io) && io.BaseSeverity > 0
+        },
+        new()
+        {
+            Description = "LCK_M_S waits — readers blocked by writers, RCSI would eliminate shared lock waits",
+            Boost = 0.5,
+            Predicate = facts => facts.TryGetValue("DB_CONFIG", out var db)
+                              && db.Metadata.GetValueOrDefault("rcsi_off_count") > 0
+                              && facts.TryGetValue("LCK_M_S", out var lckS) && lckS.BaseSeverity > 0
+        },
+        new()
+        {
+            Description = "LCK_M_IS waits — intent-shared locks blocked by writers, RCSI would eliminate these",
+            Boost = 0.4,
+            Predicate = facts => facts.TryGetValue("DB_CONFIG", out var db)
+                              && db.Metadata.GetValueOrDefault("rcsi_off_count") > 0
+                              && facts.TryGetValue("LCK_M_IS", out var lckIS) && lckIS.BaseSeverity > 0
+        },
+        new()
+        {
+            Description = "Deadlocks with reader/writer lock waits — RCSI eliminates reader/writer deadlocks",
+            Boost = 0.4,
+            Predicate = facts => facts.TryGetValue("DB_CONFIG", out var db)
+                              && db.Metadata.GetValueOrDefault("rcsi_off_count") > 0
+                              && facts.TryGetValue("DEADLOCKS", out var dl) && dl.BaseSeverity > 0
+                              && (facts.TryGetValue("LCK_M_S", out var s) && s.BaseSeverity > 0
+                               || facts.TryGetValue("LCK_M_IS", out var i) && i.BaseSeverity > 0)
         }
     ];
 
