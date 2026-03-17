@@ -742,6 +742,12 @@ internal static class ToolRecommendations
             new("get_running_jobs", "See currently running jobs with duration vs historical"),
             new("get_cpu_utilization", "Check if long-running jobs are consuming CPU")
         ],
+        ["BAD_ACTOR"] =
+        [
+            new("get_top_queries_by_cpu", "See full query stats for this query"),
+            new("analyze_query_plan", "Analyze the execution plan for optimization opportunities"),
+            new("get_query_trend", "Track this query's performance over time")
+        ],
         ["DISK_SPACE"] =
         [
             new("get_file_io_stats", "Check per-file sizes and I/O"),
@@ -761,7 +767,13 @@ internal static class ToolRecommendations
 
         foreach (var key in factKeys)
         {
-            if (!ByFactKey.TryGetValue(key, out var recommendations)) continue;
+            if (!ByFactKey.TryGetValue(key, out var recommendations))
+            {
+                // Handle dynamic keys like BAD_ACTOR_0x... by checking prefix
+                if (key.StartsWith("BAD_ACTOR_"))
+                    ByFactKey.TryGetValue("BAD_ACTOR", out recommendations);
+                if (recommendations == null) continue;
+            }
 
             foreach (var rec in recommendations)
             {

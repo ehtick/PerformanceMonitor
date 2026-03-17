@@ -70,6 +70,9 @@ public class DrillDownCollector
                 if (pathKeys.Contains("MEMORY_GRANT_PENDING"))
                     await CollectPendingGrants(finding, context);
 
+                if (pathKeys.Any(k => k.StartsWith("BAD_ACTOR_")))
+                    await CollectBadActorDetail(finding, context);
+
                 // Remove empty drill-down dictionaries
                 if (finding.DrillDown.Count == 0)
                     finding.DrillDown = null;
@@ -539,5 +542,65 @@ LIMIT 5";
 
         if (items.Count > 0)
             finding.DrillDown!["pending_grants"] = items;
+    }
+
+    private async Task CollectBadActorDetail(AnalysisFinding finding, AnalysisContext context)
+    {
+        // Extract query_hash from the fact key (BAD_ACTOR_0x...)
+        var queryHash = finding.RootFactKey.Replace("BAD_ACTOR_", "");
+        if (string.IsNullOrEmpty(queryHash)) return;
+
+        using var readLock = _duckDb.AcquireReadLock();
+        using var connection = _duckDb.CreateConnection();
+        await connection.OpenAsync();
+
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = @"
+SELECT database_name, query_hash,
+       LEFT(MAX(query_text), 500) AS query_text,
+       SUM(delta_execution_count)::BIGINT AS exec_count,
+       CASE WHEN SUM(delta_execution_count) > 0
+            THEN SUM(delta_worker_time)::DOUBLE / SUM(delta_execution_count) / 1000.0
+            ELSE 0 END AS avg_cpu_ms,
+       CASE WHEN SUM(delta_execution_count) > 0
+            THEN SUM(delta_elapsed_time)::DOUBLE / SUM(delta_execution_count) / 1000.0
+            ELSE 0 END AS avg_elapsed_ms,
+       CASE WHEN SUM(delta_execution_count) > 0
+            THEN SUM(delta_logical_reads)::DOUBLE / SUM(delta_execution_count)
+            ELSE 0 END AS avg_reads,
+       SUM(delta_worker_time)::BIGINT AS total_cpu_us,
+       SUM(delta_logical_reads)::BIGINT AS total_reads,
+       SUM(delta_spills)::BIGINT AS total_spills,
+       MAX(max_dop) AS max_dop
+FROM v_query_stats
+WHERE server_id = $1
+AND   collection_time >= $2
+AND   collection_time <= $3
+AND   query_hash = $4
+GROUP BY database_name, query_hash";
+
+        cmd.Parameters.Add(new DuckDBParameter { Value = context.ServerId });
+        cmd.Parameters.Add(new DuckDBParameter { Value = context.TimeRangeStart });
+        cmd.Parameters.Add(new DuckDBParameter { Value = context.TimeRangeEnd });
+        cmd.Parameters.Add(new DuckDBParameter { Value = queryHash });
+
+        using var reader = await cmd.ExecuteReaderAsync();
+        if (await reader.ReadAsync())
+        {
+            finding.DrillDown!["bad_actor_query"] = new
+            {
+                database = reader.IsDBNull(0) ? "" : reader.GetString(0),
+                query_hash = reader.IsDBNull(1) ? "" : reader.GetString(1),
+                query_text = reader.IsDBNull(2) ? "" : reader.GetString(2),
+                execution_count = reader.IsDBNull(3) ? 0L : Convert.ToInt64(reader.GetValue(3)),
+                avg_cpu_ms = reader.IsDBNull(4) ? 0.0 : Math.Round(Convert.ToDouble(reader.GetValue(4)), 2),
+                avg_elapsed_ms = reader.IsDBNull(5) ? 0.0 : Math.Round(Convert.ToDouble(reader.GetValue(5)), 2),
+                avg_reads = reader.IsDBNull(6) ? 0.0 : Math.Round(Convert.ToDouble(reader.GetValue(6)), 0),
+                total_cpu_ms = reader.IsDBNull(7) ? 0.0 : Convert.ToDouble(reader.GetValue(7)) / 1000.0,
+                total_reads = reader.IsDBNull(8) ? 0L : Convert.ToInt64(reader.GetValue(8)),
+                total_spills = reader.IsDBNull(9) ? 0L : Convert.ToInt64(reader.GetValue(9)),
+                max_dop = reader.IsDBNull(10) ? 0 : Convert.ToInt32(reader.GetValue(10))
+            };
+        }
     }
 }
