@@ -49,10 +49,21 @@ public class DuckDbInitializer
     /// <summary>
     /// Acquires an exclusive write lock on the database. Blocks until all readers finish.
     /// Dispose the returned object to release the lock.
+    /// When a timeout is specified, throws <see cref="TimeoutException"/> if the lock
+    /// cannot be acquired within the given duration (e.g., archival is in progress).
     /// </summary>
-    public IDisposable AcquireWriteLock()
+    public IDisposable AcquireWriteLock(TimeSpan? timeout = null)
     {
-        s_dbLock.EnterWriteLock();
+        if (timeout.HasValue)
+        {
+            if (!s_dbLock.TryEnterWriteLock(timeout.Value))
+                throw new TimeoutException(
+                    "Could not acquire database write lock — another operation (archival or maintenance) may be in progress. Please try again in a few moments.");
+        }
+        else
+        {
+            s_dbLock.EnterWriteLock();
+        }
         return new LockReleaser(s_dbLock, write: true);
     }
 
@@ -86,7 +97,7 @@ public class DuckDbInitializer
     /// <summary>
     /// Current schema version. Increment this when schema changes require table rebuilds.
     /// </summary>
-    internal const int CurrentSchemaVersion = 22;
+    internal const int CurrentSchemaVersion = 24;
 
     private readonly string _archivePath;
 
@@ -599,6 +610,35 @@ public class DuckDbInitializer
                 throw;
             }
         }
+
+        if (fromVersion < 23)
+        {
+            _logger?.LogInformation("Running migration to v23: adding dismissed_archive_alerts sidecar table");
+            try
+            {
+                await ExecuteNonQueryAsync(connection, Schema.CreateDismissedArchiveAlertsTable);
+                await ExecuteNonQueryAsync(connection, Schema.CreateDismissedArchiveAlertsIndex);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Migration to v23 failed");
+                throw;
+            }
+        }
+
+        if (fromVersion < 24)
+        {
+            _logger?.LogInformation("Running migration to v24: adding vcore_count column to server_properties for Azure SQL DB vCore tracking");
+            try
+            {
+                await ExecuteNonQueryAsync(connection, "ALTER TABLE server_properties ADD COLUMN IF NOT EXISTS vcore_count INTEGER");
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Migration to v24 failed");
+                throw;
+            }
+        }
     }
 
     /// <summary>
@@ -685,11 +725,30 @@ public class DuckDbInitializer
                 if (hasParquetFiles)
                 {
                     var globPath = parquetGlob.Replace("\\", "/");
-                    viewSql = $"CREATE OR REPLACE VIEW v_{table} AS SELECT * FROM {table} UNION ALL BY NAME SELECT * FROM read_parquet('{globPath}', union_by_name=true)";
+                    if (table == "config_alert_log")
+                    {
+                        viewSql = $@"CREATE OR REPLACE VIEW v_{table} AS
+SELECT *, 'live' AS source FROM {table}
+UNION ALL BY NAME
+SELECT *, 'archive' AS source FROM read_parquet('{globPath}', union_by_name=true) p
+WHERE NOT EXISTS (
+    SELECT 1 FROM dismissed_archive_alerts d
+    WHERE d.alert_time = p.alert_time
+    AND   d.server_id  = p.server_id
+    AND   d.metric_name = p.metric_name
+)";
+                    }
+                    else
+                    {
+                        viewSql = $"CREATE OR REPLACE VIEW v_{table} AS SELECT * FROM {table} UNION ALL BY NAME SELECT * FROM read_parquet('{globPath}', union_by_name=true)";
+                    }
                 }
                 else
                 {
-                    viewSql = $"CREATE OR REPLACE VIEW v_{table} AS SELECT * FROM {table}";
+                    if (table == "config_alert_log")
+                        viewSql = $"CREATE OR REPLACE VIEW v_{table} AS SELECT *, 'live' AS source FROM {table}";
+                    else
+                        viewSql = $"CREATE OR REPLACE VIEW v_{table} AS SELECT * FROM {table}";
                 }
 
                 using var cmd = connection.CreateCommand();
@@ -703,7 +762,10 @@ public class DuckDbInitializer
                 try
                 {
                     using var fallbackCmd = connection.CreateCommand();
-                    fallbackCmd.CommandText = $"CREATE OR REPLACE VIEW v_{table} AS SELECT * FROM {table}";
+                    if (table == "config_alert_log")
+                        fallbackCmd.CommandText = $"CREATE OR REPLACE VIEW v_{table} AS SELECT *, 'live' AS source FROM {table}";
+                    else
+                        fallbackCmd.CommandText = $"CREATE OR REPLACE VIEW v_{table} AS SELECT * FROM {table}";
                     await fallbackCmd.ExecuteNonQueryAsync();
                 }
                 catch (Exception fallbackEx)

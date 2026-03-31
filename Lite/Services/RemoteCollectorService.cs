@@ -59,6 +59,7 @@ public partial class RemoteCollectorService
     private readonly ScheduleManager _scheduleManager;
     private readonly ILogger<RemoteCollectorService>? _logger;
     private readonly DeltaCalculator _deltaCalculator;
+    public DeltaCalculator DeltaCalculator => _deltaCalculator;
     private static long s_idCounter = DateTime.UtcNow.Ticks;
 
     /// <summary>
@@ -235,10 +236,9 @@ public partial class RemoteCollectorService
     /// </summary>
     public async Task RunDueCollectorsAsync(CancellationToken cancellationToken = default)
     {
-        var dueCollectors = _scheduleManager.GetDueCollectors();
         var enabledServers = _serverManager.GetEnabledServers();
 
-        if (dueCollectors.Count == 0 || enabledServers.Count == 0)
+        if (enabledServers.Count == 0)
         {
             return;
         }
@@ -258,15 +258,22 @@ public partial class RemoteCollectorService
             onlineServers.Add(server);
         }
 
-        _logger?.LogInformation("Running {CollectorCount} collectors for {OnlineCount}/{TotalCount} servers ({SkippedCount} offline, skipped)",
-            dueCollectors.Count, onlineServers.Count, enabledServers.Count, skippedOffline);
+        if (onlineServers.Count == 0)
+        {
+            return;
+        }
+
+        _logger?.LogInformation("Checking per-server schedules for {OnlineCount}/{TotalCount} servers ({SkippedCount} offline, skipped)",
+            onlineServers.Count, enabledServers.Count, skippedOffline);
 
         /* Run servers in parallel, but collectors within each server sequentially.
            DuckDB is single-writer; running all collectors in parallel causes spin-wait
            contention (50%+ CPU, multi-second stalls). Sequential per-server eliminates
-           this while still allowing multi-server parallelism. */
+           this while still allowing multi-server parallelism.
+           Each server gets its own due-collector list from per-server schedules. */
         var serverTasks = onlineServers.Select(server => Task.Run(async () =>
         {
+            var dueCollectors = _scheduleManager.GetDueCollectorsForServer(server.Id);
             foreach (var collector in dueCollectors)
             {
                 await RunCollectorAsync(server, collector.Name, cancellationToken);
@@ -299,8 +306,8 @@ public partial class RemoteCollectorService
     /// </summary>
     public async Task RunAllCollectorsForServerAsync(ServerConnection server, CancellationToken cancellationToken = default)
     {
-        var enabledSchedules = _scheduleManager.GetEnabledSchedules()
-            .Concat(_scheduleManager.GetOnLoadCollectors())
+        var enabledSchedules = _scheduleManager.GetSchedulesForServer(server.Id)
+            .Where(s => s.Enabled)
             .ToList();
 
         /* Ensure XE sessions are set up before collecting */
@@ -396,7 +403,7 @@ public partial class RemoteCollectorService
                 _ => throw new ArgumentException($"Unknown collector: {collectorName}")
             };
 
-            _scheduleManager.MarkCollectorRun(collectorName, startTime);
+            _scheduleManager.MarkCollectorRunForServer(server.Id, collectorName, startTime);
 
             var elapsed = (int)(DateTime.UtcNow - startTime).TotalMilliseconds;
             AppLogger.Info("Collector", $"  [{server.DisplayName}] {collectorName} => {rowsCollected} rows in {elapsed}ms (sql:{_lastSqlMs}ms, duck:{_lastDuckDbMs}ms)");
@@ -682,12 +689,18 @@ WHERE server_id = $3";
 
     /// <summary>
     /// Gets the server name used for DuckDB storage and hashing.
+    /// Appends the database name for Azure SQL Database connections so that
+    /// different databases on the same logical server get distinct server_ids.
     /// Appends ":RO" for ReadOnlyIntent connections so they get a
     /// different server_id than read-write connections to the same host.
     /// </summary>
     internal static string GetServerNameForStorage(ServerConnection server)
     {
-        return server.ReadOnlyIntent ? server.ServerName + ":RO" : server.ServerName;
+        var name = string.IsNullOrWhiteSpace(server.DatabaseName)
+            ? server.ServerName
+            : server.ServerName + ":" + server.DatabaseName;
+
+        return server.ReadOnlyIntent ? name + ":RO" : name;
     }
 
     /// <summary>

@@ -1841,11 +1841,18 @@ OPTION(MAXDOP 1, RECOMPILE);";
 
                 if (edition.Contains("Enterprise", StringComparison.OrdinalIgnoreCase))
                 {
-                    using var featCmd = new SqlCommand(@"
-SELECT
-    DB_NAME(database_id) AS database_name,
-    feature_name
-FROM sys.dm_db_persisted_sku_features", connection);
+                    var hasDatabaseId = false;
+                    using (var colCheck = new SqlCommand(
+                        "SELECT COL_LENGTH('sys.dm_db_persisted_sku_features', 'database_id')", connection))
+                    {
+                        colCheck.CommandTimeout = 10;
+                        hasDatabaseId = await colCheck.ExecuteScalarAsync() is not null and not DBNull;
+                    }
+
+                    var featSql = hasDatabaseId
+                        ? "SELECT DB_NAME(database_id) AS database_name, feature_name FROM sys.dm_db_persisted_sku_features"
+                        : "SELECT N'(unknown)' AS database_name, feature_name FROM sys.dm_db_persisted_sku_features";
+                    using var featCmd = new SqlCommand(featSql, connection);
                     featCmd.CommandTimeout = 30;
 
                     var features = new List<string>();
@@ -1909,7 +1916,7 @@ FROM sys.dm_db_persisted_sku_features", connection);
             }
             catch (Exception ex)
             {
-                Logger.Error($"Recommendation check failed (Enterprise features): {ex.Message}", ex);
+                Logger.Error($"[{ServerLabel}] Recommendation check failed (Enterprise features): {ex.Message}", ex);
             }
 
             // 2. CPU right-sizing score
@@ -1953,7 +1960,7 @@ OPTION(MAXDOP 1, RECOMPILE);", connection);
             }
             catch (Exception ex)
             {
-                Logger.Error($"Recommendation check failed (CPU right-sizing): {ex.Message}", ex);
+                Logger.Error($"[{ServerLabel}] Recommendation check failed (CPU right-sizing): {ex.Message}", ex);
             }
 
             // 3. Memory right-sizing score
@@ -1997,7 +2004,7 @@ OPTION(MAXDOP 1);", connection);
             }
             catch (Exception ex)
             {
-                Logger.Error($"Recommendation check failed (Memory right-sizing): {ex.Message}", ex);
+                Logger.Error($"[{ServerLabel}] Recommendation check failed (Memory right-sizing): {ex.Message}", ex);
             }
 
             // 4. Unused index cost quantification
@@ -2019,7 +2026,7 @@ OPTION(MAXDOP 1);", connection);
             }
             catch (Exception ex)
             {
-                Logger.Error($"Recommendation check failed (Index analysis): {ex.Message}", ex);
+                Logger.Error($"[{ServerLabel}] Recommendation check failed (Index analysis): {ex.Message}", ex);
             }
 
             // 5. Compression savings estimator
@@ -2086,7 +2093,7 @@ OPTION(MAXDOP 1, RECOMPILE);", connection);
             }
             catch (Exception ex)
             {
-                Logger.Error($"Recommendation check failed (Compression): {ex.Message}", ex);
+                Logger.Error($"[{ServerLabel}] Recommendation check failed (Compression): {ex.Message}", ex);
             }
 
             // 6. Dormant database detection with cost impact
@@ -2122,7 +2129,7 @@ OPTION(MAXDOP 1, RECOMPILE);", connection);
             }
             catch (Exception ex)
             {
-                Logger.Error($"Recommendation check failed (Dormant databases): {ex.Message}", ex);
+                Logger.Error($"[{ServerLabel}] Recommendation check failed (Dormant databases): {ex.Message}", ex);
             }
 
             // 7. Dev/test workload detection
@@ -2159,7 +2166,7 @@ AND   database_id > 4", connection);
             }
             catch (Exception ex)
             {
-                Logger.Error($"Recommendation check failed (Dev/test detection): {ex.Message}", ex);
+                Logger.Error($"[{ServerLabel}] Recommendation check failed (Dev/test detection): {ex.Message}", ex);
             }
 
             // 11. Maintenance window efficiency — jobs running long
@@ -2206,7 +2213,7 @@ ORDER BY SUM(CAST(is_running_long AS int)) DESC", connection);
             }
             catch (Exception ex)
             {
-                Logger.Error($"Recommendation check failed (Maintenance window): {ex.Message}", ex);
+                Logger.Error($"[{ServerLabel}] Recommendation check failed (Maintenance window): {ex.Message}", ex);
             }
 
             // 12. VM right-sizing — prescriptive core/memory targets
@@ -2215,7 +2222,7 @@ ORDER BY SUM(CAST(is_running_long AS int)) DESC", connection);
                 using var vmCmd = new SqlCommand(@"
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 SELECT
-    p95_cpu = (SELECT PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY cus.sqlserver_cpu_utilization)
+    p95_cpu = (SELECT TOP (1) PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY cus.sqlserver_cpu_utilization) OVER ()
                FROM collect.cpu_utilization_stats AS cus
                WHERE cus.collection_time >= DATEADD(DAY, -7, SYSDATETIME())),
     cpu_count = (SELECT si.cpu_count FROM sys.dm_os_sys_info AS si),
@@ -2291,7 +2298,7 @@ OPTION(MAXDOP 1, RECOMPILE);", connection);
             }
             catch (Exception ex)
             {
-                Logger.Error($"Recommendation check failed (VM right-sizing): {ex.Message}", ex);
+                Logger.Error($"[{ServerLabel}] Recommendation check failed (VM right-sizing): {ex.Message}", ex);
             }
 
             // 13. Storage tier optimization — flag databases with low IO latency
@@ -2353,7 +2360,7 @@ OPTION(MAXDOP 1, RECOMPILE);", connection);
             }
             catch (Exception ex)
             {
-                Logger.Error($"Recommendation check failed (Storage tier): {ex.Message}", ex);
+                Logger.Error($"[{ServerLabel}] Recommendation check failed (Storage tier): {ex.Message}", ex);
             }
 
             // 14. Reserved capacity candidates — stable CPU utilization
@@ -2398,7 +2405,7 @@ OPTION(MAXDOP 1, RECOMPILE);", connection);
             }
             catch (Exception ex)
             {
-                Logger.Error($"Recommendation check failed (Reserved capacity): {ex.Message}", ex);
+                Logger.Error($"[{ServerLabel}] Recommendation check failed (Reserved capacity): {ex.Message}", ex);
             }
 
             return recommendations;
@@ -2674,6 +2681,11 @@ OPTION(MAXDOP 1, RECOMPILE);", connection);
         public string IndexWrites { get; set; } = "";
         public string OriginalIndexDefinition { get; set; } = "";
         public string Script { get; set; } = "";
+
+        public decimal IndexSizeGbSort => NumericSortHelper.Parse(IndexSizeGb);
+        public decimal IndexRowsSort => NumericSortHelper.Parse(IndexRows);
+        public decimal IndexReadsSort => NumericSortHelper.Parse(IndexReads);
+        public decimal IndexWritesSort => NumericSortHelper.Parse(IndexWrites);
     }
 
     public class FinOpsProvisioningTrend
@@ -2768,6 +2780,25 @@ OPTION(MAXDOP 1, RECOMPILE);", connection);
         public string LatchWaitCount { get; set; } = "";
         public string DailyLatchWaitsSaved { get; set; } = "";
         public string AvgLatchWaitMs { get; set; } = "";
+
+        public decimal TotalIndexesSort => NumericSortHelper.Parse(TotalIndexes);
+        public decimal RemovableIndexesSort => NumericSortHelper.Parse(RemovableIndexes);
+        public decimal MergeableIndexesSort => NumericSortHelper.Parse(MergeableIndexes);
+        public decimal CompressableIndexesSort => NumericSortHelper.Parse(CompressableIndexes);
+        public decimal PercentRemovableSort => NumericSortHelper.Parse(PercentRemovable);
+        public decimal CurrentSizeGbSort => NumericSortHelper.Parse(CurrentSizeGb);
+        public decimal SizeAfterCleanupGbSort => NumericSortHelper.Parse(SizeAfterCleanupGb);
+        public decimal SpaceSavedGbSort => NumericSortHelper.Parse(SpaceSavedGb);
+        public decimal SpaceReductionPercentSort => NumericSortHelper.Parse(SpaceReductionPercent);
+        public decimal TotalRowsSort => NumericSortHelper.Parse(TotalRows);
+        public decimal WritesSort => NumericSortHelper.Parse(Writes);
+        public decimal DailyWriteOpsSavedSort => NumericSortHelper.Parse(DailyWriteOpsSaved);
+        public decimal LockWaitCountSort => NumericSortHelper.Parse(LockWaitCount);
+        public decimal DailyLockWaitsSavedSort => NumericSortHelper.Parse(DailyLockWaitsSaved);
+        public decimal AvgLockWaitMsSort => NumericSortHelper.Parse(AvgLockWaitMs);
+        public decimal LatchWaitCountSort => NumericSortHelper.Parse(LatchWaitCount);
+        public decimal DailyLatchWaitsSavedSort => NumericSortHelper.Parse(DailyLatchWaitsSaved);
+        public decimal AvgLatchWaitMsSort => NumericSortHelper.Parse(AvgLatchWaitMs);
     }
 
     public class FinOpsRecommendation
@@ -2807,5 +2838,16 @@ OPTION(MAXDOP 1, RECOMPILE);", connection);
             >= 60 => "#F39C12",
             _ => "#27AE60"
         };
+    }
+
+    internal static class NumericSortHelper
+    {
+        internal static decimal Parse(string? s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return -1m;
+            var cleaned = s.Replace(",", "").Replace("%", "").Trim();
+            return decimal.TryParse(cleaned, System.Globalization.NumberStyles.Any,
+                System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : -1m;
+        }
     }
 }

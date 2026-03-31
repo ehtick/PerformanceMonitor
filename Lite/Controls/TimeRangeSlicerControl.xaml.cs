@@ -14,8 +14,14 @@ namespace PerformanceMonitorLite.Controls;
 public partial class TimeRangeSlicerControl : UserControl
 {
     private List<TimeSliceBucket> _data = new();
+    private DateTime? _requestedStartUtc;
+    private DateTime? _requestedEndUtc;
     private string _metricLabel = "Sessions";
     private bool _isExpanded = true;
+
+    // Overlay: per-item trend drawn on top of the aggregate area chart
+    private List<(DateTime TimeUtc, double Value)>? _overlayData;
+    private string? _overlayLabel;
 
     // Range as normalised [0..1] positions within the data span
     private double _rangeStart;
@@ -59,9 +65,12 @@ public partial class TimeRangeSlicerControl : UserControl
 
     /// <summary>
     /// Loads slicer data. All timestamps must be UTC.
+    /// requestedStartUtc/requestedEndUtc define the full time window so the slicer
+    /// shows the correct span even when data is sparse. Empty hours get zero-value buckets.
     /// Selection defaults to the full range (no filtering until user interacts).
     /// </summary>
-    public void LoadData(List<TimeSliceBucket> data, string metricLabel)
+    public void LoadData(List<TimeSliceBucket> data, string metricLabel,
+        DateTime? requestedStartUtc = null, DateTime? requestedEndUtc = null)
     {
         // Preserve selection if we already have data (auto-refresh)
         DateTime? prevStart = null, prevEnd = null;
@@ -71,7 +80,9 @@ public partial class TimeRangeSlicerControl : UserControl
             prevEnd = UtcAtNorm(_rangeEnd);
         }
 
-        _data = data;
+        _requestedStartUtc = requestedStartUtc;
+        _requestedEndUtc = requestedEndUtc;
+        _data = FillEmptyBuckets(data, requestedStartUtc, requestedEndUtc);
         _metricLabel = metricLabel;
 
         if (prevStart.HasValue && prevEnd.HasValue && _data.Count >= 2)
@@ -89,6 +100,26 @@ public partial class TimeRangeSlicerControl : UserControl
         Redraw();
     }
 
+    /// <summary>
+    /// Sets an overlay trend line on the slicer. Drawn on its own Y scale
+    /// so it's visible regardless of the aggregate chart's magnitude.
+    /// </summary>
+    public void SetOverlay(List<(DateTime TimeUtc, double Value)> data, string label)
+    {
+        _overlayData = data.Count >= 1 ? data : null;
+        _overlayLabel = label;
+        Redraw();
+    }
+
+    /// <summary>Removes the overlay trend line.</summary>
+    public void ClearOverlay()
+    {
+        if (_overlayData == null) return;
+        _overlayData = null;
+        _overlayLabel = null;
+        Redraw();
+    }
+
     /// <summary>Updates the metric label and redraws (when sort column changes).</summary>
     public void UpdateMetric(string metricLabel)
     {
@@ -101,8 +132,38 @@ public partial class TimeRangeSlicerControl : UserControl
 
     // ── Time mapping ──
 
-    private DateTime DataStartUtc => _data[0].BucketTimeUtc;
-    private DateTime DataEndUtc => _data[^1].BucketTimeUtc.AddHours(1);
+    private DateTime DataStartUtc => _requestedStartUtc ?? _data[0].BucketTimeUtc;
+    private DateTime DataEndUtc => _requestedEndUtc ?? _data[^1].BucketTimeUtc.AddHours(1);
+
+    /// <summary>
+    /// Fills in zero-value buckets for hours with no data so the slicer
+    /// spans the full requested time range.
+    /// </summary>
+    private static List<TimeSliceBucket> FillEmptyBuckets(
+        List<TimeSliceBucket> data, DateTime? requestedStart, DateTime? requestedEnd)
+    {
+        if (data.Count == 0 || !requestedStart.HasValue || !requestedEnd.HasValue)
+            return data;
+
+        var floorStart = FloorToHour(requestedStart.Value);
+        // Floor the end too — we don't want a bucket for the current partial hour extending into the future
+        var floorEnd = FloorToHour(requestedEnd.Value);
+
+        var existing = new Dictionary<long, TimeSliceBucket>();
+        foreach (var b in data)
+            existing[FloorToHour(b.BucketTimeUtc).Ticks] = b;
+
+        var result = new List<TimeSliceBucket>();
+        for (var t = floorStart; t <= floorEnd; t = t.AddHours(1))
+        {
+            if (existing.TryGetValue(t.Ticks, out var bucket))
+                result.Add(bucket);
+            else
+                result.Add(new TimeSliceBucket { BucketTimeUtc = t });
+        }
+
+        return result;
+    }
 
     private DateTime UtcAtNorm(double norm)
     {
@@ -122,7 +183,7 @@ public partial class TimeRangeSlicerControl : UserControl
     public void Redraw()
     {
         SlicerCanvas.Children.Clear();
-        if (_data.Count < 2) return;
+        if (_data.Count < 1) return;
 
         var w = SlicerBorder.ActualWidth;
         var h = SlicerBorder.ActualHeight;
@@ -211,6 +272,42 @@ public partial class TimeRangeSlicerControl : UserControl
 
         AddLine(selLeft, 0, selRight, 0, handleBrush, 0.5);
         AddLine(selLeft, h, selRight, h, handleBrush, 0.5);
+
+        // Overlay dots (per-item highlight from grid selection)
+        if (_overlayData != null && _overlayData.Count >= 1)
+        {
+            var overlayMax = _overlayData.Max(d => d.Value);
+            if (overlayMax <= 0) overlayMax = 1;
+
+            var dotBrush = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FF6F00"));
+            var firstBucket = _data[0].BucketTimeUtc;
+            var lastBucket = _data[^1].BucketTimeUtc;
+            foreach (var pt in _overlayData)
+            {
+                if (pt.TimeUtc < firstBucket || pt.TimeUtc > lastBucket) continue;
+                var norm = NormAtUtc(pt.TimeUtc);
+                var ox = norm * w;
+                var oy = Math.Clamp(chartBottom - (pt.Value / overlayMax) * chartHeight, chartTop, chartBottom);
+                var dot = new Ellipse { Width = 5, Height = 5, Fill = dotBrush };
+                Canvas.SetLeft(dot, ox - 2.5);
+                Canvas.SetTop(dot, oy - 2.5);
+                SlicerCanvas.Children.Add(dot);
+            }
+
+            if (!string.IsNullOrEmpty(_overlayLabel))
+            {
+                var overlayLabelTb = new TextBlock
+                {
+                    Text = _overlayLabel,
+                    FontSize = 11,
+                    FontWeight = FontWeights.SemiBold,
+                    Foreground = dotBrush
+                };
+                Canvas.SetLeft(overlayLabelTb, 8);
+                Canvas.SetTop(overlayLabelTb, 2);
+                SlicerCanvas.Children.Add(overlayLabelTb);
+            }
+        }
     }
 
     private void AddRect(double x, double y, double width, double height, Brush fill)
@@ -258,7 +355,8 @@ public partial class TimeRangeSlicerControl : UserControl
         var startDisplay = ServerTimeHelper.FormatServerTime(UtcAtNorm(_rangeStart), "yyyy-MM-dd HH:mm");
         var endDisplay = ServerTimeHelper.FormatServerTime(UtcAtNorm(_rangeEnd), "yyyy-MM-dd HH:mm");
         var spanHours = (UtcAtNorm(_rangeEnd) - UtcAtNorm(_rangeStart)).TotalHours;
-        RangeLabel.Text = $"{startDisplay} \u2192 {endDisplay}  ({spanHours:F0}h)";
+        var spanLabel = spanHours >= 1 ? $"{spanHours:F0}h" : $"{spanHours * 60:F0}m";
+        RangeLabel.Text = $"{startDisplay} \u2192 {endDisplay}  ({spanLabel})";
     }
 
     // ── Mouse interaction ──

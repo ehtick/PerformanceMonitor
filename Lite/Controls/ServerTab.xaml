@@ -1,4 +1,4 @@
-﻿<UserControl x:Class="PerformanceMonitorLite.Controls.ServerTab"
+<UserControl x:Class="PerformanceMonitorLite.Controls.ServerTab"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:ScottPlot="clr-namespace:ScottPlot.WPF;assembly=ScottPlot.WPF"
@@ -128,6 +128,32 @@
         <!-- Main Tab Control -->
         <TabControl Grid.Row="1" x:Name="MainTabControl" Background="{DynamicResource BackgroundBrush}"
                     BorderThickness="0" Padding="0" SelectionChanged="MainTabControl_SelectionChanged">
+
+            <!-- Overview Tab -->
+            <TabItem Header="Overview">
+                <Grid Margin="8">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <Border Grid.Row="0" Grid.Column="0" Margin="0,0,4,4">
+                        <ScottPlot:WpfPlot x:Name="OverviewCpuChart"/>
+                    </Border>
+                    <Border Grid.Row="0" Grid.Column="1" Margin="4,0,0,4">
+                        <ScottPlot:WpfPlot x:Name="OverviewMemoryChart"/>
+                    </Border>
+                    <Border Grid.Row="1" Grid.Column="0" Margin="0,4,4,0">
+                        <ScottPlot:WpfPlot x:Name="OverviewFileIoChart"/>
+                    </Border>
+                    <Border Grid.Row="1" Grid.Column="1" Margin="4,4,0,0">
+                        <ScottPlot:WpfPlot x:Name="OverviewWaitStatsChart"/>
+                    </Border>
+                </Grid>
+            </TabItem>
 
             <!-- Wait Stats Tab -->
             <TabItem Header="Wait Stats">
@@ -342,6 +368,7 @@
                                       RowStyle="{StaticResource GridRowStyle}"
                                       HeadersVisibility="Column" GridLinesVisibility="Horizontal"
                                       CanUserSortColumns="True"
+                                      SelectionChanged="QueryStatsGrid_SelectionChanged"
                                       Sorting="QueryStatsGrid_Sorting"
                                       MouseDoubleClick="QueryStatsGrid_MouseDoubleClick">
                                 <DataGrid.Columns>
@@ -475,6 +502,7 @@
                                       RowStyle="{StaticResource GridRowStyle}"
                                       HeadersVisibility="Column" GridLinesVisibility="Horizontal"
                                       CanUserSortColumns="True"
+                                      SelectionChanged="ProcedureStatsGrid_SelectionChanged"
                                       Sorting="ProcedureStatsGrid_Sorting"
                                       MouseDoubleClick="ProcedureStatsGrid_MouseDoubleClick">
                                 <DataGrid.Columns>
@@ -587,6 +615,7 @@
                                       RowStyle="{StaticResource GridRowStyle}"
                                       HeadersVisibility="Column" GridLinesVisibility="Horizontal"
                                       CanUserSortColumns="True"
+                                      SelectionChanged="QueryStoreGrid_SelectionChanged"
                                       Sorting="QueryStoreGrid_Sorting"
                                       MouseDoubleClick="QueryStoreGrid_MouseDoubleClick">
                                 <DataGrid.Columns>
@@ -688,6 +717,27 @@
                                     </DataGridTemplateColumn>
                                 </DataGrid.Columns>
                             </DataGrid>
+                            </Grid>
+                        </TabItem>
+                        <TabItem Header="Query Heatmap">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="*"/>
+                                </Grid.RowDefinitions>
+                                <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="8,4,0,4">
+                                    <TextBlock Text="Metric:" VerticalAlignment="Center" Margin="0,0,6,0" FontSize="11"/>
+                                    <ComboBox x:Name="HeatmapMetricCombo" SelectedIndex="0" SelectionChanged="HeatmapMetric_SelectionChanged" FontSize="11" Padding="4,2">
+                                        <ComboBoxItem Content="Duration (ms)"/>
+                                        <ComboBoxItem Content="CPU (ms)"/>
+                                        <ComboBoxItem Content="Logical Reads"/>
+                                        <ComboBoxItem Content="Logical Writes"/>
+                                        <ComboBoxItem Content="Execution Count"/>
+                                    </ComboBox>
+                                </StackPanel>
+                                <ScottPlot:WpfPlot Grid.Row="1" x:Name="QueryHeatmapChart"
+                                                    MouseMove="HeatmapChart_MouseMove"
+                                                    MouseLeave="HeatmapChart_MouseLeave"/>
                             </Grid>
                         </TabItem>
                     </TabControl>
@@ -968,11 +1018,18 @@
                             </Grid>
                         </TabItem>
                         <TabItem Header="Blocked Process Reports">
-                            <DataGrid x:Name="BlockedProcessReportGrid"
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="*"/>
+                                </Grid.RowDefinitions>
+                                <controls:TimeRangeSlicerControl x:Name="BlockingSlicer" Grid.Row="0"/>
+                            <DataGrid x:Name="BlockedProcessReportGrid" Grid.Row="1"
                                       AutoGenerateColumns="False" IsReadOnly="True"
                                       RowStyle="{StaticResource BlockingRowStyle}"
                                       HeadersVisibility="Column" GridLinesVisibility="Horizontal"
-                                      HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
+                                      HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"
+                                      Sorting="BlockedProcessReportGrid_Sorting">
                                 <DataGrid.Columns>
                                     <DataGridTextColumn Binding="{Binding EventTimeLocal}" Width="130">
                                         <DataGridTextColumn.Header><StackPanel Orientation="Horizontal"><Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="EventTimeLocal" Click="FilterButton_Click" Margin="0,0,4,0"/><TextBlock Text="Event Time" FontWeight="Bold" VerticalAlignment="Center"/></StackPanel></DataGridTextColumn.Header>
@@ -1065,9 +1122,16 @@
                                     </DataGridTemplateColumn>
                                 </DataGrid.Columns>
                             </DataGrid>
+                            </Grid>
                         </TabItem>
                         <TabItem Header="Deadlocks">
-                            <DataGrid x:Name="DeadlockGrid"
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="*"/>
+                                </Grid.RowDefinitions>
+                                <controls:TimeRangeSlicerControl x:Name="DeadlockSlicer" Grid.Row="0"/>
+                            <DataGrid x:Name="DeadlockGrid" Grid.Row="1"
                                       AutoGenerateColumns="False" IsReadOnly="True"
                                       RowStyle="{StaticResource GridRowStyle}"
                                       HeadersVisibility="Column" GridLinesVisibility="Horizontal"
@@ -1106,7 +1170,7 @@
                                     <DataGridTextColumn Binding="{Binding WaitResource}" Width="200">
                                         <DataGridTextColumn.Header><StackPanel Orientation="Horizontal"><Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="WaitResource" Click="FilterButton_Click" Margin="0,0,4,0"/><TextBlock Text="Wait Resource" FontWeight="Bold" VerticalAlignment="Center"/></StackPanel></DataGridTextColumn.Header>
                                     </DataGridTextColumn>
-                                    <DataGridTextColumn Binding="{Binding WaitTimeFormatted}" Width="80">
+                                    <DataGridTextColumn Binding="{Binding WaitTimeFormatted}" Width="80" SortMemberPath="WaitTime">
                                         <DataGridTextColumn.Header><StackPanel Orientation="Horizontal"><Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="WaitTimeFormatted" Click="FilterButton_Click" Margin="0,0,4,0"/><TextBlock Text="Wait (ms)" FontWeight="Bold" VerticalAlignment="Center"/></StackPanel></DataGridTextColumn.Header>
                                     </DataGridTextColumn>
                                     <DataGridTextColumn Binding="{Binding IsolationLevel}" Width="120">
@@ -1149,6 +1213,7 @@
                                     </DataGridTemplateColumn>
                                 </DataGrid.Columns>
                             </DataGrid>
+                            </Grid>
                         </TabItem>
                     </TabControl>
                 </Grid>
@@ -1241,7 +1306,7 @@
                             <DataGridTextColumn Binding="{Binding P95DurationFormatted}" Width="110" SortMemberPath="P95DurationSeconds">
                                 <DataGridTextColumn.Header><StackPanel Orientation="Horizontal"><Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="P95DurationFormatted" Click="FilterButton_Click" Margin="0,0,4,0"/><TextBlock Text="P95 Duration" FontWeight="Bold" VerticalAlignment="Center"/></StackPanel></DataGridTextColumn.Header>
                             </DataGridTextColumn>
-                            <DataGridTextColumn Binding="{Binding PercentOfAverageFormatted}" Width="100">
+                            <DataGridTextColumn Binding="{Binding PercentOfAverageFormatted}" Width="100" SortMemberPath="PercentOfAverage">
                                 <DataGridTextColumn.Header><StackPanel Orientation="Horizontal"><Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="PercentOfAverageFormatted" Click="FilterButton_Click" Margin="0,0,4,0"/><TextBlock Text="% of Average" FontWeight="Bold" VerticalAlignment="Center"/></StackPanel></DataGridTextColumn.Header>
                             </DataGridTextColumn>
                             <DataGridTextColumn Binding="{Binding RunningLongDisplay}" Width="90">

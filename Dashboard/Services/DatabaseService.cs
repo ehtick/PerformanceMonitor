@@ -38,6 +38,12 @@ namespace PerformanceMonitorDashboard.Services
         public string ConnectionString => _connectionString;
 
         /// <summary>
+        /// Server name extracted from the connection string, for use in log messages.
+        /// </summary>
+        private string ServerLabel =>
+            new SqlConnectionStringBuilder(_connectionString).DataSource ?? "(unknown)";
+
+        /// <summary>
         /// Opens a throttled database connection. The semaphore is released when the connection is disposed.
         /// </summary>
         private async Task<ThrottledConnection> OpenThrottledConnectionAsync()
@@ -85,7 +91,8 @@ namespace PerformanceMonitorDashboard.Services
             string? username = null,
             string? password = null,
             string encryptMode = "Mandatory",
-            bool trustServerCertificate = false)
+            bool trustServerCertificate = false,
+            bool readOnlyIntent = false)
         {
             var builder = new SqlConnectionStringBuilder
             {
@@ -93,7 +100,8 @@ namespace PerformanceMonitorDashboard.Services
                 InitialCatalog = "PerformanceMonitor",
                 TrustServerCertificate = trustServerCertificate,
                 IntegratedSecurity = useWindowsAuth,
-                MultipleActiveResultSets = true
+                MultipleActiveResultSets = true,
+                ApplicationIntent = readOnlyIntent ? ApplicationIntent.ReadOnly : ApplicationIntent.ReadWrite
             };
 
             // Set encryption mode

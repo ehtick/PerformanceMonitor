@@ -18,8 +18,13 @@ namespace PerformanceMonitorDashboard.Controls;
 public partial class TimeRangeSlicerControl : UserControl
 {
     private List<TimeSliceBucket> _data = new();
+    private DateTime? _requestedStart;
+    private DateTime? _requestedEnd;
     private string _metricLabel = "Sessions";
     private bool _isExpanded = true;
+
+    private List<(DateTime Time, double Value)>? _overlayData;
+    private string? _overlayLabel;
 
     private double _rangeStart;
     private double _rangeEnd = 1.0;
@@ -60,7 +65,8 @@ public partial class TimeRangeSlicerControl : UserControl
         }
     }
 
-    public void LoadData(List<TimeSliceBucket> data, string metricLabel)
+    public void LoadData(List<TimeSliceBucket> data, string metricLabel,
+        DateTime? requestedStart = null, DateTime? requestedEnd = null)
     {
         // Preserve selection if we already have data (auto-refresh)
         DateTime? prevStart = null, prevEnd = null;
@@ -70,7 +76,9 @@ public partial class TimeRangeSlicerControl : UserControl
             prevEnd = TimeAtNorm(_rangeEnd);
         }
 
-        _data = data;
+        _requestedStart = requestedStart;
+        _requestedEnd = requestedEnd;
+        _data = FillEmptyBuckets(data, requestedStart, requestedEnd);
         _metricLabel = metricLabel;
 
         if (prevStart.HasValue && prevEnd.HasValue && _data.Count >= 2)
@@ -88,6 +96,21 @@ public partial class TimeRangeSlicerControl : UserControl
         Redraw();
     }
 
+    public void SetOverlay(List<(DateTime Time, double Value)> data, string label)
+    {
+        _overlayData = data.Count >= 1 ? data : null;
+        _overlayLabel = label;
+        Redraw();
+    }
+
+    public void ClearOverlay()
+    {
+        if (_overlayData == null) return;
+        _overlayData = null;
+        _overlayLabel = null;
+        Redraw();
+    }
+
     public void UpdateMetric(string metricLabel)
     {
         _metricLabel = metricLabel;
@@ -98,8 +121,33 @@ public partial class TimeRangeSlicerControl : UserControl
     public DateTime? SelectionEnd => _data.Count > 0 ? TimeAtNorm(_rangeEnd) : null;
     public bool HasNarrowedSelection => _data.Count > 0 && (_rangeStart > 0.01 || _rangeEnd < 0.99);
 
-    private DateTime DataStart => _data[0].BucketTime;
-    private DateTime DataEnd => _data[^1].BucketTime.AddHours(1);
+    private DateTime DataStart => _requestedStart ?? _data[0].BucketTime;
+    private DateTime DataEnd => _requestedEnd ?? _data[^1].BucketTime.AddHours(1);
+
+    private static List<TimeSliceBucket> FillEmptyBuckets(
+        List<TimeSliceBucket> data, DateTime? requestedStart, DateTime? requestedEnd)
+    {
+        if (data.Count == 0 || !requestedStart.HasValue || !requestedEnd.HasValue)
+            return data;
+
+        var floorStart = FloorToHour(requestedStart.Value);
+        var floorEnd = FloorToHour(requestedEnd.Value);
+
+        var existing = new Dictionary<long, TimeSliceBucket>();
+        foreach (var b in data)
+            existing[FloorToHour(b.BucketTime).Ticks] = b;
+
+        var result = new List<TimeSliceBucket>();
+        for (var t = floorStart; t <= floorEnd; t = t.AddHours(1))
+        {
+            if (existing.TryGetValue(t.Ticks, out var bucket))
+                result.Add(bucket);
+            else
+                result.Add(new TimeSliceBucket { BucketTime = t });
+        }
+
+        return result;
+    }
 
     private DateTime TimeAtNorm(double norm)
     {
@@ -118,8 +166,9 @@ public partial class TimeRangeSlicerControl : UserControl
 
     public void Redraw()
     {
+        UpdateRangeLabel();
         SlicerCanvas.Children.Clear();
-        if (_data.Count < 2) return;
+        if (_data.Count < 1) return;
 
         var w = SlicerBorder.ActualWidth;
         var h = SlicerBorder.ActualHeight;
@@ -204,6 +253,43 @@ public partial class TimeRangeSlicerControl : UserControl
         DrawHandle(selRight - HandleWidthPx, h, handleBrush);
         AddLine(selLeft, 0, selRight, 0, handleBrush, 0.5);
         AddLine(selLeft, h, selRight, h, handleBrush, 0.5);
+
+        // Overlay trend line (per-item highlight from grid selection)
+        // Overlay dots (per-item highlight from grid selection)
+        if (_overlayData != null && _overlayData.Count >= 1)
+        {
+            var overlayMax = _overlayData.Max(d => d.Value);
+            if (overlayMax <= 0) overlayMax = 1;
+
+            var dotBrush = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FF6F00"));
+            var firstBucket = _data[0].BucketTime;
+            var lastBucket = _data[^1].BucketTime;
+            foreach (var pt in _overlayData)
+            {
+                if (pt.Time < firstBucket || pt.Time > lastBucket) continue;
+                var norm = NormAtTime(pt.Time);
+                var ox = norm * w;
+                var oy = Math.Clamp(chartBottom - (pt.Value / overlayMax) * chartHeight, chartTop, chartBottom);
+                var dot = new Ellipse { Width = 5, Height = 5, Fill = dotBrush };
+                Canvas.SetLeft(dot, ox - 2.5);
+                Canvas.SetTop(dot, oy - 2.5);
+                SlicerCanvas.Children.Add(dot);
+            }
+
+            if (!string.IsNullOrEmpty(_overlayLabel))
+            {
+                var overlayLabelTb = new TextBlock
+                {
+                    Text = _overlayLabel,
+                    FontSize = 11,
+                    FontWeight = FontWeights.SemiBold,
+                    Foreground = dotBrush
+                };
+                Canvas.SetLeft(overlayLabelTb, 8);
+                Canvas.SetTop(overlayLabelTb, 2);
+                SlicerCanvas.Children.Add(overlayLabelTb);
+            }
+        }
     }
 
     private void AddRect(double x, double y, double width, double height, Brush fill)
@@ -251,7 +337,8 @@ public partial class TimeRangeSlicerControl : UserControl
         var start = ServerTimeHelper.ConvertForDisplay(TimeAtNorm(_rangeStart), ServerTimeHelper.CurrentDisplayMode);
         var end = ServerTimeHelper.ConvertForDisplay(TimeAtNorm(_rangeEnd), ServerTimeHelper.CurrentDisplayMode);
         var span = end - start;
-        RangeLabel.Text = $"{start:yyyy-MM-dd HH:mm} \u2192 {end:yyyy-MM-dd HH:mm}  ({span.TotalHours:F0}h)";
+        var spanLabel = span.TotalHours >= 1 ? $"{span.TotalHours:F0}h" : $"{span.TotalMinutes:F0}m";
+        RangeLabel.Text = $"{start:yyyy-MM-dd HH:mm} \u2192 {end:yyyy-MM-dd HH:mm}  ({spanLabel})";
     }
 
     // ── Mouse interaction ──

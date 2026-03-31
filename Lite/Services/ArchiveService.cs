@@ -30,6 +30,12 @@ public class ArchiveService
     private readonly ILogger<ArchiveService>? _logger;
     private static readonly SemaphoreSlim s_archiveLock = new(1, 1);
 
+    /// <summary>
+    /// Indicates whether an archival operation is currently in progress.
+    /// UI code can check this to warn users before dismiss or show a status indicator.
+    /// </summary>
+    public static bool IsArchiving { get; private set; }
+
     /* Tables eligible for archival with their time column.
        IMPORTANT: Every table with time-series data must be listed here,
        or it will grow unbounded and push the DB past the 512 MB reset threshold. */
@@ -88,6 +94,7 @@ public class ArchiveService
             return;
         }
 
+        IsArchiving = true;
         try
         {
         var cutoffDate = hotDataHours.HasValue
@@ -146,6 +153,7 @@ public class ArchiveService
         }
         finally
         {
+            IsArchiving = false;
             s_archiveLock.Release();
         }
     }
@@ -301,6 +309,14 @@ COPY (
         using var con = new DuckDBConnection("DataSource=:memory:");
         con.Open();
 
+        /* Cap memory to avoid multi-GB spikes decompressing large parquet archives.
+           DuckDB will spill excess to its temp directory automatically. */
+        using (var pragma = con.CreateCommand())
+        {
+            pragma.CommandText = "SET memory_limit = '2GB'; SET preserve_insertion_order = false;";
+            pragma.ExecuteNonQuery();
+        }
+
         var totalMerged = 0;
         var totalRemoved = 0;
 
@@ -416,6 +432,7 @@ COPY (
             return;
         }
 
+        IsArchiving = true;
         try
         {
             var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmm");
@@ -475,6 +492,7 @@ COPY (
         }
         finally
         {
+            IsArchiving = false;
             s_archiveLock.Release();
         }
     }
