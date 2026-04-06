@@ -332,21 +332,21 @@ public partial class CorrelatedTimelineLanesControl : UserControl
         {
             figureBackground = ScottPlot.Color.FromHex("#EEF4FA");
             dataBackground   = ScottPlot.Color.FromHex("#DAE6F0");
-            textColor        = ScottPlot.Color.FromHex("#364D61");
+            textColor        = ScottPlot.Color.FromHex("#1A2A3A");
             gridColor        = ScottPlot.Color.FromHex("#A8BDD0").WithAlpha(120);
         }
         else if (ThemeManager.HasLightBackground)
         {
             figureBackground = ScottPlot.Color.FromHex("#FFFFFF");
             dataBackground   = ScottPlot.Color.FromHex("#F5F7FA");
-            textColor        = ScottPlot.Color.FromHex("#4A5568");
+            textColor        = ScottPlot.Color.FromHex("#1A1D23");
             gridColor        = ScottPlot.Colors.Black.WithAlpha(20);
         }
         else
         {
             figureBackground = ScottPlot.Color.FromHex("#22252b");
             dataBackground   = ScottPlot.Color.FromHex("#111217");
-            textColor        = ScottPlot.Color.FromHex("#9DA5B4");
+            textColor        = ScottPlot.Color.FromHex("#E4E6EB");
             gridColor        = ScottPlot.Colors.White.WithAlpha(40);
         }
 
@@ -368,10 +368,10 @@ public partial class CorrelatedTimelineLanesControl : UserControl
     private static void ReapplyAxisColors(ScottPlot.WPF.WpfPlot chart)
     {
         var textColor = ThemeManager.CurrentTheme == "CoolBreeze"
-            ? ScottPlot.Color.FromHex("#364D61")
+            ? ScottPlot.Color.FromHex("#1A2A3A")
             : ThemeManager.HasLightBackground
-                ? ScottPlot.Color.FromHex("#4A5568")
-                : ScottPlot.Color.FromHex("#9DA5B4");
+                ? ScottPlot.Color.FromHex("#1A1D23")
+                : ScottPlot.Color.FromHex("#E4E6EB");
         chart.Plot.Axes.Bottom.TickLabelStyle.ForeColor = textColor;
         chart.Plot.Axes.Left.TickLabelStyle.ForeColor = textColor;
         chart.Plot.Axes.Bottom.Label.ForeColor = textColor;
