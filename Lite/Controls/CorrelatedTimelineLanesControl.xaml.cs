@@ -275,7 +275,7 @@ public partial class CorrelatedTimelineLanesControl : UserControl
             var upper = baseline.Mean + 2 * baseline.EffectiveStdDev;
             var lower = Math.Max(0, baseline.Mean - 2 * baseline.EffectiveStdDev);
 
-            _crosshairManager?.SetLaneBaseline(BlockingChart, lower, upper);
+            _crosshairManager?.SetLaneBaseline(BlockingChart, lower, upper, isEventBased: true);
 
             var band = BlockingChart.Plot.Add.HorizontalSpan(lower, upper);
             band.FillStyle.Color = ScottPlot.Color.FromHex("#E57373").WithAlpha(25);

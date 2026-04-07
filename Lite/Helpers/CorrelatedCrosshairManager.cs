@@ -83,13 +83,14 @@ internal sealed class CorrelatedCrosshairManager : IDisposable
     /// Values outside this range get ▲/▼ indicators in the tooltip.
     /// </summary>
     public void SetLaneBaseline(ScottPlot.WPF.WpfPlot chart, double lower, double upper,
-        double minAnomalyValue = 0)
+        double minAnomalyValue = 0, bool isEventBased = false)
     {
         var lane = _lanes.Find(l => l.Chart == chart);
         if (lane == null) return;
         lane.BaselineLower = lower;
         lane.BaselineUpper = upper;
         lane.MinAnomalyValue = minAnomalyValue;
+        lane.IsEventBased = isEventBased;
     }
 
     /// <summary>
@@ -223,9 +224,6 @@ internal sealed class CorrelatedCrosshairManager : IDisposable
                     if (indicator != null)
                     {
                         _tooltipText.Inlines.Add(new Run($" {indicator.Value.Symbol}") { Foreground = indicator.Value.Brush });
-                        var ctx = FormatBaselineContext(lane);
-                        if (ctx != null)
-                            _tooltipText.Inlines.Add(new Run($" ({ctx})") { Foreground = DimBrush });
                     }
                 }
                 else
@@ -240,7 +238,12 @@ internal sealed class CorrelatedCrosshairManager : IDisposable
                     double? value = FindNearestValue(series, xValue);
                     string unit = series.Unit ?? lane.Unit;
                     if (value.HasValue)
+                    {
                         _tooltipText.Inlines.Add(new Run($"\n{series.Name}: {value.Value:N0} {unit}") { Foreground = defaultBrush });
+                        var indicator = GetBaselineIndicator(lane, value.Value);
+                        if (indicator != null)
+                            _tooltipText.Inlines.Add(new Run($" {indicator.Value.Symbol}") { Foreground = indicator.Value.Brush });
+                    }
                     else
                         _tooltipText.Inlines.Add(new Run($"\n{series.Name}: —") { Foreground = defaultBrush });
                 }
@@ -310,6 +313,12 @@ internal sealed class CorrelatedCrosshairManager : IDisposable
     private static BaselineIndicator? GetBaselineIndicator(LaneInfo lane, double value)
     {
         if (lane.BaselineUpper == null || lane.BaselineLower == null) return null;
+        // For event-based metrics (blocking/deadlocks): value significantly above
+        // the baseline mean is a spike, even if within the wide ± 2σ band.
+        // Uses 3x mean as threshold — if you normally see ~5 events and now see 20, that's a spike.
+        var mean = (lane.BaselineUpper.Value + lane.BaselineLower.Value) / 2.0;
+        if (lane.IsEventBased && value >= 1.0 && (mean < 1.0 || value > mean * 3))
+            return new BaselineIndicator("▲", RedBrush);
         // ▲ requires both: outside band AND above absolute minimum (prevents 1% CPU false alarms)
         if (value > lane.BaselineUpper.Value && value >= lane.MinAnomalyValue)
             return new BaselineIndicator("▲", RedBrush);
@@ -360,5 +369,6 @@ internal sealed class CorrelatedCrosshairManager : IDisposable
         public double? BaselineUpper { get; set; }
         public double? BaselineLower { get; set; }
         public double MinAnomalyValue { get; set; }
+        public bool IsEventBased { get; set; }
     }
 }
