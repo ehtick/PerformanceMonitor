@@ -103,6 +103,16 @@
                               SelectionChanged="CustomTimeCombo_Changed" ToolTip="Minute"/>
                     <Button Content="Apply to All" Click="ApplyTimeRangeToAll_Click" Padding="8,4" Margin="0,0,8,0"
                             ToolTip="Apply this time range to all open server tabs"/>
+                    <TextBlock Text="Compare:" VerticalAlignment="Center" Margin="0,0,4,0"
+                               Foreground="{DynamicResource ForegroundBrush}"/>
+                    <ComboBox x:Name="CompareToCombo" SelectedIndex="0" Width="130" Margin="0,0,8,0"
+                              SelectionChanged="CompareToCombo_SelectionChanged"
+                              ToolTip="Overlay a reference period on the Overview charts">
+                        <ComboBoxItem Content="None"/>
+                        <ComboBoxItem Content="Yesterday"/>
+                        <ComboBoxItem Content="Last week"/>
+                        <ComboBoxItem Content="Same day last week"/>
+                    </ComboBox>
                     <Button x:Name="RefreshDataButton" Content="Refresh" Click="RefreshDataButton_Click" Padding="12,4"/>
                     <Separator Style="{StaticResource {x:Static ToolBar.SeparatorStyleKey}}" Margin="8,2"/>
                     <CheckBox x:Name="AutoRefreshCheckBox" Content="Auto-refresh" VerticalAlignment="Center" Margin="0,0,4,0"

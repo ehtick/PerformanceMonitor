@@ -618,6 +618,60 @@ public partial class ServerTab : UserControl
         }
     }
 
+    private async void CompareToCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (!IsLoaded || _isRefreshing) return;
+
+        var hoursBack = GetHoursBack();
+        DateTime? fromDate = null, toDate = null;
+        if (IsCustomRange)
+        {
+            var fromLocal = GetDateTimeFromPickers(FromDatePicker!, FromHourCombo, FromMinuteCombo);
+            var toLocal = GetDateTimeFromPickers(ToDatePicker!, ToHourCombo, ToMinuteCombo);
+            if (fromLocal.HasValue && toLocal.HasValue)
+            {
+                fromDate = ServerTimeHelper.DisplayTimeToServerTime(fromLocal.Value, ServerTimeHelper.CurrentDisplayMode);
+                toDate = ServerTimeHelper.DisplayTimeToServerTime(toLocal.Value, ServerTimeHelper.CurrentDisplayMode);
+            }
+        }
+
+        await RefreshOverviewAsync(hoursBack, fromDate, toDate);
+    }
+
+    /// <summary>
+    /// Computes the reference time range for the comparison overlay based on the
+    /// current Compare dropdown selection and the active time range.
+    /// Returns null if "None" is selected.
+    /// </summary>
+    private (DateTime From, DateTime To)? GetComparisonRange()
+    {
+        if (CompareToCombo == null || CompareToCombo.SelectedIndex <= 0) return null;
+
+        var hoursBack = GetHoursBack();
+        DateTime? fromDate = null, toDate = null;
+        if (IsCustomRange)
+        {
+            var fromLocal = GetDateTimeFromPickers(FromDatePicker!, FromHourCombo, FromMinuteCombo);
+            var toLocal = GetDateTimeFromPickers(ToDatePicker!, ToHourCombo, ToMinuteCombo);
+            if (fromLocal.HasValue && toLocal.HasValue)
+            {
+                fromDate = ServerTimeHelper.DisplayTimeToServerTime(fromLocal.Value, ServerTimeHelper.CurrentDisplayMode);
+                toDate = ServerTimeHelper.DisplayTimeToServerTime(toLocal.Value, ServerTimeHelper.CurrentDisplayMode);
+            }
+        }
+
+        var currentEnd = toDate ?? DateTime.UtcNow;
+        var currentStart = fromDate ?? currentEnd.AddHours(-hoursBack);
+
+        return CompareToCombo.SelectedIndex switch
+        {
+            1 => (currentStart.AddDays(-1), currentEnd.AddDays(-1)),   // Yesterday
+            2 => (currentStart.AddDays(-7), currentEnd.AddDays(-7)),   // Last week
+            3 => (currentStart.AddDays(-7), currentEnd.AddDays(-7)),   // Same day last week
+            _ => null
+        };
+    }
+
     private async void CustomDateRange_Changed(object sender, SelectionChangedEventArgs e)
     {
         if (!IsLoaded || _isRefreshing) return;
@@ -1098,7 +1152,8 @@ public partial class ServerTab : UserControl
     {
         try
         {
-            await CorrelatedLanes.RefreshAsync(hoursBack, fromDate, toDate);
+            var comparison = GetComparisonRange();
+            await CorrelatedLanes.RefreshAsync(hoursBack, fromDate, toDate, comparison);
         }
         catch (Exception ex)
         {
