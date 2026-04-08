@@ -972,6 +972,22 @@ public static class ShowPlanParser
             if (actionColEl != null)
                 node.ActionColumn = FormatColumnRef(actionColEl);
 
+            // Nonclustered indexes maintained by modification operators (Update/SimpleUpdate/CreateIndex)
+            var opName = physicalOpEl.Name.LocalName;
+            if (opName is "Update" or "SimpleUpdate" or "CreateIndex")
+            {
+                var ncObjects = ScopedDescendants(physicalOpEl, Ns + "Object")
+                    .Where(o => string.Equals(o.Attribute("IndexKind")?.Value, "NonClustered", StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+                node.NonClusteredIndexCount = ncObjects.Count;
+                foreach (var ncObj in ncObjects)
+                {
+                    var ixName = ncObj.Attribute("Index")?.Value?.Replace("[", "").Replace("]", "");
+                    if (!string.IsNullOrEmpty(ixName))
+                        node.NonClusteredIndexNames.Add(ixName);
+                }
+            }
+
             // SET predicate (UPDATE operator)
             var setPredicateEl = physicalOpEl.Element(Ns + "SetPredicate");
             if (setPredicateEl != null)
@@ -1616,7 +1632,8 @@ public static class ShowPlanParser
             });
         }
 
-        // Memory grant warning
+        // Memory grant warning (from plan XML) — gate at 1 GB to avoid noise on small grants
+        // All values are in KB, consistent with MemoryGrantInfo element
         var memWarnEl = warningsEl.Element(Ns + "MemoryGrantWarning");
         if (memWarnEl != null)
         {
@@ -1624,12 +1641,17 @@ public static class ShowPlanParser
             var requested = ParseLong(memWarnEl.Attribute("RequestedMemory")?.Value);
             var granted = ParseLong(memWarnEl.Attribute("GrantedMemory")?.Value);
             var maxUsed = ParseLong(memWarnEl.Attribute("MaxUsedMemory")?.Value);
-            result.Add(new PlanWarning
+            if (granted >= 1048576) // 1 GB in KB
             {
-                WarningType = "Memory Grant",
-                Message = $"{kind}: Requested {requested:N0} KB, Granted {granted:N0} KB, Used {maxUsed:N0} KB",
-                Severity = PlanWarningSeverity.Warning
-            });
+                var grantedMB = granted / 1024.0;
+                var usedMB = maxUsed / 1024.0;
+                result.Add(new PlanWarning
+                {
+                    WarningType = "Memory Grant",
+                    Message = $"{kind}: Granted {grantedMB:N0} MB, Used {usedMB:N0} MB",
+                    Severity = PlanWarningSeverity.Warning
+                });
+            }
         }
 
         // Implicit conversions
