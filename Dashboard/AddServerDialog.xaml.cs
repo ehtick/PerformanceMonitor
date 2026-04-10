@@ -47,10 +47,12 @@ namespace PerformanceMonitorDashboard
         private InstallationResult? _installResult;
         private string? _reportPath;
         private DialogState _currentState = DialogState.Initial;
+        private string? _serverVersion;
 
         public AddServerDialog()
         {
             InitializeComponent();
+            SizeToWorkArea();
             _isEditMode = false;
             ServerConnection = new ServerConnection();
             Title = "Add SQL Server";
@@ -59,6 +61,7 @@ namespace PerformanceMonitorDashboard
         public AddServerDialog(ServerConnection existingServer)
         {
             InitializeComponent();
+            SizeToWorkArea();
             _isEditMode = true;
             ServerConnection = existingServer;
             Title = "Edit SQL Server";
@@ -107,6 +110,14 @@ namespace PerformanceMonitorDashboard
             {
                 WindowsAuthRadio.IsChecked = true;
             }
+        }
+
+        private void SizeToWorkArea()
+        {
+            var workArea = SystemParameters.WorkArea;
+            Height = workArea.Height;
+            Top = workArea.Top;
+            Left = workArea.Left + (workArea.Width - Width) / 2;
         }
 
         private void AuthType_Changed(object sender, RoutedEventArgs e)
@@ -341,17 +352,9 @@ namespace PerformanceMonitorDashboard
 
             if (connected)
             {
-                var message = serverVersion != null
-                    ? $"Successfully connected to {ServerNameTextBox.Text}!\n\n{serverVersion}"
-                    : $"Successfully connected to {ServerNameTextBox.Text}!";
-                MessageBox.Show(
-                    message,
-                    "Connection Successful",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Information
-                );
+                _serverVersion = serverVersion;
 
-                /* After successful connection, check database status */
+                /* Show connection + database status inline instead of a popup */
                 await DetectDatabaseStatusAsync();
             }
             else if (mfaCancelled)
@@ -402,6 +405,10 @@ namespace PerformanceMonitorDashboard
 
                 if (!_coreServerInfo.IsSupportedVersion)
                 {
+                    string serverName = ServerNameTextBox.Text;
+                    ConnectionInfoText.Text = _serverVersion != null
+                        ? $"Connected to {serverName} ({_serverVersion})"
+                        : $"Connected to {serverName}";
                     DatabaseStatusText.Text = $"Warning: {_coreServerInfo.ProductMajorVersionName} is not supported. SQL Server 2016+ is required.";
                     DatabaseStatusPanel.Visibility = Visibility.Visible;
                     InstallUpgradeButton.Visibility = Visibility.Collapsed;
@@ -460,13 +467,22 @@ namespace PerformanceMonitorDashboard
             ViewReportButton.Visibility = Visibility.Collapsed;
             StatusText.Text = string.Empty;
             StatusText.Visibility = Visibility.Collapsed;
+            ConnectionInfoText.Text = string.Empty;
             InstallUpgradeButton.Visibility = Visibility.Visible;
             SkipInstallText.Visibility = Visibility.Visible;
+
+            /* Build the connection header shown for all connected states */
+            string serverName = ServerNameTextBox.Text;
+            string connectionHeader = _serverVersion != null
+                ? $"Connected to {serverName} ({_serverVersion})"
+                : $"Connected to {serverName}";
 
             switch (newState)
             {
                 case DialogState.Connected_NoDatabase:
-                    DatabaseStatusText.Text = $"No PerformanceMonitor database found on this server. Install v{appVersion}?";
+                    ConnectionInfoText.Text = connectionHeader;
+                    DatabaseStatusText.Text = "No PerformanceMonitor database found on this server. " +
+                        $"Click Install Now to create the monitoring database, collection jobs, and stored procedures (v{appVersion}).";
                     InstallUpgradeButton.Content = "Install Now";
                     DatabaseStatusPanel.Visibility = Visibility.Visible;
                     InstallationPanel.Visibility = Visibility.Visible;
@@ -475,7 +491,9 @@ namespace PerformanceMonitorDashboard
 
                 case DialogState.Connected_NeedsUpgrade:
                     string normalizedInstalled = NormalizeVersion(_installedVersion!);
-                    DatabaseStatusText.Text = $"v{normalizedInstalled} installed — v{appVersion} available";
+                    ConnectionInfoText.Text = connectionHeader;
+                    DatabaseStatusText.Text = $"PerformanceMonitor v{normalizedInstalled} is installed. " +
+                        $"v{appVersion} is available — click Upgrade Now to apply the update.";
                     InstallUpgradeButton.Content = "Upgrade Now";
                     DatabaseStatusPanel.Visibility = Visibility.Visible;
                     InstallationPanel.Visibility = Visibility.Visible;
@@ -484,6 +502,7 @@ namespace PerformanceMonitorDashboard
 
                 case DialogState.Connected_Current:
                     string normalizedCurrent = NormalizeVersion(_installedVersion!);
+                    ConnectionInfoText.Text = connectionHeader;
                     DatabaseStatusText.Text = $"PerformanceMonitor v{normalizedCurrent} is up to date.";
                     InstallUpgradeButton.Visibility = Visibility.Collapsed;
                     SkipInstallText.Visibility = Visibility.Collapsed;

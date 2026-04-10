@@ -2,8 +2,8 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Add SQL Server"
-        Height="750" Width="500"
-        WindowStartupLocation="CenterOwner"
+        Width="500"
+        WindowStartupLocation="Manual"
         ResizeMode="CanResizeWithGrip"
         Background="{DynamicResource BackgroundBrush}"
         Foreground="{DynamicResource ForegroundBrush}">
@@ -142,6 +142,9 @@
                     Background="{DynamicResource BackgroundLightBrush}"
                     CornerRadius="4" Padding="12" Margin="0,0,0,10">
                 <StackPanel>
+                    <TextBlock x:Name="ConnectionInfoText" TextWrapping="Wrap" Margin="0,0,0,4"
+                               FontWeight="SemiBold"
+                               Foreground="{DynamicResource ForegroundBrush}"/>
                     <TextBlock x:Name="DatabaseStatusText" TextWrapping="Wrap" Margin="0,0,0,8"
                                Foreground="{DynamicResource ForegroundBrush}"/>
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
