@@ -130,7 +130,11 @@ namespace PerformanceMonitorDashboard.Controls
             SetupChartContextMenus();
             Loaded += OnLoaded;
             Helpers.ThemeManager.ThemeChanged += OnThemeChanged;
-            Unloaded += (_, _) => Helpers.ThemeManager.ThemeChanged -= OnThemeChanged;
+            Unloaded += (_, _) =>
+            {
+                Helpers.ThemeManager.ThemeChanged -= OnThemeChanged;
+                DisposeChartHelpers();
+            };
 
             // Apply dark theme immediately so charts don't flash white before data loads
             TabHelpers.ApplyThemeToChart(LatchStatsChart);
@@ -158,11 +162,23 @@ namespace PerformanceMonitorDashboard.Controls
             _tempDbLatencyHover = new Helpers.ChartHoverHelper(TempDbLatencyChart, "ms");
         }
 
+        public void DisposeChartHelpers()
+        {
+            _sessionStatsHover?.Dispose();
+            _latchStatsHover?.Dispose();
+            _spinlockStatsHover?.Dispose();
+            _fileIoReadHover?.Dispose();
+            _fileIoWriteHover?.Dispose();
+            _fileIoReadThroughputHover?.Dispose();
+            _fileIoWriteThroughputHover?.Dispose();
+            _perfmonHover?.Dispose();
+            _waitStatsHover?.Dispose();
+            _tempdbStatsHover?.Dispose();
+            _tempDbLatencyHover?.Dispose();
+        }
+
         private void OnLoaded(object sender, RoutedEventArgs e)
         {
-            // Apply minimum column widths based on header text
-
-            // Freeze identifier columns
         }
 
         private void OnThemeChanged(string _)

@@ -70,6 +70,14 @@ namespace PerformanceMonitorDashboard
         // Legend panel references for edge-based legends (ScottPlot issue #4717 workaround)
         private Dictionary<ScottPlot.WPF.WpfPlot, ScottPlot.IPanel?> _legendPanels = new();
 
+        // Stored event handler delegates for cleanup
+        private Action<string, string, string?>? _viewPlanHandler;
+        private Action<string>? _actualPlanStartedHandler;
+        private Action? _actualPlanFinishedHandler;
+        private Action<DateTime, DateTime>? _drillDownTimeRangeHandler;
+        private Action? _subTabChangedHandler;
+        private Analysis.SqlServerBaselineProvider? _baselineProvider;
+
         // Chart hover tooltips
         private Helpers.ChartHoverHelper? _resourceOverviewCpuHover;
         private Helpers.ChartHoverHelper? _resourceOverviewMemoryHover;
@@ -141,27 +149,23 @@ namespace PerformanceMonitorDashboard
             MemoryTab.Initialize(_databaseService);
             MemoryTab.ChartDrillDownRequested += OnChildChartDrillDown;
             PerformanceTab.Initialize(_databaseService, s => StatusText.Text = s);
-            PerformanceTab.ViewPlanRequested += (planXml, label, queryText) =>
+            _viewPlanHandler = (planXml, label, queryText) =>
             {
                 OpenPlanTab(planXml, label, queryText);
                 PlanViewerTabItem.IsSelected = true;
             };
-            PerformanceTab.ActualPlanStarted += (label) =>
-            {
-                ShowPlanLoading(label);
-            };
-            PerformanceTab.ActualPlanFinished += () =>
-            {
-                HidePlanLoading();
-            };
-            PerformanceTab.DrillDownTimeRangeRequested += (from, to) =>
-            {
-                SetDrillDownGlobalRange(from, to);
-            };
-            PerformanceTab.SubTabChanged += () => UpdateCompareDropdownState();
+            _actualPlanStartedHandler = (label) => ShowPlanLoading(label);
+            _actualPlanFinishedHandler = () => HidePlanLoading();
+            _drillDownTimeRangeHandler = (from, to) => SetDrillDownGlobalRange(from, to);
+            _subTabChangedHandler = () => UpdateCompareDropdownState();
+            PerformanceTab.ViewPlanRequested += _viewPlanHandler;
+            PerformanceTab.ActualPlanStarted += _actualPlanStartedHandler;
+            PerformanceTab.ActualPlanFinished += _actualPlanFinishedHandler;
+            PerformanceTab.DrillDownTimeRangeRequested += _drillDownTimeRangeHandler;
+            PerformanceTab.SubTabChanged += _subTabChangedHandler;
             SystemEventsContent.Initialize(_databaseService);
-            var baselineProvider = new Analysis.SqlServerBaselineProvider(_databaseService.ConnectionString);
-            ResourceMetricsContent.Initialize(_databaseService, baselineProvider);
+            _baselineProvider = new Analysis.SqlServerBaselineProvider(_databaseService.ConnectionString);
+            ResourceMetricsContent.Initialize(_databaseService, _baselineProvider);
             ResourceMetricsContent.ChartDrillDownRequested += OnChildChartDrillDown;
 
             // Set default time range on UserControls based on user preferences
@@ -375,15 +379,58 @@ namespace PerformanceMonitorDashboard
 
         private void ServerTab_Unloaded(object sender, RoutedEventArgs e)
         {
-            // Stop the timer when the tab is closed
             _autoRefreshTimer?.Stop();
             _autoRefreshTimer = null;
 
-            // Unsubscribe event handlers to prevent memory leaks
             Helpers.ThemeManager.ThemeChanged -= OnThemeChanged;
             Loaded -= ServerTab_Loaded;
             Unloaded -= ServerTab_Unloaded;
             KeyDown -= ServerTab_KeyDown;
+
+            BlockingSlicer.RangeChanged -= OnBlockingSlicerChanged;
+            DeadlockSlicer.RangeChanged -= OnDeadlockSlicerChanged;
+
+            CriticalIssuesTab.InvestigateRequested -= OnInvestigateCriticalIssue;
+            MemoryTab.ChartDrillDownRequested -= OnChildChartDrillDown;
+            ResourceMetricsContent.ChartDrillDownRequested -= OnChildChartDrillDown;
+
+            if (_viewPlanHandler != null) PerformanceTab.ViewPlanRequested -= _viewPlanHandler;
+            if (_actualPlanStartedHandler != null) PerformanceTab.ActualPlanStarted -= _actualPlanStartedHandler;
+            if (_actualPlanFinishedHandler != null) PerformanceTab.ActualPlanFinished -= _actualPlanFinishedHandler;
+            if (_drillDownTimeRangeHandler != null) PerformanceTab.DrillDownTimeRangeRequested -= _drillDownTimeRangeHandler;
+            if (_subTabChangedHandler != null) PerformanceTab.SubTabChanged -= _subTabChangedHandler;
+
+            DisposeChartHelpers();
+
+            _collectionHealthUnfilteredData = null;
+            _blockingEventsUnfilteredData = null;
+            _deadlocksUnfilteredData = null;
+            _collectionHealthFilters.Clear();
+            _blockingEventsFilters.Clear();
+            _deadlocksFilters.Clear();
+            _legendPanels.Clear();
+
+            _baselineProvider?.ClearCache();
+        }
+
+        public void DisposeChartHelpers()
+        {
+            _resourceOverviewCpuHover?.Dispose();
+            _resourceOverviewMemoryHover?.Dispose();
+            _resourceOverviewIoHover?.Dispose();
+            _resourceOverviewWaitHover?.Dispose();
+            _lockWaitStatsHover?.Dispose();
+            _blockingEventsHover?.Dispose();
+            _blockingDurationHover?.Dispose();
+            _deadlocksHover?.Dispose();
+            _deadlockWaitTimeHover?.Dispose();
+            _collectorDurationHover?.Dispose();
+            _currentWaitsDurationHover?.Dispose();
+            _currentWaitsBlockedHover?.Dispose();
+
+            MemoryTab.DisposeChartHelpers();
+            ResourceMetricsContent.DisposeChartHelpers();
+            PerformanceTab.DisposeChartHelpers();
         }
 
         private void OnThemeChanged(string _)

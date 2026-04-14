@@ -276,7 +276,16 @@ namespace PerformanceMonitorDashboard.Controls
             _qsRegressionsUnfilteredData = null;
             _lrqPatternsUnfilteredData = null;
 
+            DisposeChartHelpers();
             Helpers.ThemeManager.ThemeChanged -= OnThemeChanged;
+        }
+
+        public void DisposeChartHelpers()
+        {
+            _queryDurationHover?.Dispose();
+            _procDurationHover?.Dispose();
+            _qsDurationHover?.Dispose();
+            _execTrendsHover?.Dispose();
         }
 
         private void OnThemeChanged(string _)
