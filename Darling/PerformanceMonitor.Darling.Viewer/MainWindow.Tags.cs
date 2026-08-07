@@ -95,6 +95,10 @@ public partial class MainWindow
             {
                 _suppressSidebarSelection = false;
             }
+
+            /* Tag names/colours/assignments may have changed — refresh the Overview pills if it's showing
+               cards, so a colour edit or (un)assignment reflects there without waiting for a full reload. */
+            RestampOverviewTagPills();
         }
         catch (Exception ex)
         {
@@ -131,7 +135,24 @@ public partial class MainWindow
         return target?.DataContext as FleetHeaderRow;
     }
 
-    /// <summary>Disables the tag-only actions on the Favorites / Untagged pseudo-groups, which have no tag.</summary>
+    /// <summary>
+    /// True when this seat may EDIT tags. Tags are shared fleet configuration, so editing follows
+    /// the same rule as every other write surface: gate on <see cref="ViewerDataService.IsReadOnly"/>
+    /// (#2008 — the tag menus shipped without the gate, so a least-privilege viewer-role seat showed
+    /// working-looking editors whose writes then died as 42501 behind a status-bar line; the role
+    /// model is deliberate — the viewer role's ONLY write is config.custom_views — so the fix is the
+    /// missing gate, not a broader grant).
+    /// </summary>
+    private bool CanEditTags => _dataService?.IsReadOnly == false;
+
+    /// <summary>Tooltip shown on disabled tag editors, so the read-only seat is TOLD why (#2008's
+    /// complaint was the silence, and greying-out without a reason is only half an answer).</summary>
+    private const string ReadOnlyTagToolTip =
+        "This seat is connected with the read-only viewer role — tag editing needs the admin connection.";
+
+    /// <summary>Disables the tag-only actions on the Favorites / Untagged pseudo-groups, which have no
+    /// tag — and EVERY action here when the seat is read-only (all five entries mutate the tag tree or
+    /// open the bulk editor, which is write-only).</summary>
     private void TagHeader_ContextMenuOpening(object sender, ContextMenuEventArgs e)
     {
         if (sender is not FrameworkElement fe || fe.DataContext is not FleetHeaderRow header || fe.ContextMenu is null)
@@ -140,12 +161,15 @@ public partial class MainWindow
         }
 
         var isRealTag = header.Kind == FleetGroupKind.Tag;
+        var canEdit = CanEditTags;
         foreach (var item in fe.ContextMenu.Items.OfType<MenuItem>())
         {
-            if ((item.Header as string) is "New Child Tag..." or "Rename..." or "Delete Tag")
-            {
-                item.IsEnabled = isRealTag;
-            }
+            /* Matched on Tag, not on the header text: the headers carry Alt mnemonics now, and a
+               display string is the wrong key for behavior to hang on. */
+            var tagOnly = (item.Tag as string) == "TagOnly";
+            item.IsEnabled = canEdit && (!tagOnly || isRealTag);
+            item.ToolTip = canEdit ? null : ReadOnlyTagToolTip;
+            ToolTipService.SetShowOnDisabled(item, true);
         }
     }
 
@@ -245,6 +269,14 @@ public partial class MainWindow
             return;
         }
 
+        /* Backstop for any entry point the menu gates miss: the bulk editor is write-only, so a
+           read-only seat gets the reason instead of a window full of dead buttons (#2008). */
+        if (!CanEditTags)
+        {
+            StatusText.Text = ReadOnlyTagToolTip;
+            return;
+        }
+
         var dialog = new ManageTagsWindow(_dataService, _fleet.All) { Owner = this };
         dialog.ShowDialog();
         if (dialog.ChangedAny)
@@ -311,19 +343,57 @@ public partial class MainWindow
             return;
         }
 
-        var assignItem = fe.ContextMenu.Items.OfType<MenuItem>().FirstOrDefault(m => (m.Header as string) == "Assign Tags");
+        /* #2031: Silence / Unsilence are mutually exclusive — DISABLE the inapplicable one (never hide it;
+           Lite's semantics, and the same disabled-with-reason idiom as the read-only tag gate below). Driven
+           from the polled IsSilenced flag so opening the menu costs no store read; the click handlers re-check
+           the live rules anyway, so a stale flag degrades to a status-bar note, never a wrong write. Runs
+           BEFORE the tag gating's early returns so the pair is gated on every seat. */
+        var silenceItem = fe.ContextMenu.Items.OfType<MenuItem>().FirstOrDefault(m => (m.Tag as string) == "SilenceServer");
+        var unsilenceItem = fe.ContextMenu.Items.OfType<MenuItem>().FirstOrDefault(m => (m.Tag as string) == "UnsilenceServer");
+        if (silenceItem is not null && unsilenceItem is not null)
+        {
+            var silenced = row.Server.IsSilenced;
+
+            silenceItem.IsEnabled = !silenced;
+            silenceItem.ToolTip = silenced
+                ? "Already silenced — use Unsilence to restore alert delivery"
+                : "Mute every alert for this server until you Unsilence it";
+            ToolTipService.SetShowOnDisabled(silenceItem, true);
+
+            unsilenceItem.IsEnabled = silenced;
+            unsilenceItem.ToolTip = silenced
+                ? "Remove this server's whole-server alert silence"
+                : "Not silenced — there is nothing to remove";
+            ToolTipService.SetShowOnDisabled(unsilenceItem, true);
+        }
+
+        /* Located by Tag, not by header text — the header carries an Alt mnemonic now. */
+        var assignItem = fe.ContextMenu.Items.OfType<MenuItem>().FirstOrDefault(m => (m.Tag as string) == "AssignTags");
         if (assignItem is null)
         {
             return;
         }
 
+        /* Read-only seat: assignment is a config.server_tag_map write, gated like every other write
+           surface (#2008). Disabled-with-reason instead of built-then-failing. */
+        if (!CanEditTags)
+        {
+            assignItem.Items.Clear();
+            assignItem.IsEnabled = false;
+            assignItem.ToolTip = ReadOnlyTagToolTip;
+            ToolTipService.SetShowOnDisabled(assignItem, true);
+            return;
+        }
+
+        assignItem.IsEnabled = true;
+        assignItem.ToolTip = null;
         assignItem.Items.Clear();
 
         if (_tags.Count == 0)
         {
             assignItem.Items.Add(new MenuItem { Header = "No tags yet", IsEnabled = false });
             assignItem.Items.Add(new Separator());
-            var manage = new MenuItem { Header = "Manage Tags..." };
+            var manage = new MenuItem { Header = "_Manage Tags..." };
             manage.Click += ManageTags_Click;
             assignItem.Items.Add(manage);
             return;
@@ -335,7 +405,10 @@ public partial class MainWindow
         {
             var item = new MenuItem
             {
-                Header = new string(' ', depth * 2) + tag.Name,
+                // A MenuItem header parses a single "_" as an access-key marker, so a tag named
+                // "prod_east" would render as "prodeast" and claim Alt+E. "__" is WPF's escape for a
+                // literal underscore (same guard as the wait-type headers in ViewerServerTab.DrillDown).
+                Header = new string(' ', depth * 2) + tag.Name.Replace("_", "__"),
                 IsCheckable = true,
                 IsChecked = assigned.Contains(tag.Id),
                 Tag = new AssignTarget(row.Server.ServerId, tag.Id)

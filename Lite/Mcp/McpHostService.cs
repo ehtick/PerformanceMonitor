@@ -80,6 +80,11 @@ public sealed class McpHostService : BackgroundService
                 .WithGeminiCompatibleTools<McpHealthTools>()
                 .WithGeminiCompatibleTools<McpWaitTools>()
                 .WithGeminiCompatibleTools<McpBlockingTools>()
+                /* #2028 get_plan_corrections — automatic plan correction activity + per-database
+                   FORCE_LAST_GOOD_PLAN enablement; twin of Darling's DarlingMcpPlanCorrectionTools. */
+                .WithGeminiCompatibleTools<McpPlanCorrectionTools>()
+                /* #2029 get_pvs_stats — the ADR persistent version store; twin of Darling's DarlingMcpPvsTools. */
+                .WithGeminiCompatibleTools<McpPvsTools>()
                 .WithGeminiCompatibleTools<McpLongQueryTools>()
                 .WithGeminiCompatibleTools<McpQueryTools>()
                 .WithGeminiCompatibleTools<McpCpuTools>()

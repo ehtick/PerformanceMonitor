@@ -37,8 +37,12 @@ public partial class RemoteCollectorService
     {
         var serverId = GetServerId(server);
         var collectionTime = DateTime.UtcNow;
-        _lastSqlMs = 0;
-        _lastDuckDbMs = 0;
+
+        /* This server's slot, not a shared field: servers collect in parallel (see RunTelemetry). */
+        var telemetry = TelemetryFor(serverId);
+        telemetry.SqlMs = 0;
+        telemetry.StorageMs = 0;
+        telemetry.Note = null;
 
         var status = _serverManager.GetConnectionStatus(server.Id);
         var target = new CollectorTargetInfo
@@ -79,6 +83,13 @@ public partial class RemoteCollectorService
             && watermark is null
             && await HasPriorCollectorSuccessAsync(serverId, definition.Name, cancellationToken);
 
+        /* Per-server state the definition declared keys for — the watermark's sibling for facts no MAX()
+           over the collected rows can produce (default_trace_events' last-seen trace FILE, #1962). No
+           declared keys (every other collector) means no query runs. */
+        var collectorState = definition.StateKeys.Count == 0
+            ? null
+            : await GetCollectorStateAsync(serverId, definition.Name, cancellationToken);
+
         var context = new CollectorContext
         {
             ServerId = serverId,
@@ -89,6 +100,7 @@ public partial class RemoteCollectorService
             Watermark = watermark,
             NumericWatermark = numericWatermark,
             HasCollectedBefore = hasCollectedBefore,
+            State = collectorState ?? CollectorContext.NoState,
             IgnoredWaitTypes = _ignoredWaitTypes.Value,
             ExcludedDatabases = server.ExcludedDatabases?.ToArray() ?? Array.Empty<string>(),
             PerfmonCounterOverride = GetPerfmonCounterOverride(),
@@ -96,7 +108,8 @@ public partial class RemoteCollectorService
 
         /* Two accumulators, not one contiguous read-then-write pair: the enumeration and Azure paths now
            FLUSH each database's rows before reading the next (#1556), so SQL and storage slices interleave.
-           _lastSqlMs / _lastDuckDbMs stay the #1180 fetch/store split — now sums of interleaved slices. */
+           The telemetry slot's SqlMs / StorageMs stay the #1180 fetch/store split — now sums of
+           interleaved slices. */
         long sqlMs = 0;
         long storageMs = 0;
         var rowsWritten = 0;
@@ -122,6 +135,11 @@ public partial class RemoteCollectorService
             var failed = 0;
             Exception? firstFailure = null;
 
+            /* #1875: this path reads the trailing probe-failure set once PER DATABASE, so the note and the
+               log cap are decided for the cycle after the loop rather than inside it — see
+               CycleProbeFailures for why neither generalizes from the single-read plain path. */
+            var cycleProbeFailures = new CycleProbeFailures();
+
             /* One DuckDB connection for the whole body; one appender per database on it (disposing an
                appender flushes that database — commit-1..N-1 semantics on abort). */
             using var duckConnection = _duckDb.CreateConnection();
@@ -141,12 +159,40 @@ public partial class RemoteCollectorService
                     if (dbPlan is null)
                     {
                         /* Null (no rows for this database yet) falls back to the definition's
-                           documented first-run window, per database. This is the XE ring-buffer path
-                           (deadlocks / BPR), NOT query_store — no 24h clamp here. */
+                           documented first-run window, per database. No clamp is applied HERE because
+                           this branch also serves the XE ring-buffer collectors (deadlocks / BPR),
+                           where flooring a stale watermark would WRONGLY truncate legitimate catch-up
+                           — those sources roll past 24h on their own. query_store also reaches this
+                           branch on Azure SQL DB (#1836) and does need the bound, so it applies
+                           WatermarkPolicy.ClampCatchup inside its own cutoff computation: the clamp
+                           travels with the collector that needs it instead of with the path. */
                         context.Watermark = await GetLastCollectedTimeForDatabaseAsync(
                             serverId, definition.TargetTable, definition.WatermarkColumn!,
                             definition.PerDatabaseWatermarkColumn!, databaseName, cancellationToken);
                         dbPlan = definition.BuildQuery(context);
+
+                        /* The definition clamped its own cutoff — surface the same WARNING the
+                           enumeration path emits, so the bounded history hole stays LOGGED and does
+                           not become the one silent hole in a policy whose whole premise is that it
+                           is visible. */
+                        if (context.CatchupClampApplied)
+                        {
+                            _logger?.LogWarning(
+                                "{Collector} on '{Server}' database [{Database}] catch-up clamped to {Hours}h (stored watermark {Raw:o} is older) — a bounded, logged history hole.",
+                                definition.Name, server.DisplayName, databaseName, WatermarkPolicy.MaxCatchup.TotalHours, context.Watermark);
+
+                            /* #2058: record the hole for the backfill worker — context.Watermark still
+                               holds the RAW value here (the definition clamped only its own cutoff), so
+                               the hole is (raw, re-derived clamp floor); merged wider on repeat. The
+                               name guard keeps the XE collectors sharing this branch from growing
+                               backfill state they have no worker for. */
+                            if (context.Watermark.HasValue
+                                && string.Equals(definition.Name, QueryStoreCollector.Instance.Name, StringComparison.Ordinal)
+                                && WatermarkPolicy.ClampCatchup(context.Watermark, collectionTime) is DateTime azureClampedFloor)
+                            {
+                                await RecordQueryStoreBackfillHoleAsync(serverId, databaseName, context.Watermark.Value, azureClampedFloor, cancellationToken);
+                            }
+                        }
                     }
 
                     var sqlSlice = Stopwatch.StartNew();
@@ -156,6 +202,18 @@ public partial class RemoteCollectorService
                     using (var dbReader = await dbCommand.ExecuteReaderAsync(cancellationToken))
                     {
                         batch = await definition.ReadAsync(dbReader, context, cancellationToken);
+
+                        /* #1875: the payload path's probe-failure contract, on the path that used to
+                           ignore it. blocked_process_report is the declaring collector that also runs per
+                           database (Azure SQL DB, #1535), so before this its batch produced the trailing
+                           set and the loop simply never advanced the reader to it — the rows were built
+                           and dropped. Read HERE, still inside the reader and inside the per-database
+                           try, so a diagnostics fault stays a one-database skip like any other. */
+                        if (definition.EmitsProbeFailures)
+                        {
+                            cycleProbeFailures.Add(
+                                await EnumeratedCollectorDriver.ReadPayloadProbeFailuresAsync(dbReader, cancellationToken));
+                        }
                     }
                     sqlMs += sqlSlice.ElapsedMilliseconds;
 
@@ -165,6 +223,25 @@ public partial class RemoteCollectorService
                         var storageSlice = Stopwatch.StartNew();
                         rowsWritten += WriteBatch(duckConnection, definition, batch, serverId, context.ServerName, collectionTime, context);
                         storageMs += storageSlice.ElapsedMilliseconds;
+                    }
+
+                    /* Same per-database bounded-cycle WARNING the enumeration path emits from
+                       onItemComplete. Reachable here since #1836 put query_store — the only collector
+                       that declares either bound — on this branch for Azure SQL DB; without it a
+                       database whose cycle was cut at the bound would look like a clean collection.
+                       Since #1960 a bound DEFERS the backlog to the next cycle's resume from the
+                       shipped boundary rather than dropping it — this log is how a long catch-up
+                       stays observable. Read after the flush, as on the other path: the context
+                       signal stays this database's until the next read resets it. */
+                    var capHit = definition.PerItemRowCountWarnThreshold is int cap && batch.Count >= cap;
+                    if (capHit || context.PerItemTextBudgetExceeded)
+                    {
+                        _logger?.LogWarning(
+                            "{Collector} on '{Server}' database [{Database}] hit its per-database collection bound ({Reason}) — shipped {ShippedMB:F1}MB up to {Boundary}; the backlog resumes from that boundary next cycle.",
+                            definition.Name, server.DisplayName, databaseName,
+                            capHit ? $"row cap {definition.PerItemRowCountWarnThreshold}" : "text byte budget",
+                            context.PerItemTextBytesShipped / (1024.0 * 1024.0),
+                            context.PerItemShippedBoundary?.ToString("o") ?? "n/a");
                     }
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException and not OutOfMemoryException)
@@ -178,6 +255,12 @@ public partial class RemoteCollectorService
             }
 
             context.CurrentDatabaseName = null;
+
+            /* #1875: ONE note for the cycle and ONE capped log burst, composed from every database's
+               failures together. Assigned unconditionally — a cycle where nothing failed composes null,
+               which is exactly what this path carried before. */
+            telemetry.Note = cycleProbeFailures.Note;
+            LogEnumerationProbeFailures(definition, server, cycleProbeFailures.Failures);
 
             /* One database failing is routine (offline, mid-restore, a permissions oddity) and stays a
                debug-logged skip. EVERY database failing is a systemic fault — before this check the
@@ -202,22 +285,33 @@ public partial class RemoteCollectorService
                    run one query per item ON THE SAME CONNECTION; an item that fails with a
                    SqlException is skipped with a warning, matching the original collectors. */
                 var listSlice = Stopwatch.StartNew();
-                var items = new List<string>();
+                EnumerationOutcome enumeration;
                 /* Enumeration always uses the host default timeout, matching the originals —
                    the per-collector override applies only to the heavy per-item commands. */
                 using (var enumerationCommand = CreateCollectorCommand(enumerationPlan, sqlConnection, CommandTimeoutSeconds))
                 using (var enumerationReader = await enumerationCommand.ExecuteReaderAsync(cancellationToken))
                 {
-                    while (await enumerationReader.ReadAsync(cancellationToken))
-                    {
-                        items.Add(enumerationReader.GetString(0));
-                    }
+                    /* Shared read (#1837): the item list, then the OPTIONAL second result set of items the
+                       enumeration could not probe. Both hosts route through it so the item read, the
+                       failure read, and the note wording cannot drift. */
+                    enumeration = await EnumeratedCollectorDriver.ReadEnumerationAsync(enumerationReader, cancellationToken);
                 }
                 sqlMs += listSlice.ElapsedMilliseconds;
 
+                var items = enumeration.Items;
+
+                /* Null on the ordinary path; the empty-enumeration breadcrumb, the probe-failure summary,
+                   or both otherwise. Assigned BEFORE the zero-item early return so that cycle — the one
+                   that used to log a bare SUCCESS indistinguishable from healthy — carries it too. */
+                telemetry.Note = enumeration.Note;
+                LogEnumerationProbeFailures(definition, server, enumeration.ProbeFailures);
+
                 if (items.Count == 0)
                 {
-                    /* No items → no storage phase, matching the original's early return. */
+                    /* No items → no storage phase, matching the original's early return. The cycle still
+                       records SUCCESS/0 rows (nothing failed outright), and the note above is what makes
+                       that row distinguishable from a healthy collector whose databases were just quiet —
+                       the silent-empty shape this codebase keeps paying for (#1837). */
                     return 0;
                 }
 
@@ -272,6 +366,15 @@ public partial class RemoteCollectorService
                                 _logger?.LogWarning(
                                     "{Collector} on '{Server}' database [{Database}] catch-up clamped to {Hours}h (stored watermark {Raw:o} is older) — a bounded, logged history hole.",
                                     definition.Name, server.DisplayName, item, WatermarkPolicy.MaxCatchup.TotalHours, raw.Value);
+
+                                /* #2058: the clamp opens a hole (raw, clamped) the live path never
+                                   revisits — record it for the backfill worker, merged wider with any
+                                   hole already pending. Name-guarded like the Azure site. */
+                                if (clamped.HasValue
+                                    && string.Equals(definition.Name, QueryStoreCollector.Instance.Name, StringComparison.Ordinal))
+                                {
+                                    await RecordQueryStoreBackfillHoleAsync(serverId, item, raw.Value, clamped.Value, ct);
+                                }
                             }
                             context.Watermark = clamped;
                         },
@@ -299,9 +402,11 @@ public partial class RemoteCollectorService
                         if (capHit || context.PerItemTextBudgetExceeded)
                         {
                             _logger?.LogWarning(
-                                "{Collector} on '{Server}' database [{Database}] hit its per-database collection bound ({Reason}) — oldest rows dropped this cycle.",
+                                "{Collector} on '{Server}' database [{Database}] hit its per-database collection bound ({Reason}) — shipped {ShippedMB:F1}MB up to {Boundary}; the backlog resumes from that boundary next cycle.",
                                 definition.Name, server.DisplayName, item,
-                                capHit ? $"row cap {definition.PerItemRowCountWarnThreshold}" : "256MB text budget");
+                                capHit ? $"row cap {definition.PerItemRowCountWarnThreshold}" : "text byte budget",
+                                context.PerItemTextBytesShipped / (1024.0 * 1024.0),
+                                context.PerItemShippedBoundary?.ToString("o") ?? "n/a");
                         }
                     },
                     onItemError: (item, ex) =>
@@ -325,6 +430,22 @@ public partial class RemoteCollectorService
                 using (var reader = await command.ExecuteReaderAsync(cancellationToken))
                 {
                     rows = await definition.ReadAsync(reader, context, cancellationToken);
+
+                    /* #1851: a definition that declares it may hand back an OPTIONAL trailing
+                       (item_name, error_text) result set naming items its own server-side cursor
+                       reached but could not probe — database_size_stats' mid-restore / inaccessible
+                       databases, which used to vanish into an empty CATCH. Read through the SAME
+                       shared machinery as the enumeration path's failures (#1837), so the note wording
+                       and the log cap cannot drift between the two channels or between the two hosts.
+                       Read HERE, still inside the reader, and before the storage phase below: it
+                       touches only the note, never `rows`, so the payload and its delta ordering are
+                       exactly what they were. */
+                    if (definition.EmitsProbeFailures)
+                    {
+                        var probes = await EnumeratedCollectorDriver.ReadPayloadProbeFailuresAsync(reader, cancellationToken);
+                        telemetry.Note = probes.Note;
+                        LogEnumerationProbeFailures(definition, server, probes.ProbeFailures);
+                    }
                 }
 
                 /* Optional best-effort second query on the same connection (e.g. server_properties'
@@ -355,11 +476,56 @@ public partial class RemoteCollectorService
             }
         }
 
-        _lastSqlMs = sqlMs;
-        _lastDuckDbMs = storageMs;
+        /* Persist what the definition observed, AFTER the cycle completed — including a cycle that wrote
+           zero rows, which is exactly the case a row-derived watermark cannot cover (#1962). A cycle that
+           threw never reaches here, so the older state survives and the next run takes its conservative
+           path. Outside the storage-phase timer: this is host bookkeeping, not collected data. */
+        if (context.PendingState.Count > 0)
+        {
+            await SaveCollectorStateAsync(serverId, definition.Name, context.PendingState, cancellationToken);
+        }
+
+        telemetry.SqlMs = sqlMs;
+        telemetry.StorageMs = storageMs;
 
         _logger?.LogDebug("Collected {RowCount} {Collector} rows for server '{Server}'", rowsWritten, definition.Name, server.DisplayName);
         return rowsWritten;
+    }
+
+    /// <summary>
+    /// Writes the per-item app-log lines for probe failures, capped at
+    /// <see cref="EnumeratedCollectorDriver.MaxLoggedProbeFailures"/> with the suppressed remainder
+    /// reported as a count. The collection_log row already carries the summary note; this is where the
+    /// actual per-database error text lands, and it is why that note says "see the app log". Darling's
+    /// twin is <c>DarlingCollectorRunner.LogEnumerationProbeFailures</c> — same shared templates.
+    ///
+    /// <para>Serves BOTH channels: an enumeration's second result set (#1837) and a payload collector's
+    /// trailing one (#1851). Named for the shared template it writes, which reports the failing step as
+    /// an enumeration probe — accurate for both, since a payload collector reaches this only by
+    /// enumerating and probing databases inside its own server-side cursor.</para>
+    /// </summary>
+    private void LogEnumerationProbeFailures<TRow>(
+        ICollectorDefinition<TRow> definition,
+        ServerConnection server,
+        IReadOnlyList<EnumerationProbeFailure> probeFailures)
+    {
+        if (probeFailures.Count == 0)
+        {
+            return;
+        }
+
+        var shown = Math.Min(probeFailures.Count, EnumeratedCollectorDriver.MaxLoggedProbeFailures);
+        for (var i = 0; i < shown; i++)
+        {
+            _logger?.LogWarning(EnumeratedCollectorDriver.ProbeFailureLogTemplate,
+                definition.Name, server.DisplayName, probeFailures[i].Item, probeFailures[i].Error);
+        }
+
+        if (probeFailures.Count > shown)
+        {
+            _logger?.LogWarning(EnumeratedCollectorDriver.ProbeFailureOverflowLogTemplate,
+                definition.Name, server.DisplayName, probeFailures.Count, probeFailures.Count - shown, shown);
+        }
     }
 
     /// <summary>
@@ -430,6 +596,7 @@ public partial class RemoteCollectorService
     {
         CollectorParameterType.DateTime2 => new SqlParameter(parameter.Name, SqlDbType.DateTime2) { Value = parameter.Value ?? DBNull.Value },
         CollectorParameterType.NVarChar128 => new SqlParameter(parameter.Name, SqlDbType.NVarChar, 128) { Value = parameter.Value ?? DBNull.Value },
+        CollectorParameterType.NVarChar260 => new SqlParameter(parameter.Name, SqlDbType.NVarChar, 260) { Value = parameter.Value ?? DBNull.Value },
         CollectorParameterType.Int32 => new SqlParameter(parameter.Name, SqlDbType.Int) { Value = parameter.Value ?? DBNull.Value },
         CollectorParameterType.BigInt => new SqlParameter(parameter.Name, SqlDbType.BigInt) { Value = parameter.Value ?? DBNull.Value },
         _ => throw new ArgumentOutOfRangeException(nameof(parameter), parameter.Type, "Unmapped collector parameter type"),

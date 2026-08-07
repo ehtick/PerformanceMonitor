@@ -10,17 +10,17 @@
     <UserControl.Resources>
         <ResourceDictionary>
             <ContextMenu x:Key="DataGridContextMenu">
-                <MenuItem Header="Copy Cell" Click="CopyCell_Click">
+                <MenuItem Header="Copy _Cell" Click="CopyCell_Click">
                     <MenuItem.Icon><TextBlock Text="&#x1F4CB;"/></MenuItem.Icon>
                 </MenuItem>
-                <MenuItem Header="Copy Row" Click="CopyRow_Click">
+                <MenuItem Header="Copy _Row" Click="CopyRow_Click">
                     <MenuItem.Icon><TextBlock Text="&#x1F4C4;"/></MenuItem.Icon>
                 </MenuItem>
-                <MenuItem Header="Copy All Rows" Click="CopyAllRows_Click">
+                <MenuItem Header="Copy _All Rows" Click="CopyAllRows_Click">
                     <MenuItem.Icon><TextBlock Text="&#x1F4D1;"/></MenuItem.Icon>
                 </MenuItem>
                 <Separator/>
-                <MenuItem Header="Export to CSV..." Click="ExportToCsv_Click">
+                <MenuItem Header="_Export to CSV..." Click="ExportToCsv_Click">
                     <MenuItem.Icon><TextBlock Text="&#x1F4CA;"/></MenuItem.Icon>
                 </MenuItem>
             </ContextMenu>
@@ -32,14 +32,14 @@
             <!-- Plan-navigation menus for the query-identifying FinOps grids (a dedicated menu so the
                  plan items don't leak onto the non-query FinOps grids that share DataGridContextMenu). -->
             <ContextMenu x:Key="HighImpactPlanContextMenu">
-                <MenuItem Header="Copy Cell" Click="CopyCell_Click"><MenuItem.Icon><TextBlock Text="&#x1F4CB;"/></MenuItem.Icon></MenuItem>
-                <MenuItem Header="Copy Row" Click="CopyRow_Click"><MenuItem.Icon><TextBlock Text="&#x1F4C4;"/></MenuItem.Icon></MenuItem>
-                <MenuItem Header="Copy All Rows" Click="CopyAllRows_Click"><MenuItem.Icon><TextBlock Text="&#x1F4D1;"/></MenuItem.Icon></MenuItem>
+                <MenuItem Header="Copy _Cell" Click="CopyCell_Click"><MenuItem.Icon><TextBlock Text="&#x1F4CB;"/></MenuItem.Icon></MenuItem>
+                <MenuItem Header="Copy _Row" Click="CopyRow_Click"><MenuItem.Icon><TextBlock Text="&#x1F4C4;"/></MenuItem.Icon></MenuItem>
+                <MenuItem Header="Copy _All Rows" Click="CopyAllRows_Click"><MenuItem.Icon><TextBlock Text="&#x1F4D1;"/></MenuItem.Icon></MenuItem>
                 <Separator/>
-                <MenuItem Header="Export to CSV..." Click="ExportToCsv_Click"><MenuItem.Icon><TextBlock Text="&#x1F4CA;"/></MenuItem.Icon></MenuItem>
+                <MenuItem Header="_Export to CSV..." Click="ExportToCsv_Click"><MenuItem.Icon><TextBlock Text="&#x1F4CA;"/></MenuItem.Icon></MenuItem>
                 <Separator/>
-                <MenuItem Header="View Stored Plan" Click="FinOpsViewPlan_Click"><MenuItem.Icon><TextBlock Text="&#x1F50D;"/></MenuItem.Icon></MenuItem>
-                <MenuItem Header="Get Actual Plan (re-run)" Click="FinOpsGetActualPlan_Click"><MenuItem.Icon><TextBlock Text="&#x25B6;"/></MenuItem.Icon></MenuItem>
+                <MenuItem Header="_View Stored Plan" Click="FinOpsViewPlan_Click"><MenuItem.Icon><TextBlock Text="&#x1F50D;"/></MenuItem.Icon></MenuItem>
+                <MenuItem Header="_Get Actual Plan (re-run)" Click="FinOpsGetActualPlan_Click"><MenuItem.Icon><TextBlock Text="&#x25B6;"/></MenuItem.Icon></MenuItem>
             </ContextMenu>
             <Style x:Key="HighImpactRowStyle" TargetType="DataGridRow">
                 <Setter Property="ContextMenu" Value="{StaticResource HighImpactPlanContextMenu}"/>
@@ -48,13 +48,13 @@
             <!-- Expensive Queries carry only the full query text (no query_hash / plan_id), so they get
                  Get Actual Plan only — there is no stored plan key to fetch a collected plan with. -->
             <ContextMenu x:Key="ExpensiveQueryPlanContextMenu">
-                <MenuItem Header="Copy Cell" Click="CopyCell_Click"><MenuItem.Icon><TextBlock Text="&#x1F4CB;"/></MenuItem.Icon></MenuItem>
-                <MenuItem Header="Copy Row" Click="CopyRow_Click"><MenuItem.Icon><TextBlock Text="&#x1F4C4;"/></MenuItem.Icon></MenuItem>
-                <MenuItem Header="Copy All Rows" Click="CopyAllRows_Click"><MenuItem.Icon><TextBlock Text="&#x1F4D1;"/></MenuItem.Icon></MenuItem>
+                <MenuItem Header="Copy _Cell" Click="CopyCell_Click"><MenuItem.Icon><TextBlock Text="&#x1F4CB;"/></MenuItem.Icon></MenuItem>
+                <MenuItem Header="Copy _Row" Click="CopyRow_Click"><MenuItem.Icon><TextBlock Text="&#x1F4C4;"/></MenuItem.Icon></MenuItem>
+                <MenuItem Header="Copy _All Rows" Click="CopyAllRows_Click"><MenuItem.Icon><TextBlock Text="&#x1F4D1;"/></MenuItem.Icon></MenuItem>
                 <Separator/>
-                <MenuItem Header="Export to CSV..." Click="ExportToCsv_Click"><MenuItem.Icon><TextBlock Text="&#x1F4CA;"/></MenuItem.Icon></MenuItem>
+                <MenuItem Header="_Export to CSV..." Click="ExportToCsv_Click"><MenuItem.Icon><TextBlock Text="&#x1F4CA;"/></MenuItem.Icon></MenuItem>
                 <Separator/>
-                <MenuItem Header="Get Actual Plan (re-run)" Click="FinOpsGetActualPlan_Click"><MenuItem.Icon><TextBlock Text="&#x25B6;"/></MenuItem.Icon></MenuItem>
+                <MenuItem Header="_Get Actual Plan (re-run)" Click="FinOpsGetActualPlan_Click"><MenuItem.Icon><TextBlock Text="&#x25B6;"/></MenuItem.Icon></MenuItem>
             </ContextMenu>
             <Style x:Key="ExpensiveQueryRowStyle" TargetType="DataGridRow">
                 <Setter Property="ContextMenu" Value="{StaticResource ExpensiveQueryPlanContextMenu}"/>
@@ -63,13 +63,13 @@
             <!-- Storage Growth parent grid: base Copy/Export + the #1138 drill entry into the
                  per-object growth heatmap. Dedicated so "Show objects" does not leak onto the other grids. -->
             <ContextMenu x:Key="StorageGrowthContextMenu">
-                <MenuItem Header="Copy Cell" Click="CopyCell_Click"><MenuItem.Icon><TextBlock Text="&#x1F4CB;"/></MenuItem.Icon></MenuItem>
-                <MenuItem Header="Copy Row" Click="CopyRow_Click"><MenuItem.Icon><TextBlock Text="&#x1F4C4;"/></MenuItem.Icon></MenuItem>
-                <MenuItem Header="Copy All Rows" Click="CopyAllRows_Click"><MenuItem.Icon><TextBlock Text="&#x1F4D1;"/></MenuItem.Icon></MenuItem>
+                <MenuItem Header="Copy _Cell" Click="CopyCell_Click"><MenuItem.Icon><TextBlock Text="&#x1F4CB;"/></MenuItem.Icon></MenuItem>
+                <MenuItem Header="Copy _Row" Click="CopyRow_Click"><MenuItem.Icon><TextBlock Text="&#x1F4C4;"/></MenuItem.Icon></MenuItem>
+                <MenuItem Header="Copy _All Rows" Click="CopyAllRows_Click"><MenuItem.Icon><TextBlock Text="&#x1F4D1;"/></MenuItem.Icon></MenuItem>
                 <Separator/>
-                <MenuItem Header="Export to CSV..." Click="ExportToCsv_Click"><MenuItem.Icon><TextBlock Text="&#x1F4CA;"/></MenuItem.Icon></MenuItem>
+                <MenuItem Header="_Export to CSV..." Click="ExportToCsv_Click"><MenuItem.Icon><TextBlock Text="&#x1F4CA;"/></MenuItem.Icon></MenuItem>
                 <Separator/>
-                <MenuItem Header="Show objects" Click="StorageGrowthShowObjects_Click"><MenuItem.Icon><TextBlock Text="&#x1F50E;"/></MenuItem.Icon></MenuItem>
+                <MenuItem Header="Show _objects" Click="StorageGrowthShowObjects_Click"><MenuItem.Icon><TextBlock Text="&#x1F50E;"/></MenuItem.Icon></MenuItem>
             </ContextMenu>
             <Style x:Key="StorageGrowthRowStyle" TargetType="DataGridRow">
                 <Setter Property="ContextMenu" Value="{StaticResource StorageGrowthContextMenu}"/>
@@ -1320,6 +1320,238 @@
             </Grid>
         </TabItem>
 
+        <!-- Version Store (PVS) Sub-Tab — #1951, beside Database Sizes because ADR's version store
+             lives INSIDE the database and is a silent consumer of the space that tab reports. -->
+        <TabItem Header="Version Store (PVS)">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+
+                <!-- Header Controls -->
+                <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="10,8" Height="36">
+                    <TextBlock Text="Accelerated Database Recovery — Persistent Version Store" VerticalAlignment="Center" Margin="0,0,10,0"
+                               FontWeight="Bold" FontSize="14"
+                               Foreground="{DynamicResource ForegroundBrush}"/>
+                    <Button Content="Refresh" Click="RefreshPvsStats_Click"
+                            Margin="12,0,0,0" Padding="10,4" MinWidth="70"/>
+                    <TextBlock x:Name="PvsCountIndicator" Text="" Margin="12,0,0,0"
+                               VerticalAlignment="Center" FontStyle="Italic"
+                               Foreground="{DynamicResource AccentBrush}" FontWeight="SemiBold"/>
+                </StackPanel>
+
+                <TextBlock Grid.Row="1" Margin="10,0,10,8" TextWrapping="Wrap"
+                           Foreground="{DynamicResource ForegroundMutedBrush}" FontSize="11"
+                           Text="PVS sizes count OFF-ROW versions only and do not include row versions stored in-row. When a large PVS will not shrink, the skipped-page counters attribute it: Secondary means a query on a secondary replica, Snapshot means a long-running snapshot scan, Aborted means space still held by aborted transactions. Requires SQL Server 2019 or later; always on for Azure SQL Database."/>
+
+                <!-- DataGrid -->
+                <!-- #1984 stage 2: the PVS trend — "when did it start growing" beside the grid's
+                     "what is it now". One line per top-5 database by current PVS size, 7 days; legend
+                     labels carry each database's latest %-of-database. Collapsed until the loader has
+                     points, so an ADR-less server shows no dead chart. -->
+                <ScottPlot:WpfPlot Grid.Row="2" x:Name="PvsTrendChart" Height="220" Margin="10,0,10,8" Visibility="Collapsed"/>
+                <Grid Grid.Row="3" Margin="10,0,10,10">
+                    <DataGrid x:Name="PvsStatsDataGrid"
+                              AutoGenerateColumns="False"
+                              IsReadOnly="True"
+                              CanUserSortColumns="True"
+                              GridLinesVisibility="Horizontal"
+                              CanUserResizeColumns="True"
+                              HeadersVisibility="Column"
+                              SelectionMode="Extended"
+                              RowStyle="{StaticResource DefaultRowStyle}">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Binding="{Binding DatabaseName}" Width="160">
+                                <DataGridTextColumn.Header>
+                                    <StackPanel Orientation="Horizontal">
+                                        <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="DatabaseName" Click="FilterButton_Click" Margin="0,0,4,0"/>
+                                        <TextBlock Text="Database" FontWeight="Bold" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </DataGridTextColumn.Header>
+                            </DataGridTextColumn>
+                            <DataGridTextColumn Binding="{Binding AdrDisplay}" Width="60">
+                                <DataGridTextColumn.Header>
+                                    <StackPanel Orientation="Horizontal">
+                                        <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="AdrDisplay" Click="FilterButton_Click" Margin="0,0,4,0"/>
+                                        <TextBlock Text="ADR" FontWeight="Bold" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </DataGridTextColumn.Header>
+                            </DataGridTextColumn>
+                            <DataGridTextColumn Binding="{Binding PvsSizeMb, StringFormat='{}{0:N2}'}" Width="130">
+                                <DataGridTextColumn.Header>
+                                    <StackPanel Orientation="Horizontal">
+                                        <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="PvsSizeMb" Click="FilterButton_Click" Margin="0,0,4,0"/>
+                                        <TextBlock Text="PVS Off-Row MB" FontWeight="Bold" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </DataGridTextColumn.Header>
+                                <DataGridTextColumn.ElementStyle>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="HorizontalAlignment" Value="Right"/>
+                                    </Style>
+                                </DataGridTextColumn.ElementStyle>
+                            </DataGridTextColumn>
+                            <DataGridTextColumn Binding="{Binding PvsPercentOfDatabase, StringFormat='{}{0:N1}'}" Width="90">
+                                <DataGridTextColumn.Header>
+                                    <StackPanel Orientation="Horizontal">
+                                        <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="PvsPercentOfDatabase" Click="FilterButton_Click" Margin="0,0,4,0"/>
+                                        <TextBlock Text="% of DB" FontWeight="Bold" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </DataGridTextColumn.Header>
+                                <DataGridTextColumn.ElementStyle>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="HorizontalAlignment" Value="Right"/>
+                                    </Style>
+                                </DataGridTextColumn.ElementStyle>
+                            </DataGridTextColumn>
+                            <DataGridTextColumn Binding="{Binding DatabaseDataSizeMb, StringFormat='{}{0:N2}'}" Width="120">
+                                <DataGridTextColumn.Header>
+                                    <StackPanel Orientation="Horizontal">
+                                        <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="DatabaseDataSizeMb" Click="FilterButton_Click" Margin="0,0,4,0"/>
+                                        <TextBlock Text="Data Files MB" FontWeight="Bold" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </DataGridTextColumn.Header>
+                                <DataGridTextColumn.ElementStyle>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="HorizontalAlignment" Value="Right"/>
+                                    </Style>
+                                </DataGridTextColumn.ElementStyle>
+                            </DataGridTextColumn>
+                            <DataGridTextColumn Binding="{Binding OnlineIndexVersionStoreMb, StringFormat='{}{0:N2}'}" Width="130">
+                                <DataGridTextColumn.Header>
+                                    <StackPanel Orientation="Horizontal">
+                                        <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="OnlineIndexVersionStoreMb" Click="FilterButton_Click" Margin="0,0,4,0"/>
+                                        <TextBlock Text="Online Index MB" FontWeight="Bold" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </DataGridTextColumn.Header>
+                                <DataGridTextColumn.ElementStyle>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="HorizontalAlignment" Value="Right"/>
+                                    </Style>
+                                </DataGridTextColumn.ElementStyle>
+                            </DataGridTextColumn>
+                            <DataGridTextColumn Binding="{Binding AbortedTransactionCount, StringFormat='{}{0:N0}'}" Width="100">
+                                <DataGridTextColumn.Header>
+                                    <StackPanel Orientation="Horizontal">
+                                        <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="AbortedTransactionCount" Click="FilterButton_Click" Margin="0,0,4,0"/>
+                                        <TextBlock Text="Aborted Txns" FontWeight="Bold" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </DataGridTextColumn.Header>
+                                <DataGridTextColumn.ElementStyle>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="HorizontalAlignment" Value="Right"/>
+                                    </Style>
+                                </DataGridTextColumn.ElementStyle>
+                            </DataGridTextColumn>
+                            <DataGridTextColumn Binding="{Binding OldestActiveTransactionId, StringFormat='{}{0:N0}'}" Width="130">
+                                <DataGridTextColumn.Header>
+                                    <StackPanel Orientation="Horizontal">
+                                        <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="OldestActiveTransactionId" Click="FilterButton_Click" Margin="0,0,4,0"/>
+                                        <TextBlock Text="Oldest Active Txn" FontWeight="Bold" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </DataGridTextColumn.Header>
+                                <DataGridTextColumn.ElementStyle>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="HorizontalAlignment" Value="Right"/>
+                                    </Style>
+                                </DataGridTextColumn.ElementStyle>
+                            </DataGridTextColumn>
+                            <DataGridTextColumn Binding="{Binding OldestAbortedTransactionId, StringFormat='{}{0:N0}'}" Width="140">
+                                <DataGridTextColumn.Header>
+                                    <StackPanel Orientation="Horizontal">
+                                        <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="OldestAbortedTransactionId" Click="FilterButton_Click" Margin="0,0,4,0"/>
+                                        <TextBlock Text="Oldest Aborted Txn" FontWeight="Bold" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </DataGridTextColumn.Header>
+                                <DataGridTextColumn.ElementStyle>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="HorizontalAlignment" Value="Right"/>
+                                    </Style>
+                                </DataGridTextColumn.ElementStyle>
+                            </DataGridTextColumn>
+                            <DataGridTextColumn Binding="{Binding AbortedTransactionLag, StringFormat='{}{0:N0}'}" Width="130">
+                                <DataGridTextColumn.Header>
+                                    <StackPanel Orientation="Horizontal">
+                                        <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="AbortedTransactionLag" Click="FilterButton_Click" Margin="0,0,4,0"/>
+                                        <TextBlock Text="Aborted Lag" FontWeight="Bold" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </DataGridTextColumn.Header>
+                                <DataGridTextColumn.ElementStyle>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="HorizontalAlignment" Value="Right"/>
+                                    </Style>
+                                </DataGridTextColumn.ElementStyle>
+                            </DataGridTextColumn>
+                            <DataGridTextColumn Binding="{Binding CleanupState}" Width="90">
+                                <DataGridTextColumn.Header>
+                                    <StackPanel Orientation="Horizontal">
+                                        <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="CleanupState" Click="FilterButton_Click" Margin="0,0,4,0"/>
+                                        <TextBlock Text="Cleanup" FontWeight="Bold" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </DataGridTextColumn.Header>
+                            </DataGridTextColumn>
+                            <DataGridTextColumn Binding="{Binding LastCleanupEnd, StringFormat='{}{0:yyyy-MM-dd HH:mm:ss}'}" Width="150">
+                                <DataGridTextColumn.Header>
+                                    <StackPanel Orientation="Horizontal">
+                                        <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="LastCleanupEnd" Click="FilterButton_Click" Margin="0,0,4,0"/>
+                                        <TextBlock Text="Last Cleanup End" FontWeight="Bold" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </DataGridTextColumn.Header>
+                            </DataGridTextColumn>
+                            <DataGridTextColumn Binding="{Binding SkippedLowWaterMark, StringFormat='{}{0:N0}'}" Width="140">
+                                <DataGridTextColumn.Header>
+                                    <StackPanel Orientation="Horizontal">
+                                        <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="SkippedLowWaterMark" Click="FilterButton_Click" Margin="0,0,4,0"/>
+                                        <TextBlock Text="Skipped: Secondary" FontWeight="Bold" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </DataGridTextColumn.Header>
+                                <DataGridTextColumn.ElementStyle>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="HorizontalAlignment" Value="Right"/>
+                                    </Style>
+                                </DataGridTextColumn.ElementStyle>
+                            </DataGridTextColumn>
+                            <DataGridTextColumn Binding="{Binding SkippedMinUsefulXts, StringFormat='{}{0:N0}'}" Width="140">
+                                <DataGridTextColumn.Header>
+                                    <StackPanel Orientation="Horizontal">
+                                        <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="SkippedMinUsefulXts" Click="FilterButton_Click" Margin="0,0,4,0"/>
+                                        <TextBlock Text="Skipped: Snapshot" FontWeight="Bold" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </DataGridTextColumn.Header>
+                                <DataGridTextColumn.ElementStyle>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="HorizontalAlignment" Value="Right"/>
+                                    </Style>
+                                </DataGridTextColumn.ElementStyle>
+                            </DataGridTextColumn>
+                            <DataGridTextColumn Binding="{Binding SkippedOldestAborted, StringFormat='{}{0:N0}'}" Width="140">
+                                <DataGridTextColumn.Header>
+                                    <StackPanel Orientation="Horizontal">
+                                        <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="SkippedOldestAborted" Click="FilterButton_Click" Margin="0,0,4,0"/>
+                                        <TextBlock Text="Skipped: Aborted" FontWeight="Bold" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </DataGridTextColumn.Header>
+                                <DataGridTextColumn.ElementStyle>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="HorizontalAlignment" Value="Right"/>
+                                    </Style>
+                                </DataGridTextColumn.ElementStyle>
+                            </DataGridTextColumn>
+                        </DataGrid.Columns>
+                    </DataGrid>
+
+                    <!-- Empty State -->
+                    <TextBlock x:Name="NoPvsStatsMessage"
+                               Text="No persistent version store data collected yet (SQL Server 2019+ only)"
+                               FontSize="14" Foreground="{DynamicResource ForegroundMutedBrush}"
+                               HorizontalAlignment="Center" VerticalAlignment="Center"
+                               Visibility="Collapsed"/>
+                </Grid>
+            </Grid>
+        </TabItem>
+
         <!-- Index Analysis Sub-Tab -->
         <TabItem Header="Index Analysis">
             <Grid>
@@ -1334,7 +1566,7 @@
                                Foreground="{DynamicResource ForegroundBrush}"/>
                     <TextBox x:Name="IndexAnalysisDatabaseInput" Width="180" Margin="0,0,8,0"
                              VerticalContentAlignment="Center"/>
-                    <CheckBox x:Name="IndexAnalysisAllDatabases" Content="All Databases"
+                    <CheckBox x:Name="IndexAnalysisAllDatabases" Content="All _Databases"
                               VerticalAlignment="Center" Margin="0,0,8,0"/>
                     <Button x:Name="RunIndexAnalysisButton" Content="Run Analysis" Click="RunIndexAnalysis_Click"
                             Padding="10,4" MinWidth="100"/>
@@ -2029,6 +2261,13 @@
                                     <DataGridTextColumn Binding="{Binding DatabaseName}" Width="140">
                                         <DataGridTextColumn.Header><StackPanel Orientation="Horizontal"><Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="DatabaseName" Click="FilterButton_Click" Margin="0,0,4,0"/><TextBlock Text="Database" FontWeight="Bold" VerticalAlignment="Center"/></StackPanel></DataGridTextColumn.Header>
                                     </DataGridTextColumn>
+                                    <DataGridTemplateColumn Header="Query Preview" Width="400">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBlock Text="{Binding QueryPreview}" TextWrapping="Wrap" MaxHeight="90" Margin="5,2" ToolTip="{Binding FullQueryText}"/>
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
                                     <DataGridTextColumn Binding="{Binding TotalCpuMs, StringFormat='{}{0:N0}'}" Width="110">
                                         <DataGridTextColumn.Header><StackPanel Orientation="Horizontal"><Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="TotalCpuMs" Click="FilterButton_Click" Margin="0,0,4,0"/><TextBlock Text="Total CPU ms" FontWeight="Bold" VerticalAlignment="Center"/></StackPanel></DataGridTextColumn.Header>
                                         <DataGridTextColumn.ElementStyle><Style TargetType="TextBlock"><Setter Property="HorizontalAlignment" Value="Right"/></Style></DataGridTextColumn.ElementStyle>
@@ -2053,13 +2292,6 @@
                                         <DataGridTextColumn.Header><StackPanel Orientation="Horizontal"><Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="MonthlyCostShare" Click="FilterButton_Click" Margin="0,0,4,0"/><TextBlock Text="Est. Cost ($)" FontWeight="Bold" VerticalAlignment="Center"/></StackPanel></DataGridTextColumn.Header>
                                         <DataGridTextColumn.ElementStyle><Style TargetType="TextBlock"><Setter Property="HorizontalAlignment" Value="Right"/></Style></DataGridTextColumn.ElementStyle>
                                     </DataGridTextColumn>
-                                    <DataGridTemplateColumn Header="Query Preview" Width="400">
-                                        <DataGridTemplateColumn.CellTemplate>
-                                            <DataTemplate>
-                                                <TextBlock Text="{Binding QueryPreview}" TextWrapping="Wrap" MaxHeight="90" Margin="5,2" ToolTip="{Binding FullQueryText}"/>
-                                            </DataTemplate>
-                                        </DataGridTemplateColumn.CellTemplate>
-                                    </DataGridTemplateColumn>
                                 </DataGrid.Columns>
                             </DataGrid>
                             <TextBlock x:Name="ExpensiveQueriesNoDataMessage"
@@ -2216,6 +2448,19 @@
                                 </StackPanel>
                             </DataGridTextColumn.Header>
                         </DataGridTextColumn>
+                        <DataGridTemplateColumn Width="400">
+                            <DataGridTemplateColumn.Header>
+                                <StackPanel Orientation="Horizontal">
+                                    <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="SampleQueryText" Click="FilterButton_Click" Margin="0,0,4,0"/>
+                                    <TextBlock Text="Query Preview" FontWeight="Bold" VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </DataGridTemplateColumn.Header>
+                            <DataGridTemplateColumn.CellTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding SampleQueryText}" TextWrapping="Wrap" MaxHeight="90" Margin="5,2" ToolTip="{Binding FullQueryText}"/>
+                                </DataTemplate>
+                            </DataGridTemplateColumn.CellTemplate>
+                        </DataGridTemplateColumn>
                         <DataGridTextColumn Binding="{Binding TotalExecutions, StringFormat='{}{0:N0}'}" Width="100">
                             <DataGridTextColumn.Header>
                                 <StackPanel Orientation="Horizontal">
@@ -2315,19 +2560,6 @@
                                 <Style TargetType="TextBlock"><Setter Property="HorizontalAlignment" Value="Right"/></Style>
                             </DataGridTextColumn.ElementStyle>
                         </DataGridTextColumn>
-                        <DataGridTemplateColumn Width="400">
-                            <DataGridTemplateColumn.Header>
-                                <StackPanel Orientation="Horizontal">
-                                    <Button Style="{DynamicResource ColumnFilterButtonStyle}" Tag="SampleQueryText" Click="FilterButton_Click" Margin="0,0,4,0"/>
-                                    <TextBlock Text="Query Preview" FontWeight="Bold" VerticalAlignment="Center"/>
-                                </StackPanel>
-                            </DataGridTemplateColumn.Header>
-                            <DataGridTemplateColumn.CellTemplate>
-                                <DataTemplate>
-                                    <TextBlock Text="{Binding SampleQueryText}" TextWrapping="Wrap" MaxHeight="90" Margin="5,2" ToolTip="{Binding FullQueryText}"/>
-                                </DataTemplate>
-                            </DataGridTemplateColumn.CellTemplate>
-                        </DataGridTemplateColumn>
                     </DataGrid.Columns>
                 </DataGrid>
             </Grid>

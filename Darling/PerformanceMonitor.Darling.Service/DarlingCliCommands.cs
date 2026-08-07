@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (c) 2026 Erik Darling, Darling Data LLC
  *
  * This file is part of the SQL Server Performance Monitor.
@@ -17,6 +17,7 @@ using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.Versioning;
 using System.Security.Principal;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Npgsql;
@@ -74,6 +75,11 @@ public static class DarlingCliCommands
     public static bool IsPrintViewerConnectionVerb(string arg) =>
         string.Equals(arg, "--print-viewer-connection", StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>The verb <see cref="ExportViewerConfigAsync"/> handles — write a COMPLETE viewer darling.json +
+    /// server.crt + README.txt an operator copies to the viewer machine as-is (#1953).</summary>
+    public static bool IsExportViewerConfigVerb(string arg) =>
+        string.Equals(arg, "--export-viewer-config", StringComparison.OrdinalIgnoreCase);
+
     /// <summary>The verb <see cref="ConfigureNetworkAsync"/> handles — the interactive exposure wizard (#1561).</summary>
     public static bool IsConfigureNetworkVerb(string arg) =>
         string.Equals(arg, "--configure-network", StringComparison.OrdinalIgnoreCase);
@@ -105,6 +111,16 @@ public static class DarlingCliCommands
     public static bool IsBackfillRollupsVerb(string arg) =>
         string.Equals(arg, "--backfill-rollups", StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>The verb <see cref="CollapseLegacySlicesAsync"/> handles — repair the pre-#1907 Query Store
+    /// split slices still sitting in stored rows, then re-materialize what they fed (#1912).</summary>
+    public static bool IsCollapseLegacySlicesVerb(string arg) =>
+        string.Equals(arg, "--collapse-legacy-slices", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The verb <see cref="RecompressPlanDimAsync"/> handles — convert the plan dimension's
+    /// pre-V54 text rows to the gzip form V54's write path produces (#2076).</summary>
+    public static bool IsRecompressPlanDimVerb(string arg) =>
+        string.Equals(arg, "--recompress-plan-dim", StringComparison.OrdinalIgnoreCase);
+
     /// <summary><c>--version</c>/<c>-v</c> — print the product version and exit.</summary>
     public static bool IsVersionVerb(string arg) =>
         string.Equals(arg, "--version", StringComparison.OrdinalIgnoreCase)
@@ -126,13 +142,16 @@ public static class DarlingCliCommands
         IsEncryptPasswordVerb(arg)
         || IsValidateConfigVerb(arg)
         || IsPrintViewerConnectionVerb(arg)
+        || IsExportViewerConfigVerb(arg)
         || IsConfigureNetworkVerb(arg)
         || IsConfigureFirewallVerb(arg)
         || IsEnableMcpVerb(arg)
         || IsDisableMcpVerb(arg)
         || IsEnableWebVerb(arg)
         || IsDisableWebVerb(arg)
-        || IsBackfillRollupsVerb(arg);
+        || IsBackfillRollupsVerb(arg)
+        || IsCollapseLegacySlicesVerb(arg)
+        || IsRecompressPlanDimVerb(arg);
 
     /// <summary>
     /// Classifies the exe's command line from its FIRST argument (#1581): no args → run the host; a recognized
@@ -195,6 +214,7 @@ public static class DarlingCliCommands
         "  PerformanceMonitor.Darling.Service.exe --test-connection   Validate darling.json and probe every configured server." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --encrypt-password  Encrypt a SQL-auth password for darling.json (reads stdin)." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --print-viewer-connection   Print a remote-viewer connection string (managed store)." + Environment.NewLine +
+        "  PerformanceMonitor.Darling.Service.exe --export-viewer-config [dir] [--config <path>]  Write a ready-to-copy viewer folder (darling.json + server.crt + README.txt)." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --configure-network Interactive LAN-exposure wizard." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --configure-firewall  Create/remove the scoped firewall rules to match darling.json (run elevated)." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --enable-mcp        Enable the MCP endpoint in the store and open its firewall (run elevated)." + Environment.NewLine +
@@ -202,6 +222,8 @@ public static class DarlingCliCommands
         "  PerformanceMonitor.Darling.Service.exe --enable-web        Enable the web dashboard in the store and open its firewall (run elevated)." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --disable-web       Disable the web dashboard in the store and remove its firewall rule (run elevated)." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --backfill-rollups  Materialize the retention rollups back over existing history, after a disk preflight." + Environment.NewLine +
+        "  PerformanceMonitor.Darling.Service.exe --collapse-legacy-slices  Repair Query Store rows collected before the split-slice fix, then re-materialize the rollups they fed." + Environment.NewLine +
+        "  PerformanceMonitor.Darling.Service.exe --recompress-plan-dim  Convert the plan dimension's pre-V54 text rows to gzip in batches while the service runs, then VACUUM FULL to return the space to the volume (--no-vacuum-full to skip; --vacuum-full to compact an already-converted store)." + Environment.NewLine +
         "  PerformanceMonitor.Darling.Service.exe --backfill-rollups --dry-run   Show the plan, the disk estimate and the time budget, and change nothing.";
 
     /// <summary>
@@ -299,35 +321,131 @@ public static class DarlingCliCommands
             return 1;
         }
 
+        var handoff = await ResolveViewerHandoffAsync(
+            config, "--print-viewer-connection", "print", error, cancellationToken);
+        if (handoff is null)
+        {
+            return 1;
+        }
+
+        /* The client-side Root Certificate placeholder: the operator saves the PEM below at this path on the
+           VIEWER machine (a bare filename resolves against the folder holding the viewer's darling.json —
+           #1970; an absolute path also works). Kept as a literal so the printed string is paste-ready. */
+        const string clientCertificatePath = ViewerClientCertificateFileName;
+        var connectionString = BuildViewerConnectionString(
+            handoff.Host, handoff.Port, handoff.Role, handoff.Password, clientCertificatePath);
+
+        /* Read the cert BEFORE anything reaches STDOUT: every STDERR line — including the missing-cert NOTE —
+           must be emitted ahead of the payload (#1953 item 3). The field report watched the live password scroll
+           past and only THEN saw the redirect advice, which is exactly backwards for a warning. */
+        var certificate = File.Exists(handoff.CertificatePath)
+            ? (await File.ReadAllTextAsync(handoff.CertificatePath, cancellationToken)).Trim()
+            : null;
+
+        /* Guidance + the live-secret warning go to STDERR, so redirecting STDOUT to a file or the clipboard
+           captures the connection string + cert WITHOUT swallowing the warning (D8). */
+        error.WriteLine();
+        error.WriteLine(
+            $"WARNING: the connection string below contains a LIVE database password (the '{handoff.Role}' role), written " +
+            "to STDOUT. Redirect it to an ACL'd file or pipe it to the clipboard; do not leave it in shell " +
+            "scrollback, CI logs, or a screenshare.");
+        error.WriteLine("  Example (file):      PerformanceMonitor.Darling.Service.exe --print-viewer-connection > viewer-connection.txt");
+        error.WriteLine("  Example (clipboard): PerformanceMonitor.Darling.Service.exe --print-viewer-connection | clip");
+        error.WriteLine("  Example (no paste):  PerformanceMonitor.Darling.Service.exe --export-viewer-config   (writes the whole viewer folder for you)");
+        if (string.Equals(handoff.Role, "admin", StringComparison.Ordinal))
+        {
+            error.WriteLine(
+                "  NOTE: 'admin' is a WRITE credential holding the config-table pivot surface. Prefer the default " +
+                "'viewer' (read-only) for a remote seat; if you must use 'admin', NTFS-ACL the laptop file too.");
+        }
+
+        if (certificate is not null)
+        {
+            error.WriteLine(
+                $"Save the certificate block below as '{clientCertificatePath}' on the viewer machine (beside its " +
+                "darling.json) and point \"Root Certificate\" at it — the store uses SSL Mode=VerifyFull, so the cert must match.");
+        }
+        else
+        {
+            error.WriteLine(
+                $"NOTE: the server TLS certificate ({handoff.CertificatePath}) does not exist yet — the service generates it " +
+                "on its first managed start with postgres.network exposed. Enable postgres.network, restart the " +
+                "service, then re-run this command to emit the cert for verify-full.");
+        }
+
+        error.WriteLine();
+
+        output.WriteLine(
+            "# Paste into the viewer machine's darling.json -> postgres.connectionString (with postgres.managed = false):");
+        output.WriteLine(connectionString);
+        output.WriteLine();
+
+        /* Emit the server cert PEM so the operator can copy it to the viewer machine. */
+        if (certificate is not null)
+        {
+            output.WriteLine($"# Server TLS certificate ({DarlingManagedPostgres.ServerCertFileName}) — save as '{clientCertificatePath}' on the viewer machine:");
+            output.WriteLine(certificate);
+        }
+
+        return 0;
+    }
+
+    /// <summary>
+    /// The name the exported/pasted client-side certificate takes on the VIEWER machine, and therefore the
+    /// <c>Root Certificate=</c> value both viewer verbs emit. Deliberately the same file name the store
+    /// generates, so an operator who copies the folder never has to re-point anything.
+    /// </summary>
+    public const string ViewerClientCertificateFileName = "server.crt";
+
+    /// <summary>Everything a remote viewer seat needs, resolved from darling.json + the managed store's
+    /// on-disk material: where to dial, as whom, with which password, and the server cert to pin. Shared by
+    /// <see cref="PrintViewerConnectionAsync"/> and <see cref="ExportViewerConfigAsync"/> so the two verbs
+    /// cannot disagree about any of it.</summary>
+    /// <param name="CertificatePath">The store-side <c>server.crt</c>; may not exist yet (each verb decides
+    /// whether that is fatal — the print verb still has a useful string, the export does not).</param>
+    private sealed record ViewerHandoff(
+        string Host, int Port, string Role, string Password, string CertificatePath);
+
+    /// <summary>
+    /// Resolves the remote-viewer handoff material (D8), writing every refusal + warning to
+    /// <paramref name="error"/> and returning null when the caller must exit 1. Managed-mode only: the DPAPI
+    /// credential files and the generated TLS cert it reads exist only there — in BYO the operator's own
+    /// PostgreSQL governs exposure + credentials (D-BYO). Windows-only (DPAPI-LocalMachine). The two string
+    /// parameters shape message WORDING only — never the logic, so both verbs resolve identically.
+    /// </summary>
+    /// <param name="verb">The CLI verb to name in refusals, e.g. <c>--export-viewer-config</c>.</param>
+    /// <param name="action">What the verb would have produced, e.g. "print" / "export", for the no-remote-connection refusal.</param>
+    [SupportedOSPlatform("windows")]
+    private static async Task<ViewerHandoff?> ResolveViewerHandoffAsync(
+        DarlingConfig config, string verb, string action, TextWriter error, CancellationToken cancellationToken)
+    {
         var postgres = config.Postgres;
         if (postgres is null)
         {
             error.WriteLine("postgres section is required.");
-            return 1;
+            return null;
         }
 
-        /* Managed-mode only: the DPAPI credential files + the generated TLS cert this verb reads exist only in
-           managed mode. In BYO the operator's own PostgreSQL governs exposure + credentials (D-BYO). */
         if (!postgres.Managed)
         {
             error.WriteLine(
-                "--print-viewer-connection is for the managed store only. In bring-your-own mode " +
+                $"{verb} is for the managed store only. In bring-your-own mode " +
                 "(postgres.connectionString), your own PostgreSQL governs network exposure and credentials — " +
                 "build the remote viewer's connection string from your own role + TLS setup.");
-            return 1;
+            return null;
         }
 
         /* The pg_hba login role the network exposure names — default viewer (read-only, the secure default).
            An explicitly-invalid value is a hard error: the store degrades to loopback for it, so no remote
-           connection exists to print. */
+           connection exists at all. */
         var network = postgres.Network;
         var role = DarlingNetwork.NormalizeNetworkRole(network?.Role);
         if (role is null)
         {
             error.WriteLine(
                 $"postgres.network.role '{network?.Role}' is invalid — it must be \"viewer\" (default, read-only) " +
-                "or \"admin\". The store degrades to loopback for an unknown role, so there is no remote connection to print.");
-            return 1;
+                $"or \"admin\". The store degrades to loopback for an unknown role, so there is no remote connection to {action}.");
+            return null;
         }
 
         /* Warn (not fail) when the store is not actually network-exposed: the operator still gets a template,
@@ -355,7 +473,7 @@ public static class DarlingCliCommands
                 $"The '{role}' role credential ({credentialPath}) does not exist yet. Start the PerformanceMonitor " +
                 "Darling service once so its first run provisions the least-privilege roles and their credentials, " +
                 "then re-run this command.");
-            return 1;
+            return null;
         }
 
         string password;
@@ -368,58 +486,694 @@ public static class DarlingCliCommands
             error.WriteLine(
                 $"Could not decrypt the '{role}' credential at {credentialPath}: {ex.Message} (DPAPI-LocalMachine — " +
                 "run this on the same machine as the service, under an account that can read the credential).");
+            return null;
+        }
+
+        return new ViewerHandoff(
+            host,
+            postgres.Port,
+            role,
+            password,
+            Path.Combine(Path.GetDirectoryName(credentialPath)!, DarlingManagedPostgres.ServerCertFileName));
+    }
+
+    /// <summary>
+    /// #1953 — writes the viewer machine's COMPLETE handoff folder: a ready-to-use <c>darling.json</c> (the
+    /// resolved connection string, <c>"managed": false</c> already set, every field commented in place), the
+    /// store's <c>server.crt</c> beside it, and a <c>README.txt</c> that documents the fields — including the
+    /// valid <c>Root Certificate=</c> values — for an operator who never opens the JSON. The field report that
+    /// motivated this had to hand-merge <c>--print-viewer-connection</c>'s output into JSON copied out of the
+    /// docs and discover the <c>managed</c> flip by trial; nobody writes that file by hand anymore.
+    /// <para>Managed-mode + Windows only (same DPAPI/TLS material as <see cref="PrintViewerConnectionAsync"/>,
+    /// resolved by the same helper). The cert is REQUIRED here, unlike the print verb: a folder whose
+    /// verify-full connection cannot be completed is exactly the half-finished handoff this verb exists to
+    /// kill, so a missing cert fails with the reason instead of exporting something broken.</para>
+    /// <para><b>The written darling.json holds a LIVE credential</b> — the verb says so on STDERR, naming the
+    /// file, before writing it, then ACLs it to SYSTEM + Administrators + this account + INTERACTIVE and
+    /// CONFIRMS that (returning 2, not 0, when the secret is still readable — "exported" must not read as
+    /// "protected" to a script). The password value itself is never echoed.</para>
+    /// <para>It also refuses destinations rather than clobbering them, all decided BEFORE any config load or
+    /// credential decrypt because they are pure path questions whose failure cannot be undone: the service's
+    /// OWN config directory (exporting there replaced darling.json with the viewer's, destroying its servers,
+    /// encrypted passwords and tokens — reproduced, and one keystroke from a legitimate command); a
+    /// darling.json this verb did not write (an operator's file, or one pre-created by a local user who would
+    /// keep OWNERSHIP through the harden — a Windows owner keeps WRITE_DAC); and a junction/symlink
+    /// destination (creating one needs no privilege, and it redirects the cleartext credential). Re-exporting
+    /// over its OWN output is silent — that is the documented step after a rotation.</para>
+    /// </summary>
+    /// <param name="outputDirectory">Where to write; null = a <c>viewer-config</c> folder beside darling.json.</param>
+    /// <returns>0 exported and protected; 1 refused or failed; 2 exported but the secret is NOT protected.</returns>
+    [SupportedOSPlatform("windows")]
+    public static async Task<int> ExportViewerConfigAsync(
+        string? configPath, string? outputDirectory, TextWriter output, TextWriter error, CancellationToken cancellationToken)
+    {
+        var servicePath = DarlingConfig.ResolveConfigPath(configPath);
+        var targetDirectory = ResolveViewerExportDirectory(servicePath, outputDirectory);
+
+        /* Destination guards run FIRST — before any config load or credential decrypt — because they are pure
+           path questions and because the failure they prevent is unrecoverable. Nothing below has touched
+           DPAPI yet, so a bad argument costs nothing. */
+        if (File.Exists(targetDirectory)
+            || Path.TrimEndingDirectorySeparator(targetDirectory).EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+        {
+            /* This verb's positional argument is the DESTINATION, while every sibling verb's is a config path,
+               so an operator with sibling muscle memory types darling.json here. */
+            error.WriteLine(
+                $"'{targetDirectory}' is a file, not a directory. This verb's argument is the DESTINATION folder " +
+                "for the exported viewer files; to point it at a different darling.json, use --config <path> " +
+                "(e.g. --export-viewer-config D:\\handoff --config C:\\Darling\\darling.json).");
             return 1;
         }
 
-        /* The client-side Root Certificate placeholder: the operator saves the PEM below at this path on the
-           VIEWER machine (a bare filename resolves beside the viewer's working directory; an absolute path
-           also works). Kept as a literal so the printed string is paste-ready. */
-        const string clientCertificatePath = "server.crt";
-        var connectionString = BuildViewerConnectionString(host, postgres.Port, role, password, clientCertificatePath);
+        var exportedConfigPath = Path.Combine(targetDirectory, ViewerConfigFileName);
 
-        /* Guidance + the live-secret warning go to STDERR, so redirecting STDOUT to a file or the clipboard
-           captures the connection string + cert WITHOUT swallowing the warning (D8). */
-        error.WriteLine();
-        error.WriteLine(
-            $"WARNING: the connection string below contains a LIVE database password (the '{role}' role), written " +
-            "to STDOUT. Redirect it to an ACL'd file or pipe it to the clipboard; do not leave it in shell " +
-            "scrollback, CI logs, or a screenshare.");
-        error.WriteLine("  Example (file):      PerformanceMonitor.Darling.Service.exe --print-viewer-connection > viewer-connection.txt");
-        error.WriteLine("  Example (clipboard): PerformanceMonitor.Darling.Service.exe --print-viewer-connection | clip");
-        if (string.Equals(role, "admin", StringComparison.Ordinal))
+        /* The unrecoverable one: exporting INTO the service's own config directory would overwrite the
+           service's darling.json with the viewer's, destroying every monitored server, every DPAPI
+           encryptedPassword, and the MCP/web tokens — none of which exist anywhere else. One keystroke from
+           a legitimate command (the install directory is the obvious place to put a handoff folder).
+           #1973 — this compare is LEXICAL: Path.GetFullPath normalizes text and does not resolve links, so a
+           junction on an ANCESTOR of the destination (say C:\Data\handoff, where C:\Data links into the
+           service's own directory) reads as a different path here and slips past — as it does past the leaf
+           junction check below, whose attributes describe only the last component. Deliberately NOT chased
+           with a chain-resolving walk, because the destructive case is already refused one layer down: the
+           per-FILE TryCheckExportTarget goes through the OS's REAL path resolution (File.GetAttributes and
+           File.ReadAllText follow the whole junction chain to the actual file), and the service's own
+           darling.json carries no export marker, so such a run stops with "not written by
+           --export-viewer-config" before anything is deleted. What survives the gap is only "the files land
+           in a directory the junction-planter chose" — and planting a junction in the ancestor chain of the
+           operator's destination already means controlling that destination's fate. */
+        if (string.Equals(
+                Path.GetFullPath(exportedConfigPath), Path.GetFullPath(servicePath), StringComparison.OrdinalIgnoreCase))
         {
             error.WriteLine(
-                "  NOTE: 'admin' is a WRITE credential holding the config-table pivot surface. Prefer the default " +
-                "'viewer' (read-only) for a remote seat; if you must use 'admin', NTFS-ACL the laptop file too.");
+                $"Refusing to export into {targetDirectory}: that would overwrite the SERVICE's own {ViewerConfigFileName} " +
+                $"({servicePath}) with the viewer's, destroying its monitored servers, encrypted passwords and tokens. " +
+                "Name a different destination — the default (no argument) is a viewer-config subfolder beside it.");
+            return 1;
         }
 
-        error.WriteLine(
-            $"Save the certificate block below as '{clientCertificatePath}' on the viewer machine (beside its " +
-            "darling.json) and point \"Root Certificate\" at it — the store uses SSL Mode=VerifyFull, so the cert must match.");
-        error.WriteLine();
-
-        output.WriteLine(
-            "# Paste into the viewer machine's darling.json -> postgres.connectionString (with postgres.managed = false):");
-        output.WriteLine(connectionString);
-        output.WriteLine();
-
-        /* Emit the server cert PEM so the operator can copy it to the viewer machine. */
-        var certificatePath = Path.Combine(
-            Path.GetDirectoryName(credentialPath)!, DarlingManagedPostgres.ServerCertFileName);
-        if (File.Exists(certificatePath))
-        {
-            output.WriteLine($"# Server TLS certificate ({DarlingManagedPostgres.ServerCertFileName}) — save as '{clientCertificatePath}' on the viewer machine:");
-            output.WriteLine((await File.ReadAllTextAsync(certificatePath, cancellationToken)).Trim());
-        }
-        else
+        /* A destination that is a junction/symlink is refused: creating one needs no privilege on Windows, so
+           it is how an unprivileged local user redirects a cleartext credential into a directory they control.
+           #1973 — leaf-only, and knowingly so: DirectoryInfo.Attributes describes THIS directory, never the
+           ones above it, so this shares the ancestor-junction blind spot recorded on the guard above, and the
+           same per-file marker check in TryCheckExportTarget is the backstop that actually holds. */
+        if (Directory.Exists(targetDirectory)
+            && new DirectoryInfo(targetDirectory).Attributes.HasFlag(FileAttributes.ReparsePoint))
         {
             error.WriteLine(
-                $"NOTE: the server TLS certificate ({certificatePath}) does not exist yet — the service generates it " +
-                "on its first managed start with postgres.network exposed. Enable postgres.network, restart the " +
-                "service, then re-run this command to emit the cert for verify-full.");
+                $"Refusing to export into {targetDirectory}: it is a junction or symbolic link, so the real " +
+                "destination is somewhere else. Export to a real directory.");
+            return 1;
         }
 
-        return 0;
+        /* Overwrite only what THIS verb wrote — for ALL THREE files, not just the secret-bearing one. They
+           land in the same operator-nameable directory, so each is equally a place a local user can plant a
+           symlink to redirect the write, or pre-create a file to keep OWNERSHIP of (a Windows owner retains
+           WRITE_DAC no matter what DACL is applied afterwards). Re-exporting after a credential or
+           certificate rotation is a documented workflow, so an export of ours is replaced silently; anything
+           else stops the run. Checked here, before the config load and the credential decrypt, because these
+           are pure filesystem questions — and check-only: nothing is deleted until the write itself, so a run
+           that fails later has not thrown away the previous export. */
+        foreach (var (path, marker) in new[]
+        {
+            (exportedConfigPath, ViewerConfigMarker),
+            (Path.Combine(targetDirectory, ViewerClientCertificateFileName), CertificatePemMarker),
+            (Path.Combine(targetDirectory, ViewerReadmeFileName), ViewerReadmeMarker),
+        })
+        {
+            if (!TryCheckExportTarget(path, marker, error))
+            {
+                return 1;
+            }
+        }
+
+        if (targetDirectory.StartsWith(@"\\", StringComparison.Ordinal))
+        {
+            error.WriteLine(
+                $"WARNING: {targetDirectory} is a network path. The exported {ViewerConfigFileName} holds a live " +
+                "password, and the file ACL this verb applies locally does not necessarily hold on a remote share — " +
+                "check the share's permissions yourself.");
+        }
+
+        DarlingConfig config;
+        try
+        {
+            config = DarlingConfig.Load(configPath);
+        }
+        catch (Exception ex)
+        {
+            error.WriteLine($"Could not load configuration: {ex.Message}");
+            return 1;
+        }
+
+        var handoff = await ResolveViewerHandoffAsync(
+            config, "--export-viewer-config", "export", error, cancellationToken);
+        if (handoff is null)
+        {
+            return 1;
+        }
+
+        string certificate;
+        if (!File.Exists(handoff.CertificatePath))
+        {
+            error.WriteLine(
+                $"Cannot export: the server TLS certificate ({handoff.CertificatePath}) does not exist yet, and the " +
+                "exported connection uses SSL Mode=VerifyFull — without the cert the viewer could not connect. The " +
+                "service generates it on its first managed start with postgres.network exposed: set postgres.network " +
+                "(listen + allowFrom), restart the service, then re-run this command.");
+            return 1;
+        }
+
+        try
+        {
+            certificate = (await File.ReadAllTextAsync(handoff.CertificatePath, cancellationToken)).Trim();
+        }
+        catch (Exception ex)
+        {
+            error.WriteLine($"Could not read the server TLS certificate ({handoff.CertificatePath}): {ex.Message}");
+            return 1;
+        }
+
+        var configFile = exportedConfigPath;
+        var certificateFile = Path.Combine(targetDirectory, ViewerClientCertificateFileName);
+        var readmeFile = Path.Combine(targetDirectory, ViewerReadmeFileName);
+
+        /* The live-secret warning goes out BEFORE the write, naming the file — so an operator who walks away
+           mid-run has still been told a credential-bearing file is landing there (#1953 item 3's ordering rule,
+           applied to the verb that writes the secret rather than printing it). */
+        error.WriteLine();
+        error.WriteLine(
+            $"WARNING: {configFile} will contain a LIVE database password (the '{handoff.Role}' role) in cleartext, " +
+            "because that is what the viewer connects with. Copy the folder over a channel you trust, and keep the " +
+            "file ACL'd to the operator account on the viewer machine.");
+
+        /* One timestamp for the whole export: the two files date the same act, and sampling the clock twice
+           can straddle a second boundary and print two. */
+        var generatedUtc = DateTimeOffset.UtcNow;
+
+        bool secretProtected;
+        try
+        {
+            Directory.CreateDirectory(targetDirectory);
+
+            await WriteExportFileAsync(
+                configFile,
+                BuildViewerConfigJson(
+                    BuildViewerConnectionString(
+                        handoff.Host, handoff.Port, handoff.Role, handoff.Password, ViewerClientCertificateFileName),
+                    generatedUtc),
+                cancellationToken);
+
+            /* Only this file gets an ACL: it is the only one carrying a secret. The certificate is public by
+               construction and the README has nothing in it — but all three go through the same
+               replace-safely path above, because the ownership and symlink problems are about the PATH, not
+               about what the file contains. */
+            secretProtected = TryHardenExportedSecret(configFile, error);
+
+            await WriteExportFileAsync(certificateFile, certificate + Environment.NewLine, cancellationToken);
+            await WriteExportFileAsync(
+                readmeFile,
+                BuildViewerConfigReadme(handoff.Host, handoff.Port, handoff.Role, generatedUtc),
+                cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            error.WriteLine($"Could not write the viewer config to {targetDirectory}: {ex.Message}");
+
+            /* A write that died part-way can leave a file holding the start of a live password. Remove it, and
+               say so either way — "the export failed" must not leave an unmentioned secret on disk.
+               #1973 — and sweep the OTHER TWO as well, not just the secret-bearing one: each write DELETES the
+               previous export's copy before recreating it, so a failure part-way through leaves a mix of new
+               and stale files with no config to go with them — the half-finished handoff this verb exists to
+               refuse. The cert and the README are always safe to remove (neither carries a secret and neither
+               is usable without the config), so the folder is emptied of this verb's files rather than left
+               looking exportable. Every file still on disk is NAMED; each removal stands alone, so one that
+               fails masks neither the original error nor the other removals. */
+            TryRemovePartialExport(
+                configFile,
+                "it held a live password — the whole of one if the write that failed was a later file",
+                "it holds a live password",
+                error);
+            TryRemovePartialExport(
+                certificateFile,
+                "cleanup — no secret in it, but it belonged to an export that did not finish",
+                "it is a leftover of the failed export, not a secret",
+                error);
+            TryRemovePartialExport(
+                readmeFile,
+                "cleanup — no secret in it, but it belonged to an export that did not finish",
+                "it is a leftover of the failed export, not a secret",
+                error);
+
+            return 1;
+        }
+
+        if (string.Equals(handoff.Role, "admin", StringComparison.Ordinal))
+        {
+            error.WriteLine(
+                "NOTE: 'admin' is a WRITE credential holding the config-table pivot surface. Prefer the default " +
+                "'viewer' (read-only) for a remote seat; if you must use 'admin', NTFS-ACL the exported file on the " +
+                "viewer machine too.");
+        }
+
+        error.WriteLine();
+        error.WriteLine("Copy the whole folder to the viewer machine and put the three files NEXT TO the Viewer");
+        error.WriteLine("executable — that works unedited. To keep them elsewhere, point DARLING_CONFIG at the");
+        error.WriteLine($"{ViewerConfigFileName} — also unedited, because a bare \"Root Certificate\" resolves against the");
+        error.WriteLine($"folder holding {ViewerConfigFileName}, wherever that is. {ViewerReadmeFileName} explains every field.");
+        error.WriteLine("Re-run this command after the store's certificate is regenerated (a changed bind IP rotates it).");
+        error.WriteLine();
+
+        output.WriteLine(targetDirectory);
+        output.WriteLine(configFile);
+        output.WriteLine(certificateFile);
+        output.WriteLine(readmeFile);
+
+        /* The files exist and work, but an unprotected cleartext credential is not a success an automation
+           should read as one — exit non-zero so a script stops, with the manifest already printed so the
+           operator can act on the exact file. */
+        return secretProtected ? 0 : 2;
+    }
+
+    /// <summary>The exported viewer folder's file names — the JSON the Viewer resolves by name, the cert its
+    /// <c>Root Certificate=</c> points at, and the operator-facing field reference (#1953 item 4).</summary>
+    public const string ViewerConfigFileName = "darling.json";
+    public const string ViewerReadmeFileName = "README.txt";
+
+    /// <summary>
+    /// The first comment line of an exported viewer config, and the way a re-export tells ITS OWN previous
+    /// output apart from a file it must not clobber (an operator's real darling.json, or a pre-created one an
+    /// attacker wants to keep ownership of). Re-exporting after a rotation is a documented workflow, so our
+    /// own file is replaced silently; anything lacking this line stops the run.
+    /// </summary>
+    public const string ViewerConfigMarker = "PerformanceMonitor Darling - VIEWER configuration.";
+
+    /// <summary>The README's own first line — its half of the same identity check.</summary>
+    public const string ViewerReadmeMarker = "PerformanceMonitor Darling - remote Viewer setup";
+
+    /// <summary>What a <c>server.crt</c> at the destination must look like to be replaceable: a PEM
+    /// certificate block. The exported cert is a copy of the store's, so unlike the other two it carries no
+    /// marker of ours — but a file at that path that is not a certificate at all is still someone else's,
+    /// and replacing it silently is the behavior being prevented.</summary>
+    public const string CertificatePemMarker = "-----BEGIN CERTIFICATE-----";
+
+    /// <summary>
+    /// Parses <c>--export-viewer-config</c>'s arguments STRICTLY, in the spirit of #1581's classifier: never
+    /// guess. A last-wins loop like the sibling <c>--dry-run</c> verbs' would take an unrecognized flag as the
+    /// DESTINATION — and a bare <c>--config</c> with no value would write a live cleartext password to a
+    /// folder literally named <c>--config</c>, under whatever the working directory is (for the elevated
+    /// prompt the docs prescribe, <c>C:\Windows\System32</c>). Returns false with a ready-to-print
+    /// <paramref name="errorMessage"/> on anything unrecognized. Pure — unit-testable, which is why it lives
+    /// here rather than inline in Program.
+    /// </summary>
+    /// <param name="rest">The arguments AFTER the verb itself.</param>
+    public static bool TryParseExportViewerConfigArgs(
+        string[] rest, out string? configPath, out string? outputDirectory, out string? errorMessage)
+    {
+        configPath = null;
+        outputDirectory = null;
+        errorMessage = null;
+
+        for (var i = 0; i < rest.Length; i++)
+        {
+            var arg = rest[i];
+            if (string.Equals(arg, "--config", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 >= rest.Length)
+                {
+                    errorMessage = "--config needs a path: --export-viewer-config [directory] --config <path to darling.json>";
+                    return false;
+                }
+
+                configPath = rest[++i];
+                continue;
+            }
+
+            if (arg.StartsWith('-'))
+            {
+                errorMessage =
+                    $"Unknown option for --export-viewer-config: {arg}" + Environment.NewLine +
+                    "Usage: --export-viewer-config [destination directory] [--config <path to darling.json>]";
+                return false;
+            }
+
+            if (outputDirectory is not null)
+            {
+                errorMessage = $"--export-viewer-config takes ONE destination directory; got '{outputDirectory}' and '{arg}'.";
+                return false;
+            }
+
+            outputDirectory = arg;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Where <see cref="ExportViewerConfigAsync"/> writes: the operator's directory when they named one,
+    /// else a <c>viewer-config</c> folder beside the service's darling.json — next to the file the operator
+    /// already knows, not buried under ProgramData. Pure (no I/O), so it pins directly.
+    /// </summary>
+    public static string ResolveViewerExportDirectory(string configPath, string? outputDirectory)
+    {
+        if (!string.IsNullOrWhiteSpace(outputDirectory))
+        {
+            return Path.GetFullPath(outputDirectory.Trim());
+        }
+
+        var configDirectory = Path.GetDirectoryName(Path.GetFullPath(configPath));
+        return Path.Combine(
+            string.IsNullOrEmpty(configDirectory) ? AppContext.BaseDirectory : configDirectory,
+            "viewer-config");
+    }
+
+    /// <summary>
+    /// The exported viewer <c>darling.json</c> (#1953 items 1 + 4): the two fields the Viewer actually reads —
+    /// <c>managed: false</c> and the verbatim connection string — with every field, and the valid
+    /// <c>Root Certificate=</c> values, documented in <c>//</c> comments IN the file. The Viewer parses with
+    /// <c>JsonCommentHandling.Skip</c> + <c>AllowTrailingCommas</c> (the same tolerance darling.sample.json
+    /// relies on), so the commented file is consumed as-is — <see cref="!:ViewerSettings"/> is pinned against
+    /// this text by <c>DarlingExportViewerConfigTests</c>. Hand-composed rather than serialized precisely
+    /// because <c>System.Text.Json</c> cannot WRITE comments, and the comments are the point.
+    /// Pure — unit-testable.
+    /// </summary>
+    public static string BuildViewerConfigJson(string connectionString, DateTimeOffset generatedUtc) =>
+        "{" + Environment.NewLine +
+        "  // " + ViewerConfigMarker + Environment.NewLine +
+        $"  // Generated by --export-viewer-config at {generatedUtc.ToUniversalTime():yyyy-MM-dd HH:mm:ss}Z. Nothing here needs hand-editing." + Environment.NewLine +
+        "  //" + Environment.NewLine +
+        "  // THIS FILE CONTAINS A LIVE DATABASE PASSWORD. Keep it ACL'd to the operator account." + Environment.NewLine +
+        "  //" + Environment.NewLine +
+        "  // WHERE TO PUT THESE FILES on the viewer machine:" + Environment.NewLine +
+        "  //   Keep the three together, anywhere. Nothing here needs editing either way, because a" + Environment.NewLine +
+        "  //   bare Root Certificate name resolves against the folder holding darling.json - not" + Environment.NewLine +
+        "  //   against the folder the Viewer happens to be launched from." + Environment.NewLine +
+        "  //" + Environment.NewLine +
+        "  //   Copy all three next to the Viewer executable and it finds darling.json by itself." + Environment.NewLine +
+        "  //   To keep the folder somewhere else instead, point the DARLING_CONFIG environment" + Environment.NewLine +
+        "  //   variable at this file - the server.crt beside it still resolves, nothing to edit." + Environment.NewLine +
+        "  //   (The Viewer also looks one folder up from itself, for the release zip's viewer\\ layout.)" + Environment.NewLine +
+        "  \"postgres\": {" + Environment.NewLine +
+        "    // false = this machine does not RUN a store, it connects to one. The service host's own" + Environment.NewLine +
+        "    // darling.json says true; that flag is about who OWNS the PostgreSQL, not who is connecting." + Environment.NewLine +
+        "    // A viewer left on true would hunt for a bundled local PostgreSQL that is not there." + Environment.NewLine +
+        "    \"managed\": false," + Environment.NewLine +
+        Environment.NewLine +
+        "    // Consumed VERBATIM by the Viewer (Npgsql keywords):" + Environment.NewLine +
+        "    //   Host / Port      the service host's exposed store endpoint (its postgres.network.listen + postgres.port)" + Environment.NewLine +
+        "    //   Username         the least-privilege store role: viewer = read-only, admin = read + config writes" + Environment.NewLine +
+        "    //   Password         that role's live password (rotate by re-running the export after a rotation)" + Environment.NewLine +
+        "    //   Database         always darling" + Environment.NewLine +
+        "    //   Search Path      collect,config,public - resolves the bare table names the Viewer queries" + Environment.NewLine +
+        "    //   SSL Mode         VerifyFull - encrypted AND the server certificate must match Host. Do not" + Environment.NewLine +
+        "    //                    downgrade it to Require: that keeps the encryption but stops verifying the" + Environment.NewLine +
+        "    //                    certificate, so Root Certificate below would be ignored entirely." + Environment.NewLine +
+        "    //   Root Certificate the server.crt exported beside this file. A relative value resolves" + Environment.NewLine +
+        "    //                    against the folder holding darling.json, so the name below is correct" + Environment.NewLine +
+        "    //                    wherever you keep these files and however the Viewer is launched." + Environment.NewLine +
+        "    //                    Valid values:" + Environment.NewLine +
+        "    //                      server.crt              a bare name - the certificate exported" + Environment.NewLine +
+        "    //                                              beside this file" + Environment.NewLine +
+        "    //                      certs\\server.crt        a relative subpath - same anchor" + Environment.NewLine +
+        "    //                      C:\\Darling\\server.crt   an absolute path - used exactly as written," + Environment.NewLine +
+        "    //                                              for a certificate kept elsewhere" + Environment.NewLine +
+        "    //                    It must be the PEM the SERVICE generated (exported beside this file);" + Environment.NewLine +
+        "    //                    VerifyFull rejects any other certificate, including a re-issued one." + Environment.NewLine +
+        $"    \"connectionString\": {JsonSerializer.Serialize(connectionString)}" + Environment.NewLine +
+        "  }" + Environment.NewLine +
+        "}" + Environment.NewLine;
+
+    /// <summary>
+    /// The exported <c>README.txt</c> (#1953 item 4): the same field reference as the JSON's comments, for an
+    /// operator who never opens the JSON, plus the one-line "copy this folder" instruction. Takes no password
+    /// — the credential lives in exactly one exported file and is never echoed anywhere else. Pure —
+    /// unit-testable.
+    /// </summary>
+    public static string BuildViewerConfigReadme(string host, int port, string role, DateTimeOffset generatedUtc) =>
+        "PerformanceMonitor Darling - remote Viewer setup" + Environment.NewLine +
+        "================================================" + Environment.NewLine +
+        Environment.NewLine +
+        $"Generated by --export-viewer-config at {generatedUtc.ToUniversalTime():yyyy-MM-dd HH:mm:ss}Z on the service host." + Environment.NewLine +
+        Environment.NewLine +
+        "TO USE IT" + Environment.NewLine +
+        "  Copy these three files next to the Viewer executable on the viewer machine, then start the" + Environment.NewLine +
+        "  Viewer. Nothing to edit." + Environment.NewLine +
+        Environment.NewLine +
+        "  To keep the folder somewhere else instead, set the DARLING_CONFIG environment variable to the" + Environment.NewLine +
+        "  darling.json inside it. Still nothing to edit: the Viewer resolves a bare Root Certificate" + Environment.NewLine +
+        "  name against the folder holding darling.json, so the server.crt beside it is found wherever" + Environment.NewLine +
+        "  you keep the folder. See THE FIELDS below." + Environment.NewLine +
+        Environment.NewLine +
+        "WHAT IS IN HERE" + Environment.NewLine +
+        $"  {ViewerConfigFileName}      the Viewer's configuration. CONTAINS A LIVE DATABASE PASSWORD - treat it as a secret," + Environment.NewLine +
+        "                    ACL it to your account, and do not commit it or mail it around." + Environment.NewLine +
+        $"  {ViewerClientCertificateFileName}        the store's TLS certificate. The connection pins THIS file; the Viewer will" + Environment.NewLine +
+        "                    refuse any other certificate." + Environment.NewLine +
+        $"  {ViewerReadmeFileName}        this file." + Environment.NewLine +
+        Environment.NewLine +
+        "THE FIELDS" + Environment.NewLine +
+        "  managed = false   This machine does not RUN a store, it connects to one over the network. The" + Environment.NewLine +
+        "                    SERVICE host's own darling.json says managed = true, which is about who OWNS" + Environment.NewLine +
+        "                    the PostgreSQL, not who connects. A viewer left on true looks for a bundled" + Environment.NewLine +
+        "                    local PostgreSQL that does not exist there and fails." + Environment.NewLine +
+        "  connectionString  Handed to Npgsql verbatim. This export's values:" + Environment.NewLine +
+        Environment.NewLine +
+        $"      Host={host} / Port={port}" + Environment.NewLine +
+        "          the exposed store endpoint on the service host." + Environment.NewLine +
+        $"      Username={role}" + Environment.NewLine +
+        "          the least-privilege store role: viewer = read-only, admin = read plus the" + Environment.NewLine +
+        "          Viewer's config writes." + Environment.NewLine +
+        "      Password=<that role's live password>" + Environment.NewLine +
+        "          filled in for you. It is in darling.json and nowhere else, including this file." + Environment.NewLine +
+        "      Database=darling" + Environment.NewLine +
+        "          always." + Environment.NewLine +
+        "      Search Path=collect,config,public" + Environment.NewLine +
+        "          resolves the bare table names the Viewer queries." + Environment.NewLine +
+        "      SSL Mode=VerifyFull" + Environment.NewLine +
+        "          encrypted AND the server certificate must match Host. Do NOT downgrade this to" + Environment.NewLine +
+        "          Require: the encryption stays, the verification stops, and Root Certificate is" + Environment.NewLine +
+        "          then ignored entirely." + Environment.NewLine +
+        $"      Root Certificate={ViewerClientCertificateFileName}" + Environment.NewLine +
+        "          the certificate exported beside darling.json. A relative value resolves against" + Environment.NewLine +
+        "          the folder holding darling.json, so this name is correct wherever you keep these" + Environment.NewLine +
+        "          three files and however the Viewer is launched. Valid values:" + Environment.NewLine +
+        "            server.crt              a bare name - the certificate exported beside this file." + Environment.NewLine +
+        "            certs\\server.crt        a relative subpath - same anchor." + Environment.NewLine +
+        "            C:\\Darling\\server.crt   an absolute path - used exactly as written, for a" + Environment.NewLine +
+        "                                    certificate kept elsewhere." + Environment.NewLine +
+        "          It must be the PEM the SERVICE generated; VerifyFull rejects any other" + Environment.NewLine +
+        "          certificate, including a re-issued one." + Environment.NewLine +
+        Environment.NewLine +
+        "IF IT DOES NOT CONNECT" + Environment.NewLine +
+        "  - Certificate errors: keep server.crt in the same folder as darling.json (that is what a bare" + Environment.NewLine +
+        "    Root Certificate name resolves to), or point Root Certificate at wherever you moved it." + Environment.NewLine +
+        "    The Viewer's startup log and its connection-failure window print the absolute path it opened." + Environment.NewLine +
+        "  - The store's certificate is regenerated when its bind IP changes. Re-run --export-viewer-config" + Environment.NewLine +
+        "    on the service host and replace this folder." + Environment.NewLine +
+        $"  - The service host must be reachable on port {port} (its firewall rule is scoped to the allowed CIDR)," + Environment.NewLine +
+        "    and its postgres.network block must still name this network." + Environment.NewLine;
+
+    /// <summary>
+    /// Decides whether one export target can be written, WITHOUT touching it: refuses a symlink/junction at
+    /// the path (it redirects the write to wherever the link points, and creating one needs no privilege on
+    /// Windows), and refuses an existing file that is not recognizably a previous export's. Applied to all
+    /// three exported files — the ownership and redirection problems belong to the PATH, not to what the file
+    /// happens to contain, so the certificate and README get the same treatment as the secret.
+    /// <para>The link check reads the path's ATTRIBUTES, which describe the LINK; every other file API here
+    /// follows it to the target. Without this check a planted link is not merely written through — a link to
+    /// a target that does not exist yet still reports as existing on Windows, so the identity check below
+    /// would try to read it, fail, and refuse with a puzzling "could not read" instead of naming the link.</para>
+    /// </summary>
+    private static bool TryCheckExportTarget(string path, string ourMarker, TextWriter error)
+    {
+        FileAttributes attributes;
+        try
+        {
+            attributes = File.GetAttributes(path);
+        }
+        catch (FileNotFoundException)
+        {
+            return true;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            /* The destination folder does not exist yet — the normal first-export case. */
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error.WriteLine($"Refusing to write {path}: could not inspect it ({ex.Message}).");
+            return false;
+        }
+
+        if (attributes.HasFlag(FileAttributes.ReparsePoint))
+        {
+            var target = TryDescribeLinkTarget(path);
+            error.WriteLine(
+                $"Refusing to write {path}: it is a symbolic link{target}, so the real destination is somewhere " +
+                "else. Export to a directory that does not contain one.");
+            return false;
+        }
+
+        if (!File.Exists(path))
+        {
+            return true;
+        }
+
+        string existing;
+        try
+        {
+            existing = File.ReadAllText(path);
+        }
+        catch (Exception ex)
+        {
+            error.WriteLine($"Could not read the existing {path} to check whether it is ours: {ex.Message}");
+            return false;
+        }
+
+        if (!existing.Contains(ourMarker, StringComparison.Ordinal))
+        {
+            error.WriteLine(
+                $"Refusing to overwrite {path}: it was not written by --export-viewer-config. " +
+                "Export to an empty directory, or move that file aside first.");
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>Best-effort " (to X)" for the refusal message; naming the target is a convenience, so a
+    /// failure to resolve it must not change the refusal itself.</summary>
+    private static string TryDescribeLinkTarget(string path)
+    {
+        try
+        {
+            return File.ResolveLinkTarget(path, returnFinalTarget: false) is { } link
+                ? $" (to {link.FullName})"
+                : string.Empty;
+        }
+        catch (Exception)
+        {
+            return string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Best-effort removal of ONE file left by a failed export, naming the outcome either way (#1973). The
+    /// verb's premise is that it refuses to hand over a partial setup, so a failure that leaves anything on
+    /// disk has to say WHICH file — and a removal that itself fails must neither mask the original error nor
+    /// stop the other removals, which is why every path out of here is a message rather than a throw.
+    /// </summary>
+    /// <param name="path">The exported file to remove.</param>
+    /// <param name="whyRemoved">Parenthetical for the "Removed" line: for darling.json, that it held the secret.</param>
+    /// <param name="whatItIs">What a survivor is, for the "left behind" line — the operator has to decide what to do about it.</param>
+    private static void TryRemovePartialExport(string path, string whyRemoved, string whatItIs, TextWriter error)
+    {
+        try
+        {
+            /* File.GetAttributes rather than File.Exists, and for the same reason TryCheckExportTarget uses
+               it: Exists answers FALSE for a dangling symlink, which would leave a planted link unmentioned
+               by the one sweep whose whole job is to account for what is on disk. */
+            _ = File.GetAttributes(path);
+        }
+        catch (FileNotFoundException)
+        {
+            /* The run never got this far — nothing on disk, so nothing to name. */
+            return;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return;
+        }
+        catch (Exception inspectFailure)
+        {
+            error.WriteLine(
+                $"WARNING: could not check whether {path} was left behind ({inspectFailure.Message}) — " +
+                $"if it is there, {whatItIs}. Check it yourself.");
+            return;
+        }
+
+        try
+        {
+            File.Delete(path);
+            error.WriteLine($"Removed {path} ({whyRemoved}).");
+        }
+        catch (Exception cleanupFailure)
+        {
+            error.WriteLine(
+                $"WARNING: {path} was left behind ({cleanupFailure.Message}) — {whatItIs}. Delete it yourself.");
+        }
+    }
+
+    /// <summary>
+    /// Writes one exported file so that THIS process owns it. Delete-then-<see cref="FileMode.CreateNew"/>
+    /// rather than a truncating overwrite: an overwrite keeps the existing file's OWNER, and a Windows owner
+    /// keeps <c>WRITE_DAC</c> — so writing over a file someone else created would leave them able to undo the
+    /// ACL applied afterwards. <c>CreateNew</c> also closes the gap between
+    /// <see cref="TryCheckExportTarget"/> and this write: anything that reappears at the path in between
+    /// makes the create FAIL rather than be written through.
+    /// </summary>
+    private static async Task WriteExportFileAsync(string path, string content, CancellationToken cancellationToken)
+    {
+        File.Delete(path);
+
+        var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        await using (stream.ConfigureAwait(false))
+        {
+            var writer = new StreamWriter(stream);
+            await using (writer.ConfigureAwait(false))
+            {
+                await writer.WriteAsync(content.AsMemory(), cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>
+    /// ACLs the exported darling.json down to SYSTEM + Administrators + this account + INTERACTIVE (the
+    /// admin/viewer-credential posture — the Viewer reads it interactively), so it does not sit in a folder
+    /// that inherited BUILTIN\Users read, then CONFIRMS the result. Returns whether the file is protected —
+    /// "we tried" is not the same claim as "the secret is not readable", which is why the credential-writing
+    /// harden sites pair the call with <see cref="DarlingFileSecurity.IsReadableByOrdinaryUsers"/> and why
+    /// the caller's exit code depends on this answer. Never throws: the export's value is the file, so a
+    /// failure is reported with the icacls that fixes it rather than throwing the folder away.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static bool TryHardenExportedSecret(string path, TextWriter error)
+    {
+        try
+        {
+            DarlingFileSecurity.HardenFile(path, allowInteractiveRead: true);
+        }
+        catch (Exception ex)
+        {
+            error.WriteLine(
+                $"WARNING: could not restrict the ACL on {path} ({ex.Message}){DarlingFileSecurity.DescribeOwnerAndExposure(path)}. " +
+                "It holds a LIVE password in cleartext. Delete it, or restrict it by hand before leaving this machine: " +
+                $"icacls \"{path}\" /inheritance:r /grant \"{DarlingFileSecurity.ServiceAccountDisplayName}\":F");
+            return false;
+        }
+
+        try
+        {
+            if (DarlingFileSecurity.IsReadableByOrdinaryUsers(path))
+            {
+                error.WriteLine(
+                    $"WARNING: {path} is STILL readable by ordinary users after hardening" +
+                    $"{DarlingFileSecurity.DescribeOwnerAndExposure(path)}. It holds a LIVE password in cleartext. " +
+                    "Delete it, or restrict it by hand before leaving this machine: " +
+                    $"icacls \"{path}\" /inheritance:r /grant \"{DarlingFileSecurity.ServiceAccountDisplayName}\":F");
+                return false;
+            }
+        }
+        catch (Exception ex)
+        {
+            error.WriteLine(
+                $"WARNING: could not confirm the ACL on {path} ({ex.Message}). It holds a LIVE password in " +
+                "cleartext — check its permissions before leaving this machine.");
+            return false;
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -584,7 +1338,17 @@ public static class DarlingCliCommands
         output.WriteLine("  [5] Disable — remove all exposure (back to loopback-only)");
         output.WriteLine("  [q] Quit without changes");
         var choice = Prompt(input, output, "Choice", "q");
-        if (choice is null || choice.Length == 0 || string.Equals(choice, "q", StringComparison.OrdinalIgnoreCase))
+
+        /* #2097: null is EOF — a NON-INTERACTIVE host, not a human pressing q. Saying "No changes made."
+           there reads as the wizard shrugging for no reason; name the actual cause on stdout and exit
+           nonzero so scripts notice. An empty line or explicit q remains the deliberate quit. */
+        if (choice is null)
+        {
+            WriteNonInteractiveGuidance(output);
+            return 1;
+        }
+
+        if (choice.Length == 0 || string.Equals(choice, "q", StringComparison.OrdinalIgnoreCase))
         {
             output.WriteLine("No changes made.");
             return 0;
@@ -1258,7 +2022,7 @@ public static class DarlingCliCommands
         output.WriteLine($"  (or:  sc.exe stop \"{ServiceName}\"   then   sc.exe start \"{ServiceName}\")");
     }
 
-    /// <summary>Prints the handoff reminders: the scoped firewall command(s), the store's --print-viewer-connection step, and the web dashboard's browser login hint.</summary>
+    /// <summary>Prints the handoff reminders: the scoped firewall command(s), the store's --export-viewer-config step, and the web dashboard's browser login hint.</summary>
     [SupportedOSPlatform("windows")]
     private static void PrintNextSteps(
         TextWriter output,
@@ -1273,9 +2037,10 @@ public static class DarlingCliCommands
             output.WriteLine("  Store firewall rule (run ELEVATED; scoped to the port + CIDR):");
             output.WriteLine("    " + DarlingManagedPostgres.BuildFirewallEnableCommand(
                 $"PerformanceMonitor Darling store (port {storePort})", storePort, storeCidr!));
-            output.WriteLine("  After the service restarts (which generates the TLS cert), get the remote viewer's");
-            output.WriteLine("  paste-ready connection string + certificate with:");
-            output.WriteLine("    PerformanceMonitor.Darling.Service.exe --print-viewer-connection");
+            output.WriteLine("  After the service restarts (which generates the TLS cert), write the remote viewer's");
+            output.WriteLine("  whole config folder — darling.json + server.crt + README — with:");
+            output.WriteLine("    PerformanceMonitor.Darling.Service.exe --export-viewer-config");
+            output.WriteLine("  (or --print-viewer-connection for just the paste-ready string + certificate).");
         }
 
         if (mcpConfigured)
@@ -1419,6 +2184,24 @@ public static class DarlingCliCommands
     {
         using var identity = WindowsIdentity.GetCurrent();
         return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
+    }
+
+    /// <summary>
+    /// The actionable message for a verb that read EOF where it expected a human (#2097, gotqn): in the
+    /// PowerShell ISE, remote/PSRemoting sessions, and some integrated terminals, stdin is not an
+    /// interactive console — <c>ReadLine()</c> returns null immediately — and STDERR (where the prompts
+    /// and errors went) is not surfaced at all, so the verb read as a silent no-op. This goes to STDOUT,
+    /// the one stream every host shows, and names both the cause and the ways forward.
+    /// </summary>
+    internal static void WriteNonInteractiveGuidance(TextWriter output)
+    {
+        output.WriteLine();
+        output.WriteLine("No interactive input received. This console appears to be non-interactive (PowerShell ISE,");
+        output.WriteLine("a remote/PSRemoting session, or redirected stdin) - in these hosts, prompts written to");
+        output.WriteLine("stderr may not be shown at all, so the verb looks like it did nothing.");
+        output.WriteLine("Run this verb from a regular interactive console (Windows Terminal, powershell.exe, cmd),");
+        output.WriteLine("or, for single-value verbs, pipe the value in, e.g.:");
+        output.WriteLine("  Read-Host -Prompt 'password' | PerformanceMonitor.Darling.Service.exe --encrypt-password");
     }
 
     /// <summary>Writes a prompt and reads a trimmed line. Returns null on EOF (input exhausted); an empty line yields <paramref name="defaultValue"/> (or "").</summary>
@@ -2083,6 +2866,556 @@ public static class DarlingCliCommands
        ================================================================================================ */
 
     /// <summary>
+    /// <c>--collapse-legacy-slices</c> (#1912): repair the Query Store rows collected before #1907, then
+    /// re-materialize the rollups they fed.
+    ///
+    /// <para>Before #1907 the collector stored Query Store's FLUSHED and still-IN-MEMORY slice of one interval
+    /// as two rows. They are ADDITIVE, so the read-side dedup — which keeps one row per key — reports a
+    /// fraction of the interval's work, and the rollups materialized that fraction. #1907 made the choice
+    /// deterministic; this makes it correct, for the rows it can still reach.</para>
+    ///
+    /// <para><b>Bounded on purpose, and the bound is raw retention.</b> Only rows still in the raw tier can be
+    /// collapsed, so on a Darling store the repair reaches the last few days — which at upgrade time is the
+    /// operator's most-looked-at recent history, and is why running it PROMPTLY after upgrading is what makes
+    /// it worth anything. Everything older keeps its understated counts permanently: the daily tiers are kept
+    /// indefinitely and cannot be rebuilt from raw that no longer exists. That residue is disclosed in the
+    /// release notes rather than papered over, the same shape #1849 used for the inflated-rollup boundary.</para>
+    ///
+    /// <para><b>The refresh is CLAMPED to the rows actually collapsed, and that is a safety property rather
+    /// than an optimization.</b> A refresh whose range lies entirely within DROPPED raw chunks DESTROYS the
+    /// materialization there — with force and without, measured on PG 18.4 + TimescaleDB 2.28.1 and pinned by
+    /// <c>QueryStoreSliceRepairLiveTests</c>. Aiming at a nominal "pre-fix period" instead of at the collapsed
+    /// rows' own span would therefore blank the retained hourly tier and the indefinitely-kept daily below raw's
+    /// floor, which is precisely the history #1759/#1793 forbid destroying. Collapsed rows are inside raw's
+    /// extent by definition, so deriving the window from them cannot reach under it.</para>
+    ///
+    /// <para><b>Safe to re-run.</b> The pre-fix signature — two or more rows sharing the whole dedup key AND
+    /// <c>collection_time</c> — cannot match a row collected since #1907, which emits at most one row per
+    /// interval per cycle. A second run finds nothing and says so.</para>
+    ///
+    /// <para>Returns 0 when the repair completed or had nothing to do, 1 on a load/mode/credential error.</para>
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    public static async Task<int> CollapseLegacySlicesAsync(
+        string? configPath, bool dryRun, TextWriter output, TextWriter error, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(output);
+        ArgumentNullException.ThrowIfNull(error);
+
+        DarlingConfig config;
+        try
+        {
+            config = DarlingConfig.Load(configPath);
+        }
+        catch (Exception ex)
+        {
+            error.WriteLine($"Could not load configuration: {ex.Message}");
+            return 1;
+        }
+
+        var postgres = config.Postgres;
+        if (postgres is null)
+        {
+            error.WriteLine("postgres section is required.");
+            return 1;
+        }
+
+        var connectionString = postgres.Managed
+            ? DarlingManagedPostgres.TryBuildConnectionStringFromStoredCredential(postgres)
+            : postgres.ConnectionString;
+
+        if (string.IsNullOrWhiteSpace(connectionString))
+        {
+            error.WriteLine(postgres.Managed
+                ? "The managed store credential does not exist yet — start the PerformanceMonitor Darling service once so its first run initializes the store, then re-run this command."
+                : "postgres.connectionString is empty, so there is no store to repair.");
+            return 1;
+        }
+
+        await using var connection = new NpgsqlConnection(connectionString);
+        try
+        {
+            await connection.OpenAsync(cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            error.WriteLine($"Could not connect to the store: {ex.Message}");
+            return 1;
+        }
+
+        output.WriteLine();
+        output.WriteLine("PerformanceMonitor Darling — Query Store slice repair (--collapse-legacy-slices)");
+        output.WriteLine();
+
+        QueryStoreSliceRepair.Survey survey;
+        try
+        {
+            survey = await QueryStoreSliceRepair.SurveyAsync(connection, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            error.WriteLine($"Could not survey query_store_stats: {ex.Message}");
+            return 1;
+        }
+
+        if (!survey.HasWork)
+        {
+            output.WriteLine("  Nothing to repair — no Query Store rows carry the pre-fix split-slice signature.");
+            output.WriteLine();
+            output.WriteLine("  That is the expected result on a store that has only ever run builds carrying the");
+            output.WriteLine("  collection-side fix, and on any store where a previous run already repaired them.");
+            return 0;
+        }
+
+        output.WriteLine($"  Split intervals found : {survey.SplitGroups:N0}");
+        output.WriteLine($"  Rows involved         : {survey.SplitRows:N0}  (collapsing to {survey.SplitGroups:N0}, removing {survey.RowsRemoved:N0})");
+        output.WriteLine($"  Collection-time span  : {survey.OldestUtc:yyyy-MM-dd HH:mm} .. {survey.NewestUtc:yyyy-MM-dd HH:mm} UTC");
+        output.WriteLine();
+        output.WriteLine("  Only rows still held in the raw tier can be repaired. Query Store history older than");
+        output.WriteLine("  raw retention keeps its understated counts permanently — see the release notes.");
+        output.WriteLine();
+
+        if (dryRun)
+        {
+            output.WriteLine("  DRY RUN — nothing was changed.");
+            return 0;
+        }
+
+        /* SLICED PER DAY, not one call over the whole span. CollapseSliceAsync runs each slice in ONE
+           transaction, and that transaction takes locks on the raw chunks it touches — which the compression
+           policy also wants. Handing it the entire survey span would make one long transaction sitting across
+           however much history the store keeps, which is exactly the lock-duration family that has bitten this
+           repo before (#1564/#1567). On a default 4-day raw tier this is a handful of slices; on a store with
+           a widened retention it is the protection the method's own doc promises.
+
+           The half-open upper bound includes the newest collapsed row — the survey reports that instant
+           itself, not a bound past it — hence the final slice's one-second nudge. */
+        long removed = 0;
+        var sliceStart = survey.OldestUtc!.Value.Date;
+        var collapseEnd = survey.NewestUtc!.Value.AddSeconds(1);
+
+        try
+        {
+            while (sliceStart < collapseEnd)
+            {
+                var sliceEnd = sliceStart.AddDays(1);
+                if (sliceEnd > collapseEnd)
+                {
+                    sliceEnd = collapseEnd;
+                }
+
+                removed += await QueryStoreSliceRepair.CollapseSliceAsync(
+                    connection, sliceStart, sliceEnd, cancellationToken);
+
+                sliceStart = sliceEnd;
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            /* Each slice is its own transaction, so earlier slices are already committed and are not lost —
+               and the collapse is idempotent, so re-running picks up where this stopped. */
+            error.WriteLine($"  The collapse failed after {removed:N0} row(s); the failing slice was rolled back: {ex.Message}");
+            error.WriteLine("  Slices already committed are safe. Re-run to continue — the repair is idempotent.");
+            return 1;
+        }
+
+        output.WriteLine($"  Collapsed. Rows removed: {removed:N0}");
+        output.WriteLine();
+
+        /* Re-materialize every rollup fed by query_store_stats, in the dependency order RollupBackfill.Targets
+           already carries — a rollup refreshed before its source materializes nothing, reports success, and
+           consumes the invalidations that covered the range. The window is the collapsed rows' own span,
+           widened to whole buckets so a partially-covered bucket is recomputed rather than left half-old. */
+        var affected = RollupBackfill.Targets
+            .Where(t => string.Equals(t.RawTable, QueryStoreSliceRepair.Table, StringComparison.Ordinal))
+            .ToList();
+
+        /* ONE disclosure for the whole run, so a pre-2.21 store's missing `options` parameter is reported once
+           rather than per rollup — and reported at all, which is the point of it being required (#1797). */
+        var disclosure = new RefreshDisclosure(message => output.WriteLine($"  [NOTE] {message}"));
+
+        var refreshed = 0;
+        foreach (var target in affected)
+        {
+            var from = Floor(survey.OldestUtc!.Value, target.BucketWidth);
+            var to = Floor(survey.NewestUtc!.Value, target.BucketWidth) + target.BucketWidth;
+
+            try
+            {
+                await RollupBackfill.RepairAsync(connection, target.View, from, to, disclosure, cancellationToken);
+                refreshed++;
+                output.WriteLine($"  [OK]   {target.View}: re-materialized {from:yyyy-MM-dd HH:mm} .. {to:yyyy-MM-dd HH:mm} UTC");
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                error.WriteLine($"  [FAIL] {target.View}: {ex.Message}");
+            }
+        }
+
+        output.WriteLine();
+        output.WriteLine(refreshed == affected.Count
+            ? $"  DONE — {removed:N0} row(s) collapsed, {refreshed} rollup(s) re-materialized."
+            : $"  PARTIAL — {removed:N0} row(s) collapsed, {refreshed} of {affected.Count} rollup(s) re-materialized. The collapse itself is committed; re-run to retry the rollups.");
+
+        return 0;
+    }
+
+    /// <summary>Floors an instant to its bucket, so a refresh window covers whole buckets on both edges.</summary>
+    private static DateTime Floor(DateTime value, TimeSpan bucket)
+        => bucket <= TimeSpan.Zero ? value : new DateTime(value.Ticks - (value.Ticks % bucket.Ticks), value.Kind);
+
+    /// <summary>How <c>--recompress-plan-dim</c> handles the closing VACUUM FULL (#2076).</summary>
+    public enum RecompressVacuumMode
+    {
+        /// <summary>Compact after a CONVERGED, zero-failure conversion — the default, because the moment of
+        /// convergence is the moment of maximum bloat, and shipping the saving only as internal free space
+        /// leaves operators wondering why df never moved.</summary>
+        Auto,
+
+        /// <summary>Compact even when there is nothing left to convert (<c>--vacuum-full</c>) — for a store
+        /// converted by an earlier run/build whose file still sits at its high-water mark.</summary>
+        Force,
+
+        /// <summary>Never compact (<c>--no-vacuum-full</c>) — for operators who want the exclusive-lock
+        /// window scheduled separately. The conversion's saving stays internal until they take it.</summary>
+        Skip,
+    }
+
+    /// <summary>
+    /// Parses the verb's trailing arguments. PURE so the flag grammar pins: <c>--dry-run</c>,
+    /// <c>--vacuum-full</c>, <c>--no-vacuum-full</c> in any order, at most one bare argument (the config
+    /// path). Unknown flags are NOT config paths — refusing beats silently treating a typo as a file.
+    /// </summary>
+    public static (string? ConfigPath, bool DryRun, RecompressVacuumMode Mode, string? Error) ParseRecompressArgs(
+        ReadOnlySpan<string> rest)
+    {
+        string? configPath = null;
+        var dryRun = false;
+        var mode = RecompressVacuumMode.Auto;
+
+        foreach (var arg in rest)
+        {
+            if (string.Equals(arg, "--dry-run", StringComparison.OrdinalIgnoreCase))
+            {
+                dryRun = true;
+            }
+            else if (string.Equals(arg, "--vacuum-full", StringComparison.OrdinalIgnoreCase))
+            {
+                mode = RecompressVacuumMode.Force;
+            }
+            else if (string.Equals(arg, "--no-vacuum-full", StringComparison.OrdinalIgnoreCase))
+            {
+                mode = RecompressVacuumMode.Skip;
+            }
+            else if (arg.StartsWith("--", StringComparison.Ordinal))
+            {
+                return (null, false, RecompressVacuumMode.Auto, $"unknown option '{arg}' for --recompress-plan-dim");
+            }
+            else
+            {
+                configPath = arg;
+            }
+        }
+
+        return (configPath, dryRun, mode, null);
+    }
+
+    /// <summary>
+    /// <c>--recompress-plan-dim</c> (#2076): convert the plan dimension's pre-V54 text rows to the gzip form
+    /// V54's write path produces (#2069), in bounded batches, while the service keeps running.
+    ///
+    /// <para><b>Why a verb.</b> V54 left old rows to convert by GC attrition, but the dimension GC retires a
+    /// row only when its digest stops being re-seen — a STABLE plan's text row never ages out, so the tail
+    /// never converts on its own. Rewriting the store's largest table runs when a person decides it should
+    /// (the <c>--collapse-legacy-slices</c> rationale), with <c>--dry-run</c> measuring the real ratio on
+    /// this store's own content first.</para>
+    ///
+    /// <para><b>No outage.</b> Each 1,000-row batch is one transaction against rows the collectors only ever
+    /// touch via <c>ON CONFLICT ... SET last_seen</c>; the service stays up, collection keeps running, and an
+    /// interrupted run resumes from wherever it stopped (the fetch predicate IS the resume point). Every
+    /// row's gzip bytes are round-trip verified before its text is nulled — a row that fails keeps its text
+    /// and is counted, never converted blind.</para>
+    ///
+    /// <para><b>Disclosed limit.</b> Converts live content; does not shrink the file — PostgreSQL returns old
+    /// row versions as reusable space INSIDE the relation, so the observable outcome is the dimension's
+    /// growth flatlining. Handing space back to the volume is a separate one-time VACUUM FULL/repack.</para>
+    ///
+    /// <para>Returns 0 when the conversion completed (or had nothing to do), 1 on a load/mode/credential
+    /// error or when any row failed round-trip verification (those rows keep their text; re-run after
+    /// investigating).</para>
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    public static async Task<int> RecompressPlanDimAsync(
+        string? configPath, bool dryRun, RecompressVacuumMode vacuumMode, TextWriter output, TextWriter error,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(output);
+        ArgumentNullException.ThrowIfNull(error);
+
+        DarlingConfig config;
+        try
+        {
+            config = DarlingConfig.Load(configPath);
+        }
+        catch (Exception ex)
+        {
+            error.WriteLine($"Could not load configuration: {ex.Message}");
+            return 1;
+        }
+
+        var postgres = config.Postgres;
+        if (postgres is null)
+        {
+            error.WriteLine("postgres section is required.");
+            return 1;
+        }
+
+        var connectionString = postgres.Managed
+            ? DarlingManagedPostgres.TryBuildConnectionStringFromStoredCredential(postgres)
+            : postgres.ConnectionString;
+
+        if (string.IsNullOrWhiteSpace(connectionString))
+        {
+            error.WriteLine(postgres.Managed
+                ? "The managed store credential does not exist yet — start the PerformanceMonitor Darling service once so its first run initializes the store, then re-run this command."
+                : "postgres.connectionString is empty, so there is no store to convert.");
+            return 1;
+        }
+
+        await using var connection = new NpgsqlConnection(connectionString);
+        try
+        {
+            await connection.OpenAsync(cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            error.WriteLine($"Could not connect to the store: {ex.Message}");
+            return 1;
+        }
+
+        output.WriteLine();
+        output.WriteLine("PerformanceMonitor Darling — plan-dimension recompression (--recompress-plan-dim)");
+        output.WriteLine();
+
+        PlanDimRecompression.Survey survey;
+        try
+        {
+            survey = await PlanDimRecompression.SurveyAsync(connection, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            error.WriteLine($"Could not survey query_plan_dim: {ex.Message}");
+            return 1;
+        }
+
+        output.WriteLine($"  {survey.Pending:N0} text row(s) to convert; {survey.Converted:N0} already gzip; {survey.Total:N0} total.");
+        output.WriteLine($"  Relation size (table + TOAST + indexes): {survey.RelationBytes / (1024.0 * 1024 * 1024):N1} GB.");
+        output.WriteLine();
+
+        if (!survey.HasWork)
+        {
+            output.WriteLine("  Nothing to convert — every dimension row already carries gzip content.");
+            output.WriteLine("  That is the expected end state: V54 writes gzip, and this verb (or GC attrition)");
+            output.WriteLine("  has already converted whatever text rows existed.");
+
+            if (vacuumMode == RecompressVacuumMode.Force && !dryRun)
+            {
+                return await CompactPlanDimAsync(connection, output, error, cancellationToken);
+            }
+
+            output.WriteLine("  (Pass --vacuum-full to compact a previously-converted store whose file still");
+            output.WriteLine("  sits at its pre-conversion high-water mark.)");
+            return 0;
+        }
+
+        if (dryRun)
+        {
+            PlanDimRecompression.Result sample;
+            try
+            {
+                sample = await PlanDimRecompression.SampleAsync(connection, cancellationToken);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                error.WriteLine($"Could not sample query_plan_dim: {ex.Message}");
+                return 1;
+            }
+
+            if (sample.Rows == 0)
+            {
+                output.WriteLine("  DRY RUN — the sample fetch returned no rows; nothing further to report.");
+                return 0;
+            }
+
+            var ratio = sample.GzipBytes == 0 ? 0 : (double)sample.TextBytes / sample.GzipBytes;
+            var avgGzip = sample.GzipBytes / (double)sample.Rows;
+            var projected = survey.Pending * avgGzip;
+            output.WriteLine($"  DRY RUN — sampled {sample.Rows:N0} pending row(s), compressed in memory, wrote nothing:");
+            output.WriteLine($"    measured ratio: {ratio:N1}x (raw text -> gzip), average {avgGzip / 1024.0:N1} KB per plan");
+            output.WriteLine($"    projected gzip content for all {survey.Pending:N0} pending rows: ~{projected / (1024.0 * 1024 * 1024):N1} GB");
+            output.WriteLine();
+            output.WriteLine("  The real run converts in 1,000-row batches (one transaction each) while the service");
+            output.WriteLine("  runs; it is safe to interrupt and re-run. When the conversion CONVERGES it ends with");
+            output.WriteLine("  VACUUM FULL, which rewrites the dimension to its live content and returns the freed");
+            output.WriteLine("  space to the volume — that step takes an EXCLUSIVE lock and is preflighted against");
+            output.WriteLine("  free disk. Size the lock window by your dimension: measured ~46 minutes on a 174 GB");
+            output.WriteLine("  dimension (7.1M plans), during which collection freshness DEGRADES and recovers within");
+            output.WriteLine("  minutes after. --no-vacuum-full skips it to schedule that window separately.");
+            return 0;
+        }
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var pending = survey.Pending;
+        long lastNarrated = 0;
+        PlanDimRecompression.Result result;
+        try
+        {
+            result = await PlanDimRecompression.ConvertAsync(
+                connection,
+                running =>
+                {
+                    /* Narrate every ~25k rows: enough to prove liveness on a multi-hour run without
+                       scrolling the console into noise. */
+                    if (running.Rows - lastNarrated < 25_000)
+                    {
+                        return;
+                    }
+
+                    lastNarrated = running.Rows;
+                    var pct = pending == 0 ? 100 : running.Rows * 100.0 / pending;
+                    var rate = running.Rows / Math.Max(stopwatch.Elapsed.TotalSeconds, 1);
+                    var etaSeconds = rate <= 0 ? 0 : (pending - running.Rows) / rate;
+                    output.WriteLine(
+                        $"  {running.Rows:N0} / {pending:N0} ({pct:N1}%) — " +
+                        $"{running.TextBytes / (1024.0 * 1024 * 1024):N1} GB text -> {running.GzipBytes / (1024.0 * 1024 * 1024):N1} GB gzip — " +
+                        $"~{TimeSpan.FromSeconds(etaSeconds):hh\\:mm\\:ss} remaining");
+                },
+                cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            error.WriteLine($"Conversion failed mid-run: {ex.Message}");
+            error.WriteLine("Committed batches are converted; re-running resumes from the remainder.");
+            return 1;
+        }
+
+        PlanDimRecompression.Survey after;
+        try
+        {
+            after = await PlanDimRecompression.SurveyAsync(connection, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            error.WriteLine($"Post-run survey failed: {ex.Message}");
+            after = default;
+        }
+
+        var finalRatio = result.GzipBytes == 0 ? 0 : (double)result.TextBytes / result.GzipBytes;
+        output.WriteLine();
+        output.WriteLine($"  DONE in {stopwatch.Elapsed:hh\\:mm\\:ss} — {result.Rows:N0} row(s) converted, " +
+            $"{result.TextBytes / (1024.0 * 1024 * 1024):N1} GB text -> {result.GzipBytes / (1024.0 * 1024 * 1024):N1} GB gzip ({finalRatio:N1}x).");
+        if (after.Total > 0)
+        {
+            output.WriteLine($"  Remaining text rows: {after.Pending:N0} (new sightings during the run convert on the next pass).");
+        }
+
+        if (result.VerifyFailures > 0)
+        {
+            error.WriteLine($"  [WARN] {result.VerifyFailures:N0} row(s) FAILED round-trip verification and kept their text unchanged.");
+            error.WriteLine("  Investigate before re-running; those rows are readable exactly as before.");
+            error.WriteLine("  VACUUM FULL was skipped — compaction can wait until the conversion is clean.");
+            return 1;
+        }
+
+        if (vacuumMode == RecompressVacuumMode.Skip)
+        {
+            output.WriteLine("  --no-vacuum-full: the freed space stays INTERNAL to the relation (growth is flat,");
+            output.WriteLine("  but the file keeps its high-water mark). Re-run with --vacuum-full to compact later.");
+            return 0;
+        }
+
+        if (after.Total > 0 && after.Pending > 0)
+        {
+            output.WriteLine($"  {after.Pending:N0} row(s) arrived mid-run and are still text — re-run to convert them;");
+            output.WriteLine("  compaction will run when the conversion converges.");
+            return 0;
+        }
+
+        return await CompactPlanDimAsync(connection, output, error, cancellationToken);
+    }
+
+    /// <summary>
+    /// The closing VACUUM FULL (#2076): rewrites the dimension to its live content so the conversion's
+    /// saving reaches the VOLUME, not just the relation's internal free-space map. Preflighted against free
+    /// disk on the store's own volume (the rewrite needs room for the compacted copy while the original
+    /// still exists); an unmeasurable volume is a REFUSAL, not a shrug — "probably fits" is not a plan for
+    /// a rewrite of the store's largest table. Returns 0 on success, 1 on a preflight refusal or a failed
+    /// vacuum (the conversion itself is already committed either way).
+    /// </summary>
+    private static async Task<int> CompactPlanDimAsync(
+        NpgsqlConnection connection, TextWriter output, TextWriter error, CancellationToken cancellationToken)
+    {
+        long estimated;
+        try
+        {
+            estimated = await PlanDimRecompression.EstimateCompactedBytesAsync(connection, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            error.WriteLine($"  Could not estimate the compacted size: {ex.Message}");
+            return 1;
+        }
+
+        var (freeBytes, freeError) = await ResolveStoreFreeSpaceAsync(connection, cancellationToken);
+        if (freeError is not null)
+        {
+            error.WriteLine($"  REFUSING to VACUUM FULL: {freeError}");
+            error.WriteLine("  The conversion is committed; re-run with --vacuum-full on the store host (or after");
+            error.WriteLine("  fixing the above) to compact.");
+            return 1;
+        }
+
+        /* 1.2x headroom on a sampled estimate: the rewrite holds old + new copies simultaneously, and the
+           new copy is the estimate — the old one is already on disk and costs nothing extra. */
+        var required = (long)(estimated * 1.2);
+        if (freeBytes < required)
+        {
+            error.WriteLine("  REFUSING to VACUUM FULL: not enough free disk for the compacted copy.");
+            error.WriteLine($"    estimated compacted size : {estimated / (1024.0 * 1024 * 1024):N1} GB");
+            error.WriteLine($"    required (x1.2 headroom) : {required / (1024.0 * 1024 * 1024):N1} GB");
+            error.WriteLine($"    free on the store volume : {freeBytes / (1024.0 * 1024 * 1024):N1} GB");
+            error.WriteLine("  The conversion is committed and its space is reusable internally; free up disk and");
+            error.WriteLine("  re-run with --vacuum-full to compact.");
+            return 1;
+        }
+
+        var before = (await PlanDimRecompression.SurveyAsync(connection, cancellationToken)).RelationBytes;
+        output.WriteLine();
+        output.WriteLine($"  Compacting (VACUUM FULL): rewriting ~{estimated / (1024.0 * 1024 * 1024):N1} GB of live content.");
+        output.WriteLine("  This takes an EXCLUSIVE lock on the plan dimension — collections DEGRADE until it");
+        output.WriteLine("  finishes and recover within minutes after (measured: ~46 minutes of lock on a 174 GB");
+        output.WriteLine("  dimension; scale by yours). The service does not need to stop.");
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            await PlanDimRecompression.VacuumFullAsync(connection, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            error.WriteLine($"  VACUUM FULL failed: {ex.Message}");
+            error.WriteLine("  The original relation is untouched (the rewrite is transactional); the conversion");
+            error.WriteLine("  is committed. Re-run with --vacuum-full to retry the compaction.");
+            return 1;
+        }
+
+        var after = (await PlanDimRecompression.SurveyAsync(connection, cancellationToken)).RelationBytes;
+        output.WriteLine($"  COMPACTED in {stopwatch.Elapsed:hh\\:mm\\:ss} — " +
+            $"{before / (1024.0 * 1024 * 1024):N1} GB -> {after / (1024.0 * 1024 * 1024):N1} GB on disk.");
+        return 0;
+    }
+
+    /// <summary>
     /// Materializes the query-acceleration rollups back over pre-existing history so the held raw retention
     /// policies can arm themselves (#1759 Phase 2). Runs while the service is UP.
     ///
@@ -2202,7 +3535,7 @@ public static class DarlingCliCommands
             plans.Add((target, RollupBackfill.Plan(
                 target.View, RollupBackfill.EventualSourceFloor(probe.SourceOldestUtc, rootRawOldest), probe.CoverageOldestUtc,
                 probe.MaterializedBuckets, probe.MaterializedBytes, rawBytes,
-                target.IsDaily ? TimeSpan.FromDays(1) : TimeSpan.FromHours(1))));
+                target.BucketWidth)));
         }
 
         var work = plans.Where(p => !p.Plan.IsComplete).ToList();
@@ -2336,7 +3669,7 @@ public static class DarlingCliCommands
                     target.View, live.SourceOldestUtc, live.CoverageOldestUtc,
                     live.MaterializedBuckets, live.MaterializedBytes,
                     rawBytesCache.TryGetValue(target.RawTable, out var cachedRawBytes) ? cachedRawBytes : 0,
-                    target.IsDaily ? TimeSpan.FromDays(1) : TimeSpan.FromHours(1));
+                    target.BucketWidth);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -2462,7 +3795,7 @@ public static class DarlingCliCommands
         output.WriteLine("  'N/N retention policies in place, N armed, 0 held paused pending backfill'");
         output.WriteLine("is the confirmation; the first purge then reclaims the raw tables in one pass.");
         output.WriteLine();
-        output.WriteLine("Do not delay the restart. The hourly rollups carry their OWN 21-day retention policy, already");
+        output.WriteLine($"Do not delay the restart. The hourly rollups carry their OWN retention policy ({TimescaleSupport.HourlyRetentionInterval}), already");
         output.WriteLine("armed on these stores, which will trim the coverage this run just built when it next fires");
         output.WriteLine("(roughly daily). Restarting now is what lets the raw policies arm off that coverage first. If");
         output.WriteLine("the trim wins the race nothing is lost — raw is still held — and re-running this verb rebuilds it.");

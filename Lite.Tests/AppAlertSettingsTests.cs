@@ -26,7 +26,13 @@ namespace PerformanceMonitorLite.Tests;
 /// in parallel — touching the shared analysis statics here could flake that class.
 /// The pass-through contract is type-uniform (every member is `=> App.X`), so the
 /// SMTP/webhook coverage proves the invariant for the analysis members too.
+///
+/// Shares a collection with <see cref="AlertSettingsCredentialLoadTests"/> for the same reason: that class
+/// drives App.LoadAlertSettings, which writes the four webhook statics this one asserts on, and xUnit runs
+/// separate classes in parallel. #1965 widened that collection (and renamed it from "app-webhook-statics")
+/// to cover the App.Alert* statics too, after the same parallelism flaked the MCP alert-settings tests.
 /// </summary>
+[Collection("app-alert-statics")]
 public class AppAlertSettingsTests
 {
     /// <summary>

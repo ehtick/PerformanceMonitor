@@ -320,10 +320,11 @@ public sealed class TimescaleSupportTests
         }
 
         /* Clear leftovers from an earlier aborted run so the assertions below are deterministic. */
-        await DeleteTestRowsAsync(connection);
+        await DeleteTestRowsAsync(connection, ct);
 
         await using var postgres = NpgsqlDataSource.Create(connectionString!);
 
+        var bodySucceeded = false;
         try
         {
             /* All timestamps Kind-Unspecified — naive-UTC storage, see PgCollectorRowWriter. */
@@ -401,10 +402,13 @@ public sealed class TimescaleSupportTests
                 var remaining = (long)(await read.ExecuteScalarAsync(ct))!;
                 Assert.True(remaining == 0L, $"the 70-day collection_log row survived the purge ({remaining} row(s)); {purgeLog.Joined}");
             }
+
+            bodySucceeded = true;
         }
         finally
         {
-            await DeleteTestRowsAsync(connection);
+            await LiveStoreCleanup.RunAsync(connectionString!, bodySucceeded, async (cleanup, cleanupCt) =>
+                await DeleteTestRowsAsync(cleanup, cleanupCt));
         }
     }
 
@@ -608,6 +612,7 @@ WHERE hypertable_name = 'wait_stats'
         const string Legacy = "tick1778_legacy";
         const string Fresh = "tick1778_fresh";
 
+        var bodySucceeded = false;
         try
         {
             await DropTickTableAsync(connection, Legacy, ct);
@@ -671,11 +676,16 @@ FROM timescaledb_information.jobs
 WHERE proc_name = 'policy_retention'
 AND   schedule_interval = INTERVAL '1 hour'", connection);
             Assert.Equal(0L, (long)(await retention.ExecuteScalarAsync(ct))!);
+
+            bodySucceeded = true;
         }
         finally
         {
-            await DropTickTableAsync(connection, Legacy, ct);
-            await DropTickTableAsync(connection, Fresh, ct);
+            await LiveStoreCleanup.RunAsync(connectionString!, bodySucceeded, async (cleanup, cleanupCt) =>
+            {
+                await DropTickTableAsync(cleanup, Legacy, cleanupCt);
+                await DropTickTableAsync(cleanup, Fresh, cleanupCt);
+            });
         }
     }
 
@@ -706,25 +716,41 @@ AND   schedule_interval = INTERVAL '1 hour'", connection);
 
         const string Table = "tick1778_eligibility";
 
+        var bodySucceeded = false;
         try
         {
             await DropTickTableAsync(connection, Table, ct);
             await CreateTickTableAsync(connection, Table, ct);
 
-            /* One chunk five days back (closed, well past the 1-day delay) and one from right now (still open,
-               and young either way). */
-            await ExecAsync(connection,
-                $"INSERT INTO collect.{Table} SELECT now()::timestamp - INTERVAL '5 days' + (g || ' seconds')::interval, {TestServerId}, g FROM generate_series(1, 200) g", ct);
-            await ExecAsync(connection,
-                $"INSERT INTO collect.{Table} SELECT now()::timestamp - (g || ' seconds')::interval, {TestServerId}, g FROM generate_series(1, 200) g", ct);
+            /* Policy first, parked, while there is nothing to compress — see AddCompressionPolicyParkedAsync.
+               Adding it after the inserts hands the scheduler two eligible chunks and a head start on the
+               assertions below. */
+            await AddCompressionPolicyParkedAsync(connection, Table, ct);
 
-            await ExecAsync(connection, TimescaleSupport.AddCompressionPolicySql($"collect.{Table}"), ct);
+            /* One chunk five days back (closed, well past the 1-day delay) and one from midday TODAY (still
+               open, and young either way).
+
+               MIDDAY, not now() (#1972). These seeds span 200 seconds, and the chunks are day-aligned
+               (ChunkIntervalDays), so a now()-relative span straddles a chunk boundary whenever the suite runs
+               within ~200 seconds of midnight: the one intended chunk becomes two and the counts below fail
+               deterministically. Both directions were real — a young seed run in 00:00:00-00:03:20 split into
+               yesterday's tail plus today's and failed the uncompressed count (caught live at 00:01:38 UTC),
+               and an old seed run in 23:56:40-23:59:59 split into two closed, both-eligible chunks and failed
+               the compressed count. Anchoring to midday puts 200 seconds of slack against 12 hours of margin
+               on either side, so chunk placement no longer depends on what time the suite runs. */
+            await ExecAsync(connection,
+                $"INSERT INTO collect.{Table} SELECT date_trunc('day', now()::timestamp) - INTERVAL '5 days' + INTERVAL '12 hours' + (g || ' seconds')::interval, {TestServerId}, g FROM generate_series(1, 200) g", ct);
+            await ExecAsync(connection,
+                $"INSERT INTO collect.{Table} SELECT date_trunc('day', now()::timestamp) + INTERVAL '12 hours' + (g || ' seconds')::interval, {TestServerId}, g FROM generate_series(1, 200) g", ct);
+
             await RunPolicyAsync(connection, Table, ct);
 
             Assert.Equal(1, await ChunkCountAsync(connection, Table, compressed: true, ct));
             Assert.Equal(1, await ChunkCountAsync(connection, Table, compressed: false, ct));
 
-            /* And the one left uncompressed is the YOUNG one, not an arbitrary survivor. */
+            /* And the one left uncompressed is the YOUNG one, not an arbitrary survivor. The midday anchor
+               keeps this true with room to spare: midday today sits in today's chunk, whose range_end is
+               tomorrow's midnight, so range_end > now() - CompressAfterDays holds at every hour of the day. */
             using var young = new NpgsqlCommand($@"
 SELECT COUNT(*)
 FROM timescaledb_information.chunks
@@ -733,10 +759,13 @@ AND   hypertable_name = '{Table}'
 AND   NOT is_compressed
 AND   range_end > now() - INTERVAL '{TimescaleSupport.CompressAfterDays} days'", connection);
             Assert.Equal(1L, (long)(await young.ExecuteScalarAsync(ct))!);
+
+            bodySucceeded = true;
         }
         finally
         {
-            await DropTickTableAsync(connection, Table, ct);
+            await LiveStoreCleanup.RunAsync(connectionString!, bodySucceeded, async (cleanup, cleanupCt) =>
+                await DropTickTableAsync(cleanup, Table, cleanupCt));
         }
     }
 
@@ -763,19 +792,24 @@ AND   range_end > now() - INTERVAL '{TimescaleSupport.CompressAfterDays} days'",
 
         const string Table = "tick1778_isolation";
 
+        var bodySucceeded = false;
         try
         {
             await DropTickTableAsync(connection, Table, ct);
             await CreateTickTableAsync(connection, Table, ct);
 
-            /* Three chunks, all eligible. */
+            /* Policy first, parked, while there is nothing to compress. This test is the one the unparked
+               scheduler actually broke on CI, in both directions — see AddCompressionPolicyParkedAsync. */
+            await AddCompressionPolicyParkedAsync(connection, Table, ct);
+
+            /* Three chunks, all eligible. Midday-anchored, not now()-relative (#1972): run in the last ~200
+               seconds before midnight, a now()-relative seed crosses the day boundary N days back and lands
+               FOUR chunks here instead of three, failing the counts below. */
             foreach (var daysBack in new[] { 7, 5, 3 })
             {
                 await ExecAsync(connection,
-                    $"INSERT INTO collect.{Table} SELECT now()::timestamp - INTERVAL '{daysBack} days' + (g || ' seconds')::interval, {TestServerId}, g FROM generate_series(1, 200) g", ct);
+                    $"INSERT INTO collect.{Table} SELECT date_trunc('day', now()::timestamp) - INTERVAL '{daysBack} days' + INTERVAL '12 hours' + (g || ' seconds')::interval, {TestServerId}, g FROM generate_series(1, 200) g", ct);
             }
-
-            await ExecAsync(connection, TimescaleSupport.AddCompressionPolicySql($"collect.{Table}"), ct);
 
             string middleChunk;
             using (var probe = new NpgsqlCommand($@"
@@ -798,24 +832,37 @@ OFFSET 1 LIMIT 1", connection))
             }
 
             await ExecAsync(connection, "SET lock_timeout = '3s'", ct);
+            var policyRan = false;
             try
             {
                 await RunPolicyAsync(connection, Table, ct);
+                policyRan = true;
             }
             finally
             {
-                await ExecAsync(connection, "SET lock_timeout = 0", ct);
-                await blocking.RollbackAsync(ct);
+                /* RunOwnedAsync, not RunAsync (#1896): both statements MUST run on the connections this test
+                   already holds. lock_timeout is a session setting, so resetting it on a fresh connection would
+                   leave the real session at 3s; and the lock can only be released by the transaction holding
+                   it. What is borrowed is the masking rule — if RunPolicyAsync threw, that is the failure worth
+                   reporting, and a broken session throwing again here must not stand in front of it. */
+                await LiveStoreCleanup.RunOwnedAsync(policyRan, async () =>
+                {
+                    await ExecAsync(connection, "SET lock_timeout = 0", ct);
+                    await blocking.RollbackAsync(ct);
+                });
             }
 
             /* THE PIN: the two reachable chunks compressed anyway. A run that aborted on the first failure
                would leave one or zero. */
             Assert.Equal(2, await ChunkCountAsync(connection, Table, compressed: true, ct));
             Assert.Equal(1, await ChunkCountAsync(connection, Table, compressed: false, ct));
+
+            bodySucceeded = true;
         }
         finally
         {
-            await DropTickTableAsync(connection, Table, ct);
+            await LiveStoreCleanup.RunAsync(connectionString!, bodySucceeded, async (cleanup, cleanupCt) =>
+                await DropTickTableAsync(cleanup, Table, cleanupCt));
         }
     }
 
@@ -844,6 +891,7 @@ OFFSET 1 LIMIT 1", connection))
         const string Blocked = "tick1778_blocked";
         const string Reachable = "tick1778_reachable";
 
+        var bodySucceeded = false;
         try
         {
             await DropTickTableAsync(connection, Blocked, ct);
@@ -879,14 +927,21 @@ AND   (proc_name LIKE '%compression%' OR proc_name LIKE '%columnstore%')", conne
 
             await ExecAsync(connection, "SET lock_timeout = '3s'", ct);
             int converged;
+            var convergeRan = false;
             try
             {
                 converged = await TimescaleSupport.ConvergeCompressionScheduleAsync(connection, null, ct);
+                convergeRan = true;
             }
             finally
             {
-                await ExecAsync(connection, "SET lock_timeout = 0", ct);
-                await blocking.RollbackAsync(ct);
+                /* RunOwnedAsync for the same reason as the isolation test above: a session setting and a
+                   transaction's own rollback cannot be moved to a fresh connection. See #1896. */
+                await LiveStoreCleanup.RunOwnedAsync(convergeRan, async () =>
+                {
+                    await ExecAsync(connection, "SET lock_timeout = 0", ct);
+                    await blocking.RollbackAsync(ct);
+                });
             }
 
             /* THE PIN: the reachable policy converged even though the other one threw. A sweep that let the
@@ -897,11 +952,16 @@ AND   (proc_name LIKE '%compression%' OR proc_name LIKE '%columnstore%')", conne
             /* And the failure is reported honestly rather than counted as success: the blocked one is untouched
                and still stale, so the next start retries it. */
             Assert.Equal(TimeSpan.FromHours(12), await ScheduleIntervalAsync(connection, Blocked, ct));
+
+            bodySucceeded = true;
         }
         finally
         {
-            await DropTickTableAsync(connection, Blocked, ct);
-            await DropTickTableAsync(connection, Reachable, ct);
+            await LiveStoreCleanup.RunAsync(connectionString!, bodySucceeded, async (cleanup, cleanupCt) =>
+            {
+                await DropTickTableAsync(cleanup, Blocked, cleanupCt);
+                await DropTickTableAsync(cleanup, Reachable, cleanupCt);
+            });
         }
     }
 
@@ -924,13 +984,22 @@ AND   (proc_name LIKE '%compression%' OR proc_name LIKE '%columnstore%')", conne
 
         const string Table = "tick1778_activity";
 
+        var bodySucceeded = false;
         try
         {
             await DropTickTableAsync(connection, Table, ct);
             await CreateTickTableAsync(connection, Table, ct);
+
+            /* Policy first, parked, while there is nothing to compress. The backlog assertion below is the most
+               exposed of the three: it reads EligibleUncompressedChunks BEFORE running the job, so a background
+               run that got there first would report a settled zero and fail the test for being correct. */
+            await AddCompressionPolicyParkedAsync(connection, Table, ct);
+
+            /* Midday-anchored, not now()-relative (#1972): in the last ~200 seconds before midnight a
+               now()-relative seed crosses the day boundary five days back and puts TWO eligible chunks in the
+               backlog, failing the count below. */
             await ExecAsync(connection,
-                $"INSERT INTO collect.{Table} SELECT now()::timestamp - INTERVAL '5 days' + (g || ' seconds')::interval, {TestServerId}, g FROM generate_series(1, 200) g", ct);
-            await ExecAsync(connection, TimescaleSupport.AddCompressionPolicySql($"collect.{Table}"), ct);
+                $"INSERT INTO collect.{Table} SELECT date_trunc('day', now()::timestamp) - INTERVAL '5 days' + INTERVAL '12 hours' + (g || ' seconds')::interval, {TestServerId}, g FROM generate_series(1, 200) g", ct);
 
             var before = await TimescaleSupport.ReadCompressionActivityAsync(connection, null, ct);
             var waiting = Assert.Single(before, a => string.Equals(a.HypertableName, Table, StringComparison.Ordinal));
@@ -944,10 +1013,13 @@ AND   (proc_name LIKE '%compression%' OR proc_name LIKE '%columnstore%')", conne
 
             /* Logging must survive every shape the store can hand back, including a null logger. */
             TimescaleSupport.LogCompressionActivity(after, DateTime.UtcNow, null);
+
+            bodySucceeded = true;
         }
         finally
         {
-            await DropTickTableAsync(connection, Table, ct);
+            await LiveStoreCleanup.RunAsync(connectionString!, bodySucceeded, async (cleanup, cleanupCt) =>
+                await DropTickTableAsync(cleanup, Table, cleanupCt));
         }
     }
 
@@ -967,9 +1039,10 @@ AND   (proc_name LIKE '%compression%' OR proc_name LIKE '%columnstore%')", conne
         await ExecAsync(connection, TimescaleSupport.EnableCompressionSql($"collect.{table}"), ct);
     }
 
-    /* DROP TABLE takes the hypertable, its chunks and its compression policy with it. */
+    /* DROP TABLE takes the hypertable, its chunks and its compression policy with it — and #1873 makes the
+       removal verified, so a leftover tick table cannot masquerade as a clean teardown. */
     private static async Task DropTickTableAsync(NpgsqlConnection connection, string table, System.Threading.CancellationToken ct)
-        => await TryExecAsync(connection, $"DROP TABLE IF EXISTS collect.{table} CASCADE", ct);
+        => await new LiveCleanupBatch(connection).DropTableAsync(table, ct);
 
     private static async Task<TimeSpan?> ScheduleIntervalAsync(NpgsqlConnection connection, string table, System.Threading.CancellationToken ct)
     {
@@ -993,6 +1066,76 @@ AND   proc_name = 'policy_retention'", connection);
     }
 
     /* Runs the policy body NOW instead of waiting out its schedule. job_id is INTEGER (#1586). */
+    /// <summary>
+    /// Adds the PRODUCT's compression policy and immediately PARKS the job it creates, so the only thing that
+    /// ever compresses these chunks is the test's own <see cref="RunPolicyAsync"/> call.
+    ///
+    /// <para><b>MUST be called before the table has any eligible chunk.</b> That is not tidiness, it is the
+    /// half of this that closes the race. <c>add_compression_policy</c> creates the job SCHEDULED with no
+    /// <c>initial_start</c>, and TimescaleDB launches it within a second or two — measured on 2.28.1: against a
+    /// hypertable holding three eligible chunks, adding the policy and then doing nothing at all compressed all
+    /// three inside six seconds, with <c>run_job</c> never called. Parking a job that has already launched does
+    /// not recall the run in flight; adding the policy while there is nothing to compress does, because that
+    /// run finds an empty chunk list and the park stops every run after it.</para>
+    ///
+    /// <para><b>What that background run did to these tests.</b> It has no <c>lock_timeout</c> (the default is
+    /// wait-forever), so in the isolation test it queued behind the ACCESS EXCLUSIVE lock the test takes on the
+    /// middle chunk, and compressed that chunk the instant the test rolled the blocker back — landing directly
+    /// on the assertions. CI caught it twice, in both of its arms: <c>Expected 2 / Actual 3</c> when the
+    /// background run beat the first assertion, and <c>Expected 1 / Actual 0</c> when the chunk flipped BETWEEN
+    /// the two reads, so neither count saw it. Same cause, two unrecognizably different failures, on a test
+    /// whose subject was never involved.</para>
+    ///
+    /// <para><b>Why it hid so well.</b> Whether the job launches at all depends on a free background-worker
+    /// slot, and this repo's <c>pg-runtime</c> sets <c>timescaledb.max_background_workers = 16</c> against
+    /// PostgreSQL's <c>max_worker_processes = 8</c> — so launches routinely fail outright ("failed to start a
+    /// background worker" in the server log) and the race simply does not happen. Twenty consecutive local runs
+    /// passed for that reason alone; raising <c>max_worker_processes</c> on the same rig made the background
+    /// run fire every time. The suite was not immune, it was under-resourced.</para>
+    ///
+    /// <para>The idiom is already in this file — the #1760 stuck-sentinel probe parks its job "so it cannot run
+    /// mid-assertion" — and is the same lever <c>PayloadDimensionLiveTests.EnsureAggregatesWithoutPoliciesAsync</c>
+    /// pulls against the identical #1788 behaviour on the aggregate side. <c>run_job</c> still executes a parked
+    /// job, verified live, so the deterministic foreground path these tests are built on is unaffected.</para>
+    /// </summary>
+    private static async Task AddCompressionPolicyParkedAsync(NpgsqlConnection connection, string table, System.Threading.CancellationToken ct)
+    {
+        /* Create and park in ONE transaction (#1888), the same lever the product pulls for retention
+           policies (#1705, EnsureRetentionPoliciesAsync): "the only way to never expose an armed job is to
+           keep the bgw_job row invisible until it already reads scheduled = false — the scheduler is a
+           separate backend and cannot see an uncommitted row."
+
+           As two autocommit statements this left a real window. add_compression_policy creates the job
+           SCHEDULED and TimescaleDB launches it within a second or two (#1788), so the scheduler could take
+           it between the create and the park — and parking a job that has ALREADY launched does not recall
+           the run in flight (#1874). The launched run then evaluates its body when it gets a worker, which
+           under full-suite load is late enough that the test's rows have landed, so it compresses chunks the
+           test is about to count and the deterministic run_job below is no longer the only thing that
+           compressed. That is why these tests passed alone and in their own class but failed in the full
+           suite once #1888 gave the scheduler enough workers to launch reliably: more parallel load widens
+           the launch-to-execute gap, and more slots make the launch itself certain. */
+        await using var tx = await connection.BeginTransactionAsync(ct);
+
+        using (var create = new NpgsqlCommand(TimescaleSupport.AddCompressionPolicySql($"collect.{table}"), connection, tx))
+        {
+            await create.ExecuteNonQueryAsync(ct);
+        }
+
+        /* Same job-lookup predicate as RunPolicyAsync, including the 2.18+ columnstore rename. The
+           uncommitted job row is visible to THIS session, so the park lands on it before anyone else can
+           see it armed. */
+        using (var park = new NpgsqlCommand($@"
+SELECT alter_job(job_id, scheduled => false, next_start => 'infinity'::timestamptz)
+FROM timescaledb_information.jobs
+WHERE hypertable_schema = 'collect' AND hypertable_name = '{table}'
+AND   (proc_name LIKE '%compression%' OR proc_name LIKE '%columnstore%')", connection, tx))
+        {
+            await park.ExecuteNonQueryAsync(ct);
+        }
+
+        await tx.CommitAsync(ct);
+    }
+
     private static async Task RunPolicyAsync(NpgsqlConnection connection, string table, System.Threading.CancellationToken ct)
     {
         int jobId;
@@ -1053,6 +1196,7 @@ AND   is_compressed = {(compressed ? "true" : "false")}", connection);
            and drop only what this test creates. */
         var preexistingCaggs = await ExistingCaggsAsync(connection, ct);
 
+        var bodySucceeded = false;
         try
         {
             /* Retention targets the hourly CAGGs as well as the raw tables, so the aggregates must exist first —
@@ -1091,21 +1235,203 @@ AND   ((SELECT min(bucket) FROM collect.query_stats_hourly) IS NULL
        OR (SELECT min(bucket) FROM collect.query_stats_hourly) > (SELECT min(collection_time) FROM collect.query_stats))", connection);
             var bad = (long)(await unsafeArmed.ExecuteScalarAsync(ct))!;
             Assert.True(bad == 0, "a retention policy is ARMED while its coverage tier does not cover everything the source holds — creation was not paused");
+
+            bodySucceeded = true;
         }
         finally
         {
             /* Retention policies first (they reference the relations), then only the CAGGs this test created —
-               DROP ... CASCADE takes each aggregate's own policy with it. */
-            foreach (var relation in RetentionRelations)
+               DROP ... CASCADE takes each aggregate's own policy with it.
+
+               Every removal is VERIFIED (#1873), and this is the site with the most to verify: unlike its
+               sibling in PayloadDimensionLiveTests, this test calls EnsureContinuousAggregatesAsync DIRECTLY,
+               so the refresh policies it attaches are still armed and still firing immediately (#1788) while
+               the drops below run. DropContinuousAggregatesAsync takes each policy off before dropping its
+               aggregate, which bounds the collision to the one refresh already executing; the retry then
+               outlasts that. Left as it was, this finally raced an active scheduler and reported success
+               either way.
+
+               On a FRESH connection since #1896: this is also the heaviest teardown in the class — sixteen
+               retention policies and up to fourteen aggregates — so it is the one with the most to lose from
+               running on a session the body's failure may have closed, where every statement after the first
+               would be abandoned. */
+            await LiveStoreCleanup.RunAsync(connectionString!, bodySucceeded, async (cleanup, cleanupCt) =>
             {
-                await TryExecAsync(connection, $"SELECT remove_retention_policy('collect.{relation}', if_exists => true)", ct);
+                var batch = new LiveCleanupBatch(cleanup);
+
+                foreach (var relation in RetentionRelations)
+                {
+                    await batch.RemoveRetentionPolicyAsync(relation, cleanupCt);
+                }
+
+                await batch.DropContinuousAggregatesAsync(
+                    (await ExistingCaggsAsync(cleanup, cleanupCt)).Except(preexistingCaggs, StringComparer.Ordinal), cleanupCt);
+            });
+        }
+    }
+
+    /// <summary>
+    /// #1937's upgrade half, measured rather than assumed: <c>add_retention_policy(if_not_exists)</c> leaves an
+    /// existing policy's <c>drop_after</c> alone, so a horizon change would reach fresh installs only — the
+    /// sweep must CONVERGE existing policies onto the constants, and the convergence must not touch anything
+    /// else about the job. Both scheduled states are proven here: a policy demoted to the old 21-day horizon
+    /// while HELD comes back at 90 still held, and one demoted while ARMED comes back at 90 still armed with
+    /// its <c>next_start</c> unmoved — converging a horizon must never trigger an immediate purge (#1680's
+    /// never-expose-an-armed-window discipline, held through an update rather than only at creation).
+    /// </summary>
+    [Fact]
+    public async Task EnsureRetentionPolicies_ConvergesAnOldHorizon_PreservingScheduledStateAndNextStart_AgainstDevPostgres()
+    {
+        var connectionString = Environment.GetEnvironmentVariable("DARLING_TEST_PG");
+        Assert.SkipWhen(string.IsNullOrEmpty(connectionString),
+            "Set DARLING_TEST_PG to a Postgres connection string (with TimescaleDB installed) to run the live convergence test.");
+
+        var ct = TestContext.Current.CancellationToken;
+
+        using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(ct);
+        await PgMigrations.MigrateAsync(connection, ct);
+
+        Assert.True(await TimescaleSupport.TryEnableAsync(connection, null, ct),
+            "the dev fixture is expected to have TimescaleDB installed");
+        Assert.Equal(CollectorCatalog.All.Count, await TimescaleSupport.ConvertToHypertablesAsync(connection, null, ct));
+
+        var preexistingCaggs = await ExistingCaggsAsync(connection, ct);
+
+        const string HeldRelation = "query_stats";
+        const string ArmedRelation = "procedure_stats_hourly";
+
+        var bodySucceeded = false;
+        try
+        {
+            /* One query_stats row 30 days back keeps that relation's coverage SHORT for the whole test: it is
+               outside the hourly CAGG's 3-day refresh window, so even the policies' immediate first fire
+               (#1788) cannot materialize it, and the #1909 gate keeps HOLDING the policy on every sweep. That
+               makes held-ness the gate's own genuine verdict rather than test-forced state — on an empty
+               relation the gate legitimately ARMS (nothing to protect), which is exactly what the
+               procedure_stats side demonstrates. */
+            using (var seed = new NpgsqlCommand(@"
+INSERT INTO collect.query_stats
+    (collection_id, collection_time, server_id, server_name, database_name, query_hash, sql_handle,
+     delta_worker_time, delta_elapsed_time, delta_execution_count)
+VALUES (1, $1, 9137, 'converge-1937', 'TestDb', decode(md5('converge'), 'hex'), decode(md5('h'), 'hex'), 1, 1, 1)", connection))
+            {
+                seed.Parameters.AddWithValue(DateTime.SpecifyKind(DateTime.UtcNow.AddDays(-30), DateTimeKind.Unspecified));
+                await seed.ExecuteNonQueryAsync(ct);
             }
 
-            foreach (var cagg in (await ExistingCaggsAsync(connection, ct)).Except(preexistingCaggs, StringComparer.Ordinal))
+            await TimescaleSupport.EnsureContinuousAggregatesAsync(connection, null, ct);
+            Assert.Equal(RetentionPolicyCount, await TimescaleSupport.EnsureRetentionPoliciesAsync(connection, null, ct));
+
+            /* The gate's own verdicts, asserted as preconditions: short coverage holds, empty coverage arms. */
+            var created = new
             {
-                await TryExecAsync(connection, $"DROP MATERIALIZED VIEW IF EXISTS collect.{cagg} CASCADE", ct);
+                Held = await PolicyStateAsync(connection, HeldRelation, ct),
+                Armed = await PolicyStateAsync(connection, ArmedRelation, ct),
+            };
+            Assert.False(created.Held.Scheduled, "short coverage must HOLD the policy at creation");
+            Assert.True(created.Armed.Scheduled, "empty coverage must ARM the policy at creation");
+
+            /* Demote both to the pre-#1937 horizon, exactly as an upgraded store presents them. The armed one
+               gets a far-future next_start, so it cannot fire a real purge while the test runs — and that
+               pushed-out next_start is precisely what must survive the convergence unmoved. */
+            await DemoteHorizonAsync(connection, HeldRelation, "21 days", ct);
+            await DemoteHorizonAsync(connection, ArmedRelation, "21 days", ct);
+            using (var push = new NpgsqlCommand(@"
+SELECT alter_job(j.job_id, next_start => now() + interval '1 hour')
+FROM timescaledb_information.jobs AS j
+WHERE j.proc_name = 'policy_retention'
+AND   j.hypertable_schema = 'collect'
+AND   j.hypertable_name = '" + ArmedRelation + "'", connection))
+            {
+                await push.ExecuteNonQueryAsync(ct);
             }
+
+            var before = new
+            {
+                Held = await PolicyStateAsync(connection, HeldRelation, ct),
+                Armed = await PolicyStateAsync(connection, ArmedRelation, ct),
+            };
+            Assert.Equal(("21 days", false), (before.Held.DropAfter, before.Held.Scheduled));
+            Assert.Equal(("21 days", true), (before.Armed.DropAfter, before.Armed.Scheduled));
+
+            /* THE measured claim: the sweep converges both onto the constant, preserving everything else. */
+            Assert.Equal(RetentionPolicyCount, await TimescaleSupport.EnsureRetentionPoliciesAsync(connection, null, ct));
+
+            var after = new
+            {
+                Held = await PolicyStateAsync(connection, HeldRelation, ct),
+                Armed = await PolicyStateAsync(connection, ArmedRelation, ct),
+            };
+            /* Each relation converges to ITS OWN constant: the raw table to 4 days, the hourly CAGG to
+               #1937's 90 - the sweep reads the horizon per policy from RetentionPolicies, not one number. */
+            Assert.Equal("4 days", after.Held.DropAfter);
+            Assert.False(after.Held.Scheduled, "a HELD policy must stay held across a horizon convergence");
+            Assert.Equal("90 days", after.Armed.DropAfter);
+            Assert.True(after.Armed.Scheduled, "an ARMED policy must stay armed across a horizon convergence");
+            Assert.Equal(before.Armed.NextStart, after.Armed.NextStart);
+
+            /* Idempotence: a third sweep finds nothing distinct from the constants and moves nothing. */
+            Assert.Equal(RetentionPolicyCount, await TimescaleSupport.EnsureRetentionPoliciesAsync(connection, null, ct));
+            var settled = await PolicyStateAsync(connection, ArmedRelation, ct);
+            Assert.Equal(("90 days", true, after.Armed.NextStart), (settled.DropAfter, settled.Scheduled, settled.NextStart));
+            Assert.Equal("4 days", (await PolicyStateAsync(connection, HeldRelation, ct)).DropAfter);
+
+            bodySucceeded = true;
         }
+        finally
+        {
+            await LiveStoreCleanup.RunAsync(connectionString!, bodySucceeded, async (cleanup, cleanupCt) =>
+            {
+                var batch = new LiveCleanupBatch(cleanup);
+
+                foreach (var relation in RetentionRelations)
+                {
+                    await batch.RemoveRetentionPolicyAsync(relation, cleanupCt);
+                }
+
+                await batch.DropContinuousAggregatesAsync(
+                    (await ExistingCaggsAsync(cleanup, cleanupCt)).Except(preexistingCaggs, StringComparer.Ordinal), cleanupCt);
+
+                using var unseed = new NpgsqlCommand(
+                    "DELETE FROM collect.query_stats WHERE server_name = 'converge-1937'", cleanup);
+                await unseed.ExecuteNonQueryAsync(cleanupCt);
+            });
+        }
+    }
+
+    /// <summary>Sets a retention policy's <c>drop_after</c> directly, standing in for a store created under an
+    /// older default. Named <c>config</c> only, like the convergence itself, so the demotion cannot arm.</summary>
+    private static async Task DemoteHorizonAsync(NpgsqlConnection connection, string relation, string horizon, System.Threading.CancellationToken ct)
+    {
+        using var demote = new NpgsqlCommand(@"
+SELECT alter_job(j.job_id, config => jsonb_set(j.config, '{drop_after}', to_jsonb($1::text)))
+FROM timescaledb_information.jobs AS j
+WHERE j.proc_name = 'policy_retention'
+AND   j.hypertable_schema = 'collect'
+AND   j.hypertable_name = '" + relation + "'", connection);
+        demote.Parameters.AddWithValue(horizon);
+        await demote.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>One policy's observable state: the horizon it would drop at, whether it is armed, and when it
+    /// would next run.</summary>
+    private static async Task<(string DropAfter, bool Scheduled, DateTime? NextStart)> PolicyStateAsync(
+        NpgsqlConnection connection, string relation, System.Threading.CancellationToken ct)
+    {
+        using var read = new NpgsqlCommand(@"
+SELECT j.config->>'drop_after', j.scheduled, j.next_start
+FROM timescaledb_information.jobs AS j
+WHERE j.proc_name = 'policy_retention'
+AND   j.hypertable_schema = 'collect'
+AND   j.hypertable_name = '" + relation + "'", connection);
+        using var reader = await read.ExecuteReaderAsync(ct);
+        Assert.True(await reader.ReadAsync(ct), $"no policy_retention job found for collect.{relation}");
+
+        /* next_start is NULL for a HELD job - a paused policy has no next run (the same sentinel family as
+           job_stats' -infinity). */
+        return (reader.GetString(0), reader.GetBoolean(1),
+            await reader.IsDBNullAsync(2, ct) ? null : reader.GetDateTime(2));
     }
 
     /// <summary>The continuous aggregates present in <c>collect</c> right now, so the retention test can drop
@@ -1124,22 +1450,10 @@ AND   ((SELECT min(bucket) FROM collect.query_stats_hourly) IS NULL
         return names.ToArray();
     }
 
-    /// <summary>Best-effort cleanup statement — a teardown failure must not mask the assertion that already ran.</summary>
-    private static async Task TryExecAsync(NpgsqlConnection connection, string sql, System.Threading.CancellationToken ct)
-    {
-        try
-        {
-            using var command = new NpgsqlCommand(sql, connection);
-            await command.ExecuteNonQueryAsync(ct);
-        }
-        catch (PostgresException)
-        {
-        }
-    }
 
     /// <summary>
     /// The relations EnsureRetentionPoliciesAsync attaches policies to, for teardown: the three raw tables,
-    /// the four hourly CAGGs, and the nine baseline aggregates (#1757). The last group is DERIVED from the
+    /// the four hourly CAGGs, and the seven baseline aggregates (#1757; nine until #2007). The last group is DERIVED from the
     /// product's own list rather than restated, so adding a baseline aggregate cannot leave an armed retention
     /// policy behind on this shared fixture.
     /// </summary>
@@ -1147,6 +1461,14 @@ AND   ((SELECT min(bucket) FROM collect.query_stats_hourly) IS NULL
     {
         "query_stats", "procedure_stats", "query_store_stats",
         "query_stats_hourly", "procedure_stats_hourly", "query_store_stats_hourly", "query_stats_db_hourly",
+        /* The corrected Query Store tier (#1849): the interval-grain dedup layer on its own short horizon,
+           and the corrected hourly on the standard 21-day one. The corrected DAILY is kept indefinitely like
+           every other daily, so it carries no policy and must not appear here — and neither does #1869's
+           day-grain daily beside it, for the same reason. Its interval-grain DAILY source does, on its own
+           slightly longer horizon: it has to outlive the hourly dedup layer whose purge waits on it. */
+        TimescaleSupport.QueryStoreStatsIntervalHourlyView,
+        TimescaleSupport.QueryStoreStatsCorrectedHourlyView,
+        TimescaleSupport.QueryStoreStatsIntervalDailyView,
     }
     .Concat(TimescaleSupport.BaselineAggregates.Select(a => a.View))
     .ToArray();
@@ -1323,17 +1645,13 @@ LIMIT 1", connection))
            argument and the whole statement dies as 42883 by_range(unknown, interval) does not exist. Skipping
            this line is what made the test pass on a rig whose search_path a previous run had already set, and
            fail on CI's throwaway cluster. */
-        /* Migrate first, as every other gated test in this class does. It is not the schema this test wants -
-           it is the search_path. TimescaleDB'''s by_range lives in PUBLIC, so a session whose search_path omits
-           public cannot resolve it, create_hypertable never resolves its argument, and the statement dies as
-           42883 by_range(unknown, interval) does not exist. Skipping this line passed on a rig whose connection
-           carried the default "$user", public and failed on CI, whose connection pins collect,config. */
         await PgMigrations.MigrateAsync(connection, ct);
 
         Assert.True(await TimescaleSupport.TryEnableAsync(connection, null, ct),
             "the dev fixture is expected to have TimescaleDB installed");
 
         const string table = "stuck_sentinel_probe_1760";
+        var bodySucceeded = false;
         try
         {
             await ExecuteAsync(connection, $"DROP TABLE IF EXISTS {table} CASCADE", ct);
@@ -1344,7 +1662,15 @@ LIMIT 1", connection))
                this test is the catalog's behaviour rather than a second dialect of the same DDL. */
             await ExecuteAsync(connection, TimescaleSupport.CreateHypertableSql(table, "collection_time"), ct);
             await ExecuteAsync(connection, TimescaleSupport.EnableCompressionSql(table), ct);
-            await ExecuteAsync(connection, TimescaleSupport.AddCompressionPolicySql(table), ct);
+
+            /* PARKED, in one transaction — the same lever #1889 pulled for the three compression tests, and
+               this one needs it MORE than they do. Their assertions are about which chunks a run compressed;
+               this one asserts the job has NEVER RUN (last_run_started_at = '-infinity', the #1760 sentinel),
+               which a single background launch destroys outright and no amount of re-reading recovers. An
+               unparked add_compression_policy creates the job SCHEDULED and TimescaleDB launches it within a
+               second or two (#1788), so the window between creating it and parking it below was the whole
+               defect: observed failing as Expected: True / Actual: False on a full-suite run, twice. */
+            await AddCompressionPolicyParkedAsync(connection, table, ct);
 
             long jobId;
             using (var find = new NpgsqlCommand(
@@ -1399,10 +1725,17 @@ LIMIT 1", connection))
             /* The pure predicate agrees end to end: never-ran + Running is NOT stuck. */
             Assert.False(
                 TimescaleSupport.IsCompressionJobStuck(false, "Running", null, TimeSpan.FromHours(12), DateTime.UtcNow, out _));
+
+            bodySucceeded = true;
         }
         finally
         {
-            await ExecuteAsync(connection, $"DROP TABLE IF EXISTS {table} CASCADE", ct);
+            /* Through LiveCleanupBatch rather than a bare DROP (#1873's verification, #1896's connection): the
+               probe table is a hypertable carrying a compression policy, and its removal has a postcondition
+               worth checking rather than assuming. The bare name resolves through the cleanup connection's
+               search_path to collect, which is where it was created. */
+            await LiveStoreCleanup.RunAsync(connectionString!, bodySucceeded, async (cleanup, cleanupCt) =>
+                await new LiveCleanupBatch(cleanup).DropTableAsync(table, cleanupCt));
         }
     }
 
@@ -1412,10 +1745,17 @@ LIMIT 1", connection))
         await command.ExecuteNonQueryAsync(ct);
     }
 
-    private static async Task DeleteTestRowsAsync(NpgsqlConnection connection)
+    /// <summary>
+    /// Takes its cancellation token rather than reaching for <c>TestContext.Current.CancellationToken</c>
+    /// (#1896). As teardown this runs under <see cref="LiveStoreCleanup"/>, which passes
+    /// <see cref="System.Threading.CancellationToken.None"/> on purpose so a CANCELLED run still restores the
+    /// shared store — and a helper that fetched the test's own token would have re-signalled itself on exactly
+    /// that path, skipping the delete it exists to perform.
+    /// </summary>
+    private static async Task DeleteTestRowsAsync(NpgsqlConnection connection, System.Threading.CancellationToken ct)
     {
         using var cleanup = new NpgsqlCommand(
             $"DELETE FROM wait_stats WHERE server_id = {TestServerId}; DELETE FROM collection_log WHERE server_id = {TestServerId};", connection);
-        await cleanup.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
+        await cleanup.ExecuteNonQueryAsync(ct);
     }
 }

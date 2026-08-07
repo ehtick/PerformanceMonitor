@@ -189,6 +189,28 @@ public sealed class DarlingServer : INotifyPropertyChanged
         OnPropertyChanged(nameof(AttentionTooltip));
     }
 
+    // ── Whole-server alert silence indicator (#2031) ──
+    // Set by MainWindow's silenced-state refresh (riding the same alert poll that drives the badge) and
+    // immediately by the Silence/Unsilence handlers. Drives the sidebar row's muted-bell glyph and the
+    // context menu's Silence/Unsilence exclusivity.
+
+    private bool _isSilenced;
+
+    /// <summary>True when a whole-server alert silence (store-side mute rule) is active for this server.</summary>
+    public bool IsSilenced => _isSilenced;
+
+    /// <summary>Updates the silenced indicator in place; raises change notification only on a real flip.</summary>
+    public void SetSilenced(bool silenced)
+    {
+        if (_isSilenced == silenced)
+        {
+            return;
+        }
+
+        _isSilenced = silenced;
+        OnPropertyChanged(nameof(IsSilenced));
+    }
+
     public event PropertyChangedEventHandler? PropertyChanged;
 
     private void OnPropertyChanged(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
@@ -400,7 +422,21 @@ SELECT
     EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'config_alert_settings' AND column_name = 'ag_disconnect_refire_minutes'),
     EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'ag_database_replica_states' AND column_name = 'est_send_drain_time_min'),
     EXISTS (SELECT 1 FROM information_schema.tables  WHERE table_name = 'query_plan_dim'),
-    EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'ix_query_stats_digest_floor')";
+    EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'ix_query_stats_digest_floor'),
+    EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'config_alert_settings' AND column_name = 'blocking_wait_seconds_threshold'),
+    EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'query_store_stats' AND column_name = 'runtime_stats_interval_id'),
+    EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'config_notification' AND column_name = 'pagerduty_routing_key'),
+    EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'config_notification' AND column_name = 'pagerduty_proxy'),
+    EXISTS (SELECT 1 FROM information_schema.tables  WHERE table_name = 'collector_state'),
+    EXISTS (SELECT 1 FROM information_schema.tables  WHERE table_name = 'plan_correction'),
+    EXISTS (SELECT 1 FROM information_schema.tables  WHERE table_name = 'pvs_stats'),
+    EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'config_alert_settings' AND column_name = 'pvs_enabled'),
+    EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'config_alert_settings' AND column_name = 'database_state_enabled'),
+    EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'server_tags' AND column_name = 'colour'),
+    EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'query_stats' AND column_name = 'host_object_name'),
+    EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'analysis_findings' AND column_name = 'drill_down_json'),
+    EXISTS (SELECT 1 FROM information_schema.tables  WHERE table_name = 'store_metrics'),
+    EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'query_plan_dim' AND column_name = 'query_plan_gz')";
 
     /// <summary>The store schema version this viewer build requires — the highest migration it knows
     /// (<see cref="StorageVersion.SchemaVersion"/>). The connect-time gate blocks a store below this.</summary>
@@ -421,7 +457,7 @@ SELECT
             await using var reader = await command.ExecuteReaderAsync(cancellationToken);
             if (await reader.ReadAsync(cancellationToken))
             {
-                return MapProbedSchemaVersion(reader.GetBoolean(0), reader.GetBoolean(1), reader.GetBoolean(2), reader.GetBoolean(3), reader.GetBoolean(4), reader.GetBoolean(5), reader.GetBoolean(6), reader.GetBoolean(7), reader.GetBoolean(8), reader.GetBoolean(9), reader.GetBoolean(10), reader.GetBoolean(11), reader.GetBoolean(12), reader.GetBoolean(13), reader.GetBoolean(14), reader.GetBoolean(15), reader.GetBoolean(16), reader.GetBoolean(17), reader.GetBoolean(18), reader.GetBoolean(19), reader.GetBoolean(20), reader.GetBoolean(21), reader.GetBoolean(22));
+                return MapProbedSchemaVersion(reader.GetBoolean(0), reader.GetBoolean(1), reader.GetBoolean(2), reader.GetBoolean(3), reader.GetBoolean(4), reader.GetBoolean(5), reader.GetBoolean(6), reader.GetBoolean(7), reader.GetBoolean(8), reader.GetBoolean(9), reader.GetBoolean(10), reader.GetBoolean(11), reader.GetBoolean(12), reader.GetBoolean(13), reader.GetBoolean(14), reader.GetBoolean(15), reader.GetBoolean(16), reader.GetBoolean(17), reader.GetBoolean(18), reader.GetBoolean(19), reader.GetBoolean(20), reader.GetBoolean(21), reader.GetBoolean(22), reader.GetBoolean(23), reader.GetBoolean(24), reader.GetBoolean(25), reader.GetBoolean(26), reader.GetBoolean(27), reader.GetBoolean(28), reader.GetBoolean(29), reader.GetBoolean(30), reader.GetBoolean(31), reader.GetBoolean(32), reader.GetBoolean(33), reader.GetBoolean(34), reader.GetBoolean(35), reader.GetBoolean(36));
             }
 
             return null;
@@ -446,8 +482,148 @@ SELECT
     /// is unit-tested without a live store; any schema bump past the newest arm trips the pinning test that keeps
     /// this in step with <see cref="StorageVersion.SchemaVersion"/>.
     /// </summary>
-    internal static int MapProbedSchemaVersion(bool hasConfigControlPlane, bool hasAlertDeliveryOverride, bool hasAnalysisState, bool hasAlertTuningKnobs, bool hasDefaultTraceEvents, bool hasIndexObjectStatsLatestIndex, bool hasCollectionLogHypertableOrPlainPg, bool hasJobHistory, bool hasAgentStatus, bool hasGenericWebhook, bool hasDeadlocksDatabaseName, bool hasQueryStoreReplicaRole, bool hasLongQueryCompletions, bool hasWebDashboardConfig, bool hasCustomViews, bool hasServerTags, bool hasConnectionRefireKnobs = false, bool hasAgCollectors = false, bool hasAgAlertKnobs = false, bool hasAgLatencyColumns = false, bool hasAgDisconnectRefire = false, bool hasPayloadDimensions = false, bool hasDimFloorIndexes = false)
+    internal static int MapProbedSchemaVersion(bool hasConfigControlPlane, bool hasAlertDeliveryOverride, bool hasAnalysisState, bool hasAlertTuningKnobs, bool hasDefaultTraceEvents, bool hasIndexObjectStatsLatestIndex, bool hasCollectionLogHypertableOrPlainPg, bool hasJobHistory, bool hasAgentStatus, bool hasGenericWebhook, bool hasDeadlocksDatabaseName, bool hasQueryStoreReplicaRole, bool hasLongQueryCompletions, bool hasWebDashboardConfig, bool hasCustomViews, bool hasServerTags, bool hasConnectionRefireKnobs = false, bool hasAgCollectors = false, bool hasAgAlertKnobs = false, bool hasAgLatencyColumns = false, bool hasAgDisconnectRefire = false, bool hasPayloadDimensions = false, bool hasDimFloorIndexes = false, bool hasBlockingWaitThreshold = false, bool hasQueryStoreIntervalIdentity = false, bool hasPagerDutyWebhook = false, bool hasPagerDutyProxy = false, bool hasCollectorState = false, bool hasPlanCorrection = false, bool hasPvsStats = false, bool hasPvsPressureKnobs = false, bool hasDatabaseStateAlert = false, bool hasServerTagColour = false, bool hasQueryStatsHostObject = false, bool hasFindingDrillDown = false, bool hasStoreMetrics = false, bool hasPlanDimGzip = false)
     {
+        /* V54 (gzip plan-dim content, #2069): column-existence sentinel, newest-first arm.
+           query_plan_dim.query_plan_gz exists only at V54 or later. The viewer NAMES the column in
+           its plan-fetch reads (gz-else-text coalesce), so against a V53 store those reads would
+           fail 42703 — the gate must refuse it, and a fully-migrated V54 store must map to exactly
+           RequiredStoreSchemaVersion. */
+        if (hasPlanDimGzip)
+        {
+            return 54;
+        }
+
+        /* V53 (store self-metrics, #2068): table-existence sentinel, newest-first arm.
+           collect.store_metrics exists only at V53 or later. The viewer never reads this table — it is
+           the service's own hourly capacity series (per-hypertable size/compression, dimension row
+           counts, whole-store size), surfaced over MCP/REST — so like V44's rung nothing in the viewer
+           would fail against a V52 store. The rung exists so a fully-migrated store maps to exactly
+           RequiredStoreSchemaVersion instead of capping at 52 and tripping the connect-time gate against
+           a healthy store. Under-reporting is the guarded failure. */
+        if (hasStoreMetrics)
+        {
+            return 53;
+        }
+
+        /* V52 (persisted finding drill-down, #2060): column-existence sentinel, newest-first arm.
+           analysis_findings.drill_down_json exists only at V52 or later. The viewer never names the
+           column (it reads findings through its own SELECT list), so nothing in the viewer fails
+           against a V51 store — the rung exists for the same reason V44's does: a probe that cannot
+           SEE the newest migration maps every fully-migrated store below RequiredStoreSchemaVersion
+           and the connect-time gate refuses healthy stores. Under-reporting is the guarded failure. */
+        if (hasFindingDrillDown)
+        {
+            return 52;
+        }
+
+        /* V51 (query-stats host object, #2012 stage 2): column-existence sentinel, newest-first arm.
+           collect.query_stats.host_object_name exists only at V51 or later. The viewer NAMES this column
+           in its Top Queries read (TopQueriesSql groups by it and the LATERAL filters on it), so against
+           a V50 store the grid read would fail 42703 outright — the gate must refuse it, and a
+           fully-migrated V51 store must map to exactly RequiredStoreSchemaVersion. */
+        if (hasQueryStatsHostObject)
+        {
+            return 51;
+        }
+
+        /* V50 (server-tag colour, #2008 2a): column-existence sentinel, newest-first arm.
+           config.server_tags.colour exists only at V50 or later. The viewer names the colour column in its
+           tag SELECT, so a fully-migrated V50 store must map to exactly RequiredStoreSchemaVersion rather
+           than capping at 49 and tripping the connect-time gate against a healthy store — the same rule as
+           every newest-column rung below. */
+        if (hasServerTagColour)
+        {
+            return 50;
+        }
+
+        /* V49 (database-state alert): engine-agnostic column-existence sentinel, newest-first arm.
+           config_alert_settings.database_state_enabled exists only at V49 or later. The viewer names this
+           column in its alert-settings SELECT and upsert, so a fully-migrated V49 store maps to exactly
+           RequiredStoreSchemaVersion rather than capping at 48 and tripping the connect-time gate against a
+           healthy store. */
+        if (hasDatabaseStateAlert)
+        {
+            return 49;
+        }
+
+        /* V48 (PVS-pressure alert knobs, #1984): column-existence sentinel, newest-first arm.
+           config_alert_settings.pvs_enabled exists only at V48 or later. The viewer names all three
+           V48 columns in its alert-settings SELECT and upsert, so against a V47 store the Settings
+           window read would fail outright with 42703 rather than degrade — the same reason the V40
+           blocking_wait rung gates. */
+        if (hasPvsPressureKnobs)
+        {
+            return 48;
+        }
+
+        /* V47 (ADR persistent version store, #1951): table-existence sentinel, newest-first arm.
+           collect.pvs_stats exists only at V47 or later. Unlike V44 the viewer DOES read this table —
+           the FinOps PVS grid queries it by name — so a V46 store would fail 42P01 rather than degrade,
+           and the gate must refuse it. */
+        if (hasPvsStats)
+        {
+            return 47;
+        }
+
+        /* V46 (automatic plan correction, #1952): table-existence sentinel, newest-first arm.
+           collect.plan_correction exists only at V46 or later. Note the gap — 45 is permanently unused
+           (it was reserved for #1951 before that lane was renumbered to 47), so there is no V45 rung and
+           there never will be a store carrying one. */
+        if (hasPlanCorrection)
+        {
+            return 46;
+        }
+
+        /* V44 (collector state, #1962): table-existence sentinel, newest-first arm.
+           collect.collector_state exists only at V44 or later. The viewer never READS this table — it is
+           service-only state (default_trace_events' last-seen trace file) with no view and no viewer query
+           — so unlike the arms below, nothing in the viewer would fail against a V43 store. The rung
+           exists so a FULLY-migrated V44 store maps to 44 rather than capping at 43: the connect-time gate
+           compares the probe against RequiredStoreSchemaVersion, and a probe that cannot see the newest
+           migration reports every healthy store as skewed and refuses to open it. Under-reporting is the
+           failure mode this ladder guards, and it does not care whether the viewer reads the table. */
+        if (hasCollectorState)
+        {
+            return 44;
+        }
+
+        /* V43 (PagerDuty proxy, #1945): column-existence sentinel, newest-first arm.
+           config_notification.pagerduty_proxy exists only at V43 or later. The viewer MUST gate on it: the
+           Settings notification read and upsert name the column, so pointed at a V42 store they would fail
+           42703 rather than degrade. */
+        if (hasPagerDutyProxy)
+        {
+            return 43;
+        }
+
+        /* V42 (PagerDuty webhook): column-existence sentinel, newest-first arm.
+           config_notification.pagerduty_routing_key exists only at V42 or later. */
+        if (hasPagerDutyWebhook)
+        {
+            return 42;
+        }
+
+        /* V41 (#1841 tier 2 Query Store interval identity): engine-agnostic column-existence sentinel,
+           newest-first arm. query_store_stats.runtime_stats_interval_id exists only at V41 or later. The
+           viewer MUST gate on it: every Query Store aggregate read now names that column inside its dedup
+           partition, so pointed at a V40 store the Query Store tab would fail outright (42703) rather than
+           degrade. The COLUMN is the sentinel, not the table — V41 only widens a table that has existed
+           since V1. */
+        if (hasQueryStoreIntervalIdentity)
+        {
+            return 41;
+        }
+
+        /* V40 (#1839 total-blocked-wait gate): engine-agnostic column-existence sentinel, newest-first arm.
+           config_alert_settings.blocking_wait_seconds_threshold exists only at V40 or later. The viewer MUST
+           gate on it: its Settings window reads and upserts that column by name, so pointed at a V39 store it
+           would fail the alert-settings read outright (42703) rather than degrade. */
+        if (hasBlockingWaitThreshold)
+        {
+            return 40;
+        }
+
         /* V39 (#1795 dimension GC measured bound): index-existence sentinel, newest-first arm — the
            same pg_indexes idiom as the V22 sentinel. ix_query_stats_digest_floor exists only at V39
            or later. The viewer itself never reads the index; the arm exists so a fully-migrated V39

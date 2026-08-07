@@ -32,6 +32,9 @@ public sealed class TagNode
 
     public string Name => Tag.Name;
 
+    /// <summary>The tag's colour as a brush for the tree swatch (neutral when the tag has no colour).</summary>
+    public System.Windows.Media.Brush SwatchBrush => TagColorBrushes.Fill(Tag.Colour);
+
     public ObservableCollection<TagNode> Children { get; } = new();
 }
 
@@ -103,6 +106,22 @@ public partial class ManageTagsWindow : Window
         _dataService = dataService;
         _servers = servers;
         ServerCheckList.ItemsSource = _serverItems;
+
+        /* Defense-in-depth for the #2008 read-only gate: every CURRENT entry point checks
+           CanEditTags before opening this window, but this window is all writes — a future entry
+           point that forgets the gate must land on inert controls with the reason in the title,
+           not on working-looking buttons whose writes die as 42501. Generic on purpose (whole
+           content tree), so it cannot drift as buttons are added. */
+        if (dataService.IsReadOnly)
+        {
+            Title += " — read-only seat (tag editing needs the admin connection)";
+            if (Content is FrameworkElement root)
+            {
+                root.IsEnabled = false;
+            }
+
+            return;
+        }
 
         Loaded += async (_, _) => await ReloadTagsAsync();
     }
@@ -227,6 +246,7 @@ public partial class ManageTagsWindow : Window
         var hasSelection = _selectedNode is not null;
         NewChildButton.IsEnabled = hasSelection && _selectedNode!.Depth < MaxDepth - 1;
         RenameButton.IsEnabled = hasSelection;
+        ColourButton.IsEnabled = hasSelection;
         DeleteButton.IsEnabled = hasSelection;
         CheckAllButton.IsEnabled = hasSelection;
         UncheckAllButton.IsEnabled = hasSelection;
@@ -450,6 +470,33 @@ public partial class ManageTagsWindow : Window
         {
             ViewerLogger.Error("ManageTags", "Rename tag failed", ex);
             MessageBox.Show(this, $"Could not rename the tag: {ex.Message}", "Manage Tags",
+                MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private async void Colour_Click(object sender, RoutedEventArgs e)
+    {
+        if (_selectedNode is null)
+        {
+            return;
+        }
+
+        var dialog = new TagColorDialog(_selectedNode.Tag.Colour) { Owner = this };
+        if (dialog.ShowDialog() != true)
+        {
+            return;   // cancelled — leave the colour as it was
+        }
+
+        try
+        {
+            await _dataService.SetServerTagColorAsync(_selectedNode.Tag.Id, dialog.SelectedColour);
+            ChangedAny = true;
+            await ReloadTagsAsync();
+        }
+        catch (Exception ex)
+        {
+            ViewerLogger.Error("ManageTags", "Set tag colour failed", ex);
+            MessageBox.Show(this, $"Could not set the tag colour: {ex.Message}", "Manage Tags",
                 MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }

@@ -3,11 +3,18 @@
 // exactly as they existed in Lite/Database/Schema.cs immediately BEFORE the catalog-driven
 // DuckDbSchemaGenerator replaced them (feature/parity-collapse-lite-schema base = origin/dev).
 //
-// DO NOT EDIT. This is the equivalence ORACLE: DuckDbSchemaEquivalenceTests executes each of these
+// DO NOT REWRITE. This is the equivalence ORACLE: DuckDbSchemaEquivalenceTests executes each of these
 // against a fresh DuckDB database and asserts the generated schema produces a byte-identical
 // PRAGMA table_info (columns, DuckDB types, order, NOT NULL, DEFAULT, PRIMARY KEY) and matching
-// indexes. Editing this file would defeat the proof that existing DuckDB stores are safe.
+// indexes. Rewriting an existing shape here would defeat the proof that existing DuckDB stores are safe.
 // Extracted mechanically from the pre-change Schema.cs constants to guarantee byte-exactness.
+//
+// APPENDING is the one legal edit, and only for a collector column that a numbered DuckDbInitializer
+// migration also adds by ALTER TABLE ADD COLUMN. Both writers are positional, so such a column can only
+// ever land at the END of its table; reflecting it here keeps the oracle describing the schema a fresh
+// store is actually built with, while every pre-existing column stays frozen. Precedent: ag_replica_role
+// (v36), replica_role (v47), runtime_stats_interval_id + interval_start_time_utc (v49, #1841 tier 2). A
+// NOT NULL relaxation is NOT an append — that goes in IntentionalStorageDivergences instead.
 // </auto-generated>
 
 using System.Collections.Generic;
@@ -16,8 +23,10 @@ namespace PerformanceMonitorLite.Tests;
 
 internal static class GoldenCollectorSchema
 {
-    /// <summary>Pre-change CREATE TABLE DDL, keyed by collector target table (36 entries — the original
-    /// 35 pre-generation tables plus long_query_completions, #1496, added at its post-collapse migration).</summary>
+    /// <summary>Pre-change CREATE TABLE DDL, keyed by collector target table (39 entries — the original
+    /// 35 pre-generation tables plus the four collectors added at their own post-collapse migrations:
+    /// long_query_completions (#1496), the two Availability Group tables (#991), and plan_correction
+    /// (#1952, Lite schema v50)).</summary>
     public static readonly IReadOnlyDictionary<string, string> Tables = new Dictionary<string, string>
     {
         ["wait_stats"] = @"CREATE TABLE IF NOT EXISTS wait_stats (
@@ -694,7 +703,9 @@ internal static class GoldenCollectorSchema
     compatibility_level INTEGER,
     query_plan_text VARCHAR,
     query_plan_hash VARCHAR,
-    replica_role VARCHAR
+    replica_role VARCHAR,
+    runtime_stats_interval_id BIGINT,
+    interval_start_time_utc TIMESTAMP
 )",
         ["deadlocks"] = @"CREATE TABLE IF NOT EXISTS deadlocks (
     deadlock_id BIGINT PRIMARY KEY,
@@ -889,6 +900,90 @@ internal static class GoldenCollectorSchema
     est_redo_completion_time_min DOUBLE,
     est_send_drain_time_min DOUBLE
 )",
+        ["plan_correction"] = @"CREATE TABLE IF NOT EXISTS plan_correction (
+    collection_id BIGINT PRIMARY KEY,
+    collection_time TIMESTAMP NOT NULL,
+    server_id INTEGER NOT NULL,
+    server_name VARCHAR NOT NULL,
+    database_name VARCHAR NOT NULL,
+    force_last_good_plan_desired_state VARCHAR,
+    force_last_good_plan_actual_state VARCHAR,
+    force_last_good_plan_reason VARCHAR,
+    create_index_actual_state VARCHAR,
+    drop_index_actual_state VARCHAR,
+    recommendation_name VARCHAR,
+    recommendation_type VARCHAR,
+    recommendation_state VARCHAR,
+    recommendation_state_reason VARCHAR,
+    recommendation_reason VARCHAR,
+    valid_since TIMESTAMP,
+    last_refresh TIMESTAMP,
+    score INTEGER,
+    query_id BIGINT,
+    query_text VARCHAR,
+    regressed_plan_id BIGINT,
+    last_good_plan_id BIGINT,
+    last_good_plan_forcing_type VARCHAR,
+    last_good_plan_is_forced BOOLEAN,
+    last_good_plan_force_failure_reason VARCHAR,
+    regressed_plan_execution_count BIGINT,
+    regressed_plan_cpu_time_average_ms DOUBLE,
+    regressed_plan_error_count BIGINT,
+    last_good_plan_execution_count BIGINT,
+    last_good_plan_cpu_time_average_ms DOUBLE,
+    last_good_plan_error_count BIGINT,
+    estimated_gain_seconds DOUBLE,
+    is_executable_action BOOLEAN,
+    is_revertable_action BOOLEAN,
+    execute_action_initiated_by VARCHAR,
+    execute_action_initiated_time TIMESTAMP,
+    execute_action_start_time TIMESTAMP,
+    execute_action_duration_seconds DOUBLE,
+    revert_action_initiated_by VARCHAR,
+    revert_action_initiated_time TIMESTAMP,
+    revert_action_start_time TIMESTAMP,
+    revert_action_duration_seconds DOUBLE,
+    implementation_script VARCHAR
+)",
+        ["pvs_stats"] = @"CREATE TABLE IF NOT EXISTS pvs_stats (
+    collection_id BIGINT PRIMARY KEY,
+    collection_time TIMESTAMP NOT NULL,
+    server_id INTEGER NOT NULL,
+    server_name VARCHAR NOT NULL,
+    database_name VARCHAR,
+    database_id INTEGER,
+    is_accelerated_database_recovery_on BOOLEAN,
+    pvs_filegroup_id SMALLINT,
+    persistent_version_store_size_mb DECIMAL(19,2),
+    online_index_version_store_size_mb DECIMAL(19,2),
+    database_data_size_mb DECIMAL(19,2),
+    current_aborted_transaction_count BIGINT,
+    oldest_active_transaction_id BIGINT,
+    oldest_aborted_transaction_id BIGINT,
+    min_transaction_timestamp BIGINT,
+    online_index_min_transaction_timestamp BIGINT,
+    secondary_low_water_mark BIGINT,
+    offrow_version_cleaner_start_time TIMESTAMP,
+    offrow_version_cleaner_end_time TIMESTAMP,
+    aborted_version_cleaner_start_time TIMESTAMP,
+    aborted_version_cleaner_end_time TIMESTAMP,
+    pvs_off_row_page_skipped_low_water_mark BIGINT,
+    pvs_off_row_page_skipped_transaction_not_cleaned BIGINT,
+    pvs_off_row_page_skipped_oldest_active_xdesid BIGINT,
+    pvs_off_row_page_skipped_min_useful_xts BIGINT,
+    pvs_off_row_page_skipped_oldest_snapshot BIGINT,
+    pvs_off_row_page_skipped_oldest_aborted_xdesid BIGINT
+)",
+        ["database_states"] = @"CREATE TABLE IF NOT EXISTS database_states (
+    collection_id BIGINT PRIMARY KEY,
+    collection_time TIMESTAMP NOT NULL,
+    server_id INTEGER NOT NULL,
+    server_name VARCHAR NOT NULL,
+    database_name VARCHAR,
+    database_id INTEGER,
+    state_desc VARCHAR,
+    is_in_standby BOOLEAN
+)",
     };
 
     /// <summary>Pre-change CREATE INDEX DDL, keyed by collector target table (35 entries; server_config and database_config have no index).</summary>
@@ -930,5 +1025,8 @@ internal static class GoldenCollectorSchema
         ["agent_status"] = @"CREATE INDEX IF NOT EXISTS idx_agent_status_time ON agent_status(server_id, collection_time)",
         ["ag_replica_states"] = @"CREATE INDEX IF NOT EXISTS idx_ag_replica_states_time ON ag_replica_states(server_id, collection_time)",
         ["ag_database_replica_states"] = @"CREATE INDEX IF NOT EXISTS idx_ag_database_replica_states_time ON ag_database_replica_states(server_id, collection_time)",
+        ["plan_correction"] = @"CREATE INDEX IF NOT EXISTS idx_plan_correction_time ON plan_correction(server_id, collection_time)",
+        ["pvs_stats"] = @"CREATE INDEX IF NOT EXISTS idx_pvs_stats_time ON pvs_stats(server_id, collection_time)",
+        ["database_states"] = @"CREATE INDEX IF NOT EXISTS idx_database_states_time ON database_states(server_id, collection_time)",
     };
 }

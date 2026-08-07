@@ -105,20 +105,23 @@ public sealed class DarlingAnomalyBaselineTests
         /* The stall/reads ratio must be DOUBLE PRECISION, not numeric (`* 1.0`): STDDEV_SAMP of a
            spurious-large ratio yields a numeric that overflows System.Decimal when Npgsql materializes
            the aggregate, silently failing the io_latency baseline (found live via the error monitor).
+           #1757 first pinned the cast inside the file_io_baseline aggregate; #2007 retired that
+           aggregate outright (nothing read it after the raw move), so the raw-arm pins below are
+           the surviving — and only — guarantee. */
 
-           #1757 moved the ratio into the baseline aggregate, so the cast is pinned where it now lives —
-           and the provider half is pinned too, because the reconstruction must stay in float arithmetic
-           all the way out or the same overflow returns by a different route. */
-        Assert.Contains("delta_stall_read_ms::DOUBLE PRECISION", TimescaleSupport.CreateFileIoBaselineSql, StringComparison.Ordinal);
-        Assert.DoesNotContain("delta_stall_read_ms * 1.0", TimescaleSupport.CreateFileIoBaselineSql, StringComparison.Ordinal);
-
+        /* #1743 follow-up moved the arm off the rollup and onto the raw hypertable (the rollup
+           cannot produce a median) — the cast pin moves WITH it: the ratio must still be computed
+           in float arithmetic at the source. The old SUM(row_count) pin's SEMANTIC survives as the
+           nullable-v design: the arm's WHERE keeps write-only rows (delta_reads > 0 OR
+           delta_writes > 0) and must NOT filter the NULL ratios out — the scaffold's COUNT(*)
+           counts them (the row_count behavior) while AVG/STDDEV/median/mad ignore them (the
+           ratio_count behavior), exactly the retired rollup's two-count distinction. */
         var sql = PgBaselineProvider.GetBaselineQuery(MetricNames.IoLatency)!;
-        Assert.Contains("file_io_baseline", sql, StringComparison.Ordinal);
-        Assert.Contains("SQRT(", sql, StringComparison.Ordinal);
-        /* sample_count must come from row_count, NOT ratio_count: the raw path counted rows whose ratio was
-           NULL (writes but no reads pass the filter and average to nothing), so counting only the non-null
-           ratios would silently under-report the sample size the baseline gate reads. */
-        Assert.Contains("SUM(row_count) AS sample_count", sql, StringComparison.Ordinal);
+        Assert.Contains("FROM file_io_stats", sql, StringComparison.Ordinal);
+        Assert.Contains("delta_stall_read_ms::DOUBLE PRECISION / NULLIF(delta_reads, 0)", sql, StringComparison.Ordinal);
+        Assert.DoesNotContain("delta_stall_read_ms * 1.0", sql, StringComparison.Ordinal);
+        Assert.Contains("(delta_reads > 0 OR delta_writes > 0)", sql, StringComparison.Ordinal);
+        Assert.DoesNotContain("v IS NOT NULL", sql, StringComparison.Ordinal);
     }
 
     /* ---------------- ungated: method-surface pins vs Lite ---------------- */
@@ -346,10 +349,11 @@ public sealed class DarlingAnomalyBaselineTests
         await PgMigrations.MigrateAsync(connection, ct);
 
         /* Clear leftovers from an earlier aborted run so the assertions below are deterministic. */
-        await DeleteTestRowsAsync(connection);
+        await DeleteTestRowsAsync(connection, ct);
 
         await using var postgres = NpgsqlDataSource.Create(connectionString!);
 
+        var bodySucceeded = false;
         try
         {
             /* ---- plant the hour×dow history: one bucket (Monday 10:00 UTC), 12 collections
@@ -393,8 +397,26 @@ public sealed class DarlingAnomalyBaselineTests
                compute the identical statistic, and an ordinary view is isolated — creating the aggregates here
                would create all seventeen and change compose's tier routing for the live test that asserts a
                10-day window lands on RAW. The continuous-aggregate half of this invariant is proven in
-               TimescaleSupportTests, which already owns the snapshot/restore machinery for that. */
-            Assert.Equal(9, await TimescaleSupport.EnsureBaselineFallbackViewsAsync(connection, null, ct));
+               TimescaleSupportTests, which already owns the snapshot/restore machinery for that.
+
+               Asserted as EXISTENCE of all nine, not as a return count of nine (#1862). The return is how
+               many the call CREATED, and it skips any relation that is already there — so a store where a
+               sibling class's continuous aggregate is still standing, or where an earlier run's fallback view
+               survived, legitimately answers 8 and the old assertion failed on a store that was in every way
+               fit for this test. That is the same order-dependence as the fixture bug this shipped with, one
+               layer up: a count of a shared mutable store is not a property of this test. Existence is what
+               the paragraph above actually needs, and it holds however the nine came to be there. The list
+               being nine long is pinned purely in BaselineSupplyTests, where no store can move it. */
+            await TimescaleSupport.EnsureBaselineFallbackViewsAsync(connection, null, ct);
+
+            foreach (var (_, view) in TimescaleSupport.BaselineAggregates)
+            {
+                using var exists = new NpgsqlCommand(TimescaleSupport.BaselineRelationExistsSql(view), connection);
+                Assert.True((bool)(await exists.ExecuteScalarAsync(ct))!,
+                    $"Baseline relation collect.{view} does not exist and could not be created as a fallback "
+                    + "view. Every assertion below would then read an empty baseline and compare against "
+                    + "zeroes rather than failing on the statistic it means to test.");
+            }
 
             /* The FOLLOWING Monday 10:00 UTC — same (hour, dow) bucket, 1-7 days back, still
                in the past. Both baseline reads and the detector window anchor here. */
@@ -464,11 +486,89 @@ public sealed class DarlingAnomalyBaselineTests
             Assert.Equal((double)BaselineTier.Full, fact.Metadata["baseline_tier"]);
             Assert.Equal(10.0, fact.Metadata["baseline_hour"]);
             Assert.Equal((double)DayOfWeek.Monday, fact.Metadata["baseline_dow"]);
+
+            bodySucceeded = true;
         }
         finally
         {
-            await DeleteTestRowsAsync(connection);
-            await DropBaselineFallbackViewsAsync(connection);
+            await LiveStoreCleanup.RunAsync(connectionString!, bodySucceeded, async (cleanup, cleanupCt) =>
+            {
+                await DeleteTestRowsAsync(cleanup, cleanupCt);
+                await DropBaselineFallbackViewsAsync(cleanup, cleanupCt);
+            });
+        }
+    }
+
+    /// <summary>
+    /// #1995 review follow-through: the IO arm's NULL-ratio semantics, proven against a LIVE
+    /// Postgres instead of claimed in comments. The arm's WHERE keeps write-only file rows
+    /// (delta_reads = 0, delta_writes &gt; 0), whose stall/reads ratio is NULL through NULLIF — and
+    /// the scaffold must COUNT those rows (the retired rollup's row_count behavior) while
+    /// AVG/STDDEV/median/mad ignore them (the ratio_count behavior). If percentile_cont ever
+    /// counted NULLs the median here would shift off 2.5; if the WHERE dropped write-only rows the
+    /// sample count would read 4. Grain note, measured on the production fleet: file_io_stats is
+    /// ~216K rows/server/30d (13x CPU's grain) and the full composed arm ran in 1.15 s on the
+    /// busiest tenant — fine behind the provider's 1-hour cache.
+    /// </summary>
+    [Fact]
+    public async Task EndToEnd_IoLatencyArm_CountsWriteOnlyRows_StatsIgnoreThem_AgainstDevPostgres()
+    {
+        var connectionString = Environment.GetEnvironmentVariable("DARLING_TEST_PG");
+        Assert.SkipWhen(string.IsNullOrEmpty(connectionString),
+            "Set DARLING_TEST_PG to a Postgres connection string to run the live IO-arm test.");
+
+        var ct = TestContext.Current.CancellationToken;
+        const int ioServerId = TestServerId + 1; // own id — this test cleans its own rows
+
+        using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(ct);
+        await PgMigrations.MigrateAsync(connection, ct);
+
+        await using (var cleanup = new NpgsqlCommand($"DELETE FROM file_io_stats WHERE server_id = {ioServerId};", connection))
+        {
+            await cleanup.ExecuteNonQueryAsync(ct);
+        }
+
+        await using var postgres = NpgsqlDataSource.Create(connectionString!);
+        var bodySucceeded = false;
+        try
+        {
+            var day = DateTime.UtcNow.Date.AddDays(-8);
+            while (day.DayOfWeek != DayOfWeek.Monday) day = day.AddDays(-1);
+            var historyStart = DateTime.SpecifyKind(day.AddHours(10), DateTimeKind.Unspecified);
+
+            /* Four read-bearing rows with hand-checkable ratios 1, 2, 3, 4 ms; one WRITE-ONLY row
+               (NULL ratio, must be counted but not averaged); one no-activity row (must be
+               filtered by the WHERE entirely). Expected flat tier: 5 samples, median 2.5, MAD 1.0. */
+            var rows = new (long Reads, long Writes, long StallReadMs)[]
+                { (10, 0, 10), (10, 0, 20), (10, 0, 30), (10, 0, 40), (0, 25, 0), (0, 0, 0) };
+            for (var i = 0; i < rows.Length; i++)
+            {
+                await InsertAsync(connection,
+                    "INSERT INTO file_io_stats (collection_id, collection_time, server_id, server_name, delta_reads, delta_writes, delta_stall_read_ms) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    (long)(100 + i), historyStart.AddMinutes(5 * i), ioServerId, "IO-NULL-SEMANTICS",
+                    rows[i].Reads, rows[i].Writes, rows[i].StallReadMs);
+            }
+
+            var provider = new PgBaselineProvider(postgres);
+            var bucket = await provider.GetBaselineAsync(ioServerId, MetricNames.IoLatency, historyStart.AddDays(7));
+
+            /* One sparse bucket collapses to the exact flat sentinel — robust fields intact. */
+            Assert.Equal(BaselineTier.Flat, bucket.Tier);
+            Assert.Equal(5, bucket.SampleCount);          // write-only row COUNTED, no-activity row filtered
+            Assert.Equal(2.5, bucket.Median, precision: 6); // NULL ratio ignored by the median
+            Assert.Equal(1.0, bucket.Mad, precision: 6);
+            Assert.Equal(2.5, bucket.Mean, precision: 6);   // and by the mean — both counts' semantics hold
+
+            bodySucceeded = true;
+        }
+        finally
+        {
+            await LiveStoreCleanup.RunAsync(connectionString!, bodySucceeded, async (cleanup, cleanupCt) =>
+            {
+                using var command = new NpgsqlCommand($"DELETE FROM file_io_stats WHERE server_id = {ioServerId};", cleanup);
+                await command.ExecuteNonQueryAsync(cleanupCt);
+            });
         }
     }
 
@@ -482,11 +582,11 @@ public sealed class DarlingAnomalyBaselineTests
         await command.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
     }
 
-    private static async Task DeleteTestRowsAsync(NpgsqlConnection connection)
+    private static async Task DeleteTestRowsAsync(NpgsqlConnection connection, System.Threading.CancellationToken ct)
     {
         using var cleanup = new NpgsqlCommand(
             $"DELETE FROM wait_stats WHERE server_id = {TestServerId};", connection);
-        await cleanup.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
+        await cleanup.ExecuteNonQueryAsync(ct);
     }
 
     /// <summary>
@@ -494,12 +594,12 @@ public sealed class DarlingAnomalyBaselineTests
     /// continuous-aggregate guard the product does, so it can never drop a real aggregate another live test
     /// planted — a bare DROP VIEW would, because a continuous aggregate is also a relkind='v' view.
     /// </summary>
-    private static async Task DropBaselineFallbackViewsAsync(NpgsqlConnection connection)
+    private static async Task DropBaselineFallbackViewsAsync(NpgsqlConnection connection, System.Threading.CancellationToken ct)
     {
         foreach (var (_, view) in TimescaleSupport.BaselineAggregates)
         {
             using var drop = new NpgsqlCommand(TimescaleSupport.DropBaselineFallbackViewSql(view), connection);
-            await drop.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
+            await drop.ExecuteNonQueryAsync(ct);
         }
     }
 }

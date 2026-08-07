@@ -11,7 +11,9 @@ using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using PerformanceMonitor.Analysis.Baselines;
+using PerformanceMonitor.Collectors;
 using PerformanceMonitor.Darling.Analysis;
+using PerformanceMonitor.Darling.Service;
 using PerformanceMonitor.Darling.Storage;
 using Xunit;
 
@@ -60,7 +62,9 @@ public class BaselineSupplyTests
     [Fact]
     public void EveryBaselineAggregate_PreservesCollectionGrain_NotJustTheHourlyBucket()
     {
-        Assert.Equal(9, TimescaleSupport.BaselineAggregates.Length);
+        /* Seven since #2007 retired the unread CPU/IO pair (their arms read the raw hypertables);
+           RetiredBaselineAggregateTests pins the retirement half of that count. */
+        Assert.Equal(7, TimescaleSupport.BaselineAggregates.Length);
 
         foreach (var (createSql, view) in TimescaleSupport.BaselineAggregates)
         {
@@ -134,27 +138,67 @@ public class BaselineSupplyTests
     }
 
     /// <summary>
-    /// The eleven families are served by the nine aggregates and nothing else — a family pointed at a view
+    /// Nine families are served by the baseline aggregates and nothing else — a family pointed at a view
     /// that no longer exists would fail at runtime against a real store, which no unit test would catch.
+    /// <para>#1743 follow-up: CPU and I/O latency are the two deliberate EXCEPTIONS — they read their RAW
+    /// hypertables (at Lite's grain, so the robust scaffold applies; their retired sum/sumsq rollups could
+    /// not produce a median). That is safe from #1757 only because those two collectors carry their own
+    /// 30-day service-side retention, which <see cref="RawBaselineFamilies_RetentionCoversTheWindow"/>
+    /// pins as the load-bearing invariant.</para>
     /// </summary>
     [Fact]
-    public void EveryFamily_ReadsOneOfTheNineBaselineAggregates()
+    public void EveryFamily_ReadsItsIntendedSupply()
     {
         var views = TimescaleSupport.BaselineAggregates.Select(a => a.View).ToArray();
-        var families = new[]
+        var aggregateFamilies = new[]
         {
-            MetricNames.Cpu, MetricNames.BatchRequests, MetricNames.WaitStats, MetricNames.SessionCount,
-            MetricNames.QueryDuration, MetricNames.IoLatency, MetricNames.Blocking, MetricNames.Deadlock,
+            MetricNames.BatchRequests, MetricNames.WaitStats, MetricNames.SessionCount,
+            MetricNames.QueryDuration, MetricNames.Blocking, MetricNames.Deadlock,
             MetricNames.Memory, MetricNames.WaitMsPerSec, MetricNames.BlockingPerMinute,
         };
 
-        foreach (var family in families)
+        foreach (var family in aggregateFamilies)
         {
             var sql = PgBaselineProvider.GetBaselineQuery(family)!;
             Assert.True(
                 views.Any(v => sql.Contains("FROM " + v, StringComparison.Ordinal)),
                 $"{family} does not read any known baseline aggregate");
         }
+
+        Assert.Contains("FROM cpu_utilization_stats", PgBaselineProvider.GetBaselineQuery(MetricNames.Cpu)!, StringComparison.Ordinal);
+        Assert.Contains("FROM file_io_stats", PgBaselineProvider.GetBaselineQuery(MetricNames.IoLatency)!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The invariant that makes the CPU/I-O raw reads safe: both collectors retain at least the full
+    /// baseline window. Drop either below <see cref="BaselineMath.BaselineWindowDays"/> and the family
+    /// silently regresses to #1757's short-supply shape — this pin is what makes that a red build
+    /// instead of a quiet baseline degradation.
+    /// </summary>
+    [Fact]
+    public void RawBaselineFamilies_RetentionCoversTheWindow()
+    {
+        Assert.True(
+            CollectorScheduleDefaults.All["cpu_utilization"].RetentionDays >= BaselineMath.BaselineWindowDays,
+            "cpu_utilization retention no longer covers the baseline window");
+        Assert.True(
+            CollectorScheduleDefaults.All["file_io_stats"].RetentionDays >= BaselineMath.BaselineWindowDays,
+            "file_io_stats retention no longer covers the baseline window");
+    }
+
+    /// <summary>
+    /// The RUNTIME half of the same invariant (review-caught on the follow-up PR): retention for
+    /// these collectors is user-editable, so a defaults pin alone leaves a deployed store able to
+    /// silently shorten the CPU/I-O baseline supply. DarlingRetention floors the purge horizon for
+    /// exactly the raw-reading baseline families at the baseline window — this pins the set's
+    /// membership to the provider's raw-reading arms so neither side can drift alone.
+    /// </summary>
+    [Fact]
+    public void BaselineServingRawCollectors_MatchTheRawReadingArms()
+    {
+        Assert.Equal(2, DarlingRetention.BaselineServingRawCollectors.Count);
+        Assert.Contains("cpu_utilization", DarlingRetention.BaselineServingRawCollectors);
+        Assert.Contains("file_io_stats", DarlingRetention.BaselineServingRawCollectors);
     }
 
     /// <summary>
@@ -167,15 +211,15 @@ public class BaselineSupplyTests
     [Fact]
     public void RefreshSql_BindsAndCastsItsBounds_BecauseTheParametersArePolymorphic()
     {
-        var plain = TimescaleSupport.RefreshContinuousAggregateSql(TimescaleSupport.CpuBaselineView);
+        var plain = TimescaleSupport.RefreshContinuousAggregateSql(TimescaleSupport.PerfmonBaselineView);
         Assert.Contains("$1::timestamp", plain, StringComparison.Ordinal);
         Assert.Contains("NULL::timestamp", plain, StringComparison.Ordinal);
-        Assert.Contains("'collect.cpu_utilization_baseline'::regclass", plain, StringComparison.Ordinal);
+        Assert.Contains("'collect.perfmon_baseline'::regclass", plain, StringComparison.Ordinal);
         Assert.DoesNotContain("buckets_per_batch", plain, StringComparison.Ordinal);
 
         /* force is the 4th positional argument, and only ever set deliberately. */
         Assert.EndsWith("NULL::timestamp)", plain, StringComparison.Ordinal);
-        var forced = TimescaleSupport.RefreshContinuousAggregateSql(TimescaleSupport.CpuBaselineView, force: true);
+        var forced = TimescaleSupport.RefreshContinuousAggregateSql(TimescaleSupport.PerfmonBaselineView, force: true);
         Assert.EndsWith("NULL::timestamp, true)", forced, StringComparison.Ordinal);
     }
 
@@ -310,7 +354,7 @@ public class BaselineSupplyTests
 
         /* The probe is what makes running it everywhere safe: a continuous aggregate is also a relkind='v'
            view, so an unconditional CREATE OR REPLACE VIEW by these names would destroy a materialization. */
-        Assert.Contains("to_regclass", TimescaleSupport.BaselineRelationExistsSql(TimescaleSupport.CpuBaselineView), StringComparison.Ordinal);
+        Assert.Contains("to_regclass", TimescaleSupport.BaselineRelationExistsSql(TimescaleSupport.PerfmonBaselineView), StringComparison.Ordinal);
     }
 
     private static string ReadWorkerSource([CallerFilePath] string thisFile = "")

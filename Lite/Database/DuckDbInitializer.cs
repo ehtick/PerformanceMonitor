@@ -98,7 +98,7 @@ public class DuckDbInitializer
     /// <summary>
     /// Current schema version. Increment this when schema changes require table rebuilds.
     /// </summary>
-    internal const int CurrentSchemaVersion = 48;
+    internal const int CurrentSchemaVersion = 52;
 
     private readonly string _archivePath;
 
@@ -1127,6 +1127,76 @@ public class DuckDbInitializer
                        correctly from the generator) — neither is fatal. */
                     _logger?.LogWarning("Migration to v48 on {Column} encountered an error (non-fatal): {Error}", column, ex.Message);
                 }
+            }
+        }
+
+        if (fromVersion < 49)
+        {
+            /* v49: query_store_stats gains the REAL Query Store interval identity (#1841 tier 2) —
+                    runtime_stats_interval_id + interval_start_time_utc. The rows are cumulative
+                    per-interval snapshots and the collector re-fetches the OPEN interval every cycle, so
+                    every aggregate read has to collapse an interval to its latest snapshot before summing;
+                    until now the only identity in the schema was the first_execution_time PROXY, and the
+                    only time axis was collection_time (the cycle that last FETCHED an interval, reliably
+                    one bucket after the one it ran in on Query Store's default 60-minute interval).
+
+                    Both appended at the end to keep the positional appender aligned; the collector writes
+                    them unconditionally, so an un-migrated database would mis-align on the next append —
+                    this ALTER is required, not cosmetic. Nullable and NOT backfilled: rows already in the
+                    store were collected without the identity and nothing can reconstruct it, so every
+                    reader keys on the real id only WHEN PRESENT and falls back to the proxy otherwise. The
+                    v_ view (SELECT *) is rebuilt every startup and picks them up; old parquet reads back
+                    NULL (union BY NAME). */
+            _logger?.LogInformation("Running migration to v49: query_store_stats interval identity columns");
+            foreach (var column in new[] { "runtime_stats_interval_id BIGINT", "interval_start_time_utc TIMESTAMP" })
+            {
+                try
+                {
+                    await ExecuteNonQueryAsync(connection, $"ALTER TABLE query_store_stats ADD COLUMN IF NOT EXISTS {column}");
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogWarning("Migration to v49 on {Column} encountered an error (non-fatal): {Error}", column, ex.Message);
+                }
+            }
+        }
+
+        if (fromVersion < 50)
+        {
+            /* v50: added plan_correction (automatic plan correction — per-database FORCE_LAST_GOOD_PLAN
+                    enablement from sys.database_automatic_tuning_options, plus the engine's live
+                    recommendation set from sys.dm_db_tuning_recommendations with the regressed query's
+                    text resolved through Query Store at collection time; issue #1952). New table only —
+                    created by GetAllTableStatements() below; the v_ view comes from
+                    CreateArchiveViewsAsync via ArchivableTables. */
+            _logger?.LogInformation("Running migration to v50: adding plan_correction table");
+        }
+
+        if (fromVersion < 51)
+        {
+            /* v51: added pvs_stats (Accelerated Database Recovery persistent version store size and
+                    cleanup state per database from sys.dm_tran_persistent_version_store_stats, SQL
+                    Server 2019+; issue #1951). New table only — created by GetAllTableStatements()
+                    below; the v_pvs_stats view the FinOps grid reads comes from CreateArchiveViewsAsync
+                    via ArchivableTables, which is derived from CollectorCatalog. */
+            _logger?.LogInformation("Running migration to v51: adding pvs_stats table");
+        }
+
+        if (fromVersion < 52)
+        {
+            /* v52 (#2012 stage 2): the statement's HOST OBJECT on query_stats — dm_exec_sql_text.objectid
+               resolved to schema.name at collection, NULL for ad-hoc/prepared text. Splits INSERT...EXEC
+               callers that share a query_hash in the hash-grouped readers; history rows stay NULL and age
+               out with retention. Appended last to match the collector's append-only payload; the
+               v_query_stats archive union re-derives per start with union_by_name, so no view work. */
+            _logger?.LogInformation("Running migration to v52: adding host_object_name to query_stats");
+            try
+            {
+                await ExecuteNonQueryAsync(connection, "ALTER TABLE query_stats ADD COLUMN IF NOT EXISTS host_object_name VARCHAR");
+            }
+            catch
+            {
+                /* Table doesn't exist yet — will be created with the full schema below */
             }
         }
     }

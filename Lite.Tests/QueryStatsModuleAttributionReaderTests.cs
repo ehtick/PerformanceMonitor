@@ -92,6 +92,25 @@ public sealed class QueryStatsModuleAttributionReaderTests : IClassFixture<Share
     }
 
     [Fact]
+    public async Task TopQueries_CountDistinctTexts_SoBlendedHashGroupsAreVisible()
+    {
+        var service = new LocalDataService(_duckDb);
+
+        /* #2012: INSERT...EXEC statements naming DIFFERENT callee procs share a query_hash
+           (reproduced live on SQL Server 2022), so a hash group can merge genuinely different
+           statements and label them with one representative text. distinct_texts is the tell. */
+        await SeedQueryStatsAsync("TestDb", "0xBLEND", "0xH1", deltaExec: 5, deltaElapsedUs: 300_000, "INSERT INTO #items EXEC dbo.inner_v3");
+        await SeedQueryStatsAsync("TestDb", "0xBLEND", "0xH2", deltaExec: 4, deltaElapsedUs: 200_000, "INSERT INTO #items EXEC dbo.inner_v4");
+        await SeedQueryStatsAsync("TestDb", "0xONETEXT", "0xH3", deltaExec: 3, deltaElapsedUs: 100_000, "SELECT stable");
+        await SeedQueryStatsAsync("TestDb", "0xONETEXT", "0xH3", deltaExec: 2, deltaElapsedUs: 90_000, "SELECT stable");
+
+        var rows = await service.GetTopQueriesByCpuAsync(ServerId);
+
+        Assert.Equal(2, rows.Single(r => r.QueryHash == "0xBLEND").DistinctTexts);
+        Assert.Equal(1, rows.Single(r => r.QueryHash == "0xONETEXT").DistinctTexts);
+    }
+
+    [Fact]
     public async Task TopQueries_ModuleJoinDoesNotFanOut_LatestCollectionWins()
     {
         var service = new LocalDataService(_duckDb);
@@ -176,5 +195,25 @@ public sealed class QueryStatsRowModuleDisplayTests
     {
         Assert.Equal("ad hoc", new QueryStatsRow().ModuleName);
         Assert.Equal("ad hoc", new QueryStatsRow { ModuleDatabaseName = "StackOverflow", ModuleSchemaName = "dbo" }.ModuleName);
+    }
+
+    [Fact]
+    public void ModuleName_PrefersCollectionTimeHostObject_OverHandleStitch()
+    {
+        /* #2012 stage 2: host_object_name is resolved ON the monitored server at collection, so it
+           wins over the #1568 sql_handle stitch (which requires the module to also be in the
+           procedure-stats cache); pre-upgrade rows have a NULL host and keep the stitch. */
+        var both = new QueryStatsRow
+        {
+            DatabaseName = "StackOverflow",
+            HostObjectName = "dbo.usp_Host",
+            ModuleDatabaseName = "OtherDb",
+            ModuleSchemaName = "dbo",
+            ModuleObjectName = "usp_Stitched",
+        };
+        Assert.Equal("StackOverflow.dbo.usp_Host", both.ModuleName);
+
+        var hostOnly = new QueryStatsRow { DatabaseName = "StackOverflow", HostObjectName = "dbo.usp_Host" };
+        Assert.Equal("StackOverflow.dbo.usp_Host", hostOnly.ModuleName);
     }
 }

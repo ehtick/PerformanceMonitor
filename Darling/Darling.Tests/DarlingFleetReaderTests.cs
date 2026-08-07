@@ -36,10 +36,34 @@ public sealed class DarlingFleetReaderSqlTests
     {
         var sql = DarlingFleetReader.FleetServersSql;
         Assert.Contains("FROM servers", sql, StringComparison.Ordinal);
-        Assert.Contains("WHERE is_enabled", sql, StringComparison.Ordinal);
-        Assert.Contains("COALESCE(display_name, server_name)", sql, StringComparison.Ordinal);
+        Assert.Contains("WHERE s.is_enabled", sql, StringComparison.Ordinal);
+        Assert.Contains("COALESCE(s.display_name, s.server_name)", sql, StringComparison.Ordinal);
         /* The per-server platform signal (D4) rides on the same registry row — no extra round-trip. */
         Assert.Contains("sql_engine_edition", sql, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The is_silenced column (#2031) must stay the SQL mirror of the Viewer's IsWholeServerSilence predicate:
+    /// server-scoped (case-insensitive, on the SAME COALESCE(display, storage) name the card shows — the name
+    /// the Viewer's Silence writes), enabled, unexpired, and with EVERY narrowing pattern NULL — so a
+    /// metric/database/query/wait/job mute an operator authored for the server never renders the whole-server
+    /// bell. Losing any one of the five NULL guards would silently widen what counts as "silenced".
+    /// </summary>
+    [Fact]
+    public void FleetServersSql_IsSilenced_MirrorsTheWholeServerSilencePredicate()
+    {
+        var sql = DarlingFleetReader.FleetServersSql;
+        Assert.Contains("EXISTS", sql, StringComparison.Ordinal);
+        Assert.Contains("FROM config_mute_rules m", sql, StringComparison.Ordinal);
+        Assert.Contains("lower(m.server_name) = lower(COALESCE(s.display_name, s.server_name))", sql, StringComparison.Ordinal);
+        Assert.Contains("m.enabled", sql, StringComparison.Ordinal);
+        Assert.Contains("m.expires_at_utc IS NULL OR m.expires_at_utc >", sql, StringComparison.Ordinal);
+        Assert.Contains("m.metric_name IS NULL", sql, StringComparison.Ordinal);
+        Assert.Contains("m.database_pattern IS NULL", sql, StringComparison.Ordinal);
+        Assert.Contains("m.query_text_pattern IS NULL", sql, StringComparison.Ordinal);
+        Assert.Contains("m.wait_type_pattern IS NULL", sql, StringComparison.Ordinal);
+        Assert.Contains("m.job_name_pattern IS NULL", sql, StringComparison.Ordinal);
+        Assert.Contains("AS is_silenced", sql, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -108,8 +132,41 @@ public sealed class DarlingFleetReaderSqlTests
         Assert.Contains("collection_time >= $1", sql, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// The read-only fleet-tag join (#2020): every (server, tag) assignment, joined to the tag for its name and
+    /// stored colour, ordered so a card's pills are stable. Bare table names resolve through the store's
+    /// search_path to the config-schema tag tables, the same way FleetServersSql reads servers / config_mute_rules.
+    /// </summary>
+    [Fact]
+    public void FleetTagsSql_JoinsAssignmentsToTags_OrderedForStablePills()
+    {
+        var sql = DarlingFleetReader.FleetTagsSql;
+        Assert.Contains("FROM server_tag_map m", sql, StringComparison.Ordinal);
+        Assert.Contains("JOIN server_tags t ON t.id = m.tag_id", sql, StringComparison.Ordinal);
+        Assert.Contains("t.colour", sql, StringComparison.Ordinal);
+        Assert.Contains("ORDER BY m.server_id, t.sort_order, lower(t.name)", sql, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The full tag-forest read (#2020) backing the web tree/group view: every tag with its parent, ordering, and
+    /// colour, so the fleet page can nest an organisational parent tag that has no directly-assigned servers —
+    /// the reason it is a separate read from the per-server <see cref="DarlingFleetReader.FleetTagsSql"/>.
+    /// </summary>
+    [Fact]
+    public void FleetTagForestSql_SelectsTheWholeHierarchy_OrderedForStableSiblings()
+    {
+        var sql = DarlingFleetReader.FleetTagForestSql;
+        Assert.Contains("FROM server_tags", sql, StringComparison.Ordinal);
+        Assert.Contains("parent_id", sql, StringComparison.Ordinal);
+        Assert.Contains("sort_order", sql, StringComparison.Ordinal);
+        Assert.Contains("colour", sql, StringComparison.Ordinal);
+        Assert.Contains("ORDER BY sort_order, lower(name)", sql, StringComparison.Ordinal);
+    }
+
     [Theory]
     [InlineData(nameof(DarlingFleetReader.FleetServersSql))]
+    [InlineData(nameof(DarlingFleetReader.FleetTagsSql))]
+    [InlineData(nameof(DarlingFleetReader.FleetTagForestSql))]
     [InlineData(nameof(DarlingFleetReader.FleetCpuSql))]
     [InlineData(nameof(DarlingFleetReader.FleetMemorySql))]
     [InlineData(nameof(DarlingFleetReader.FleetMemoryPressureSql))]
@@ -168,7 +225,7 @@ public sealed class DarlingFleetDtoJsonTests
         foreach (var field in new[]
         {
             "\"server_id\"", "\"display_name\"", "\"server_name\"", "\"engine_edition\"",
-            "\"is_azure_sql_db\"", "\"is_azure_mi\"", "\"band\"", "\"status\"",
+            "\"is_azure_sql_db\"", "\"is_azure_mi\"", "\"is_silenced\"", "\"tags\"", "\"band\"", "\"status\"",
             "\"is_online\"", "\"last_collection\"", "\"cpu_percent\"", "\"total_cpu_percent\"",
             "\"cpu_severity\"", "\"memory_severity\"", "\"blocking_count\"", "\"blocking_severity\"",
             "\"deadlock_count\"", "\"deadlock_last_seen\"", "\"deadlock_severity\"", "\"threads_severity\"",
@@ -228,6 +285,11 @@ public sealed class DarlingFleetDtoJsonTests
                 new FleetRankedServer { ServerId = 1, DisplayName = "c1", Band = FleetHealthBand.Critical, Score = 3001, Reason = "Deadlocks 1" },
             },
             Cards = Array.Empty<FleetServerCard>(),
+            Tags = new[]
+            {
+                new FleetTagNode { Id = 5, Name = "Prod", ParentId = null, SortOrder = 0, Colour = "#3B82F6" },
+                new FleetTagNode { Id = 6, Name = "US", ParentId = 5, SortOrder = 1, Colour = null },
+            },
         };
 
         var json = JsonSerializer.Serialize(result, DarlingFleetReader.JsonOptions);
@@ -238,6 +300,7 @@ public sealed class DarlingFleetDtoJsonTests
             "\"critical_count\"", "\"offline_count\"", "\"servers_with_collection_failures\"",
             "\"total_blocking_events\"", "\"total_deadlocks\"", "\"additional_problem_count\"",
             "\"worst_servers\"", "\"cards\"", "\"band_label\"", "\"reason\"", "\"score\"",
+            "\"tags\"", "\"parent_id\"", "\"sort_order\"",
         })
         {
             Assert.Contains(field, json, StringComparison.Ordinal);
@@ -298,6 +361,7 @@ public sealed class DarlingFleetReaderLivePostgresTests
 
         await using var postgres = NpgsqlDataSource.Create(connectionString!);
 
+        var bodySucceeded = false;
         try
         {
             var now = DateTime.UtcNow;
@@ -353,10 +417,13 @@ public sealed class DarlingFleetReaderLivePostgresTests
             var xeScore = ServerHealthClassifier.FleetHealthScore(xe.Band, xe.ToHealthMetrics());
             var dmvScore = ServerHealthClassifier.FleetHealthScore(dmv.Band, dmv.ToHealthMetrics());
             Assert.True(dmvScore > xeScore);
+
+            bodySucceeded = true;
         }
         finally
         {
-            await DeleteSentinelRowsAsync(connection, ct);
+            await LiveStoreCleanup.RunAsync(connectionString!, bodySucceeded, async (cleanup, cleanupCt) =>
+                await DeleteSentinelRowsAsync(cleanup, cleanupCt));
         }
     }
 

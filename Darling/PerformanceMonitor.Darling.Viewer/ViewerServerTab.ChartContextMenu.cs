@@ -39,12 +39,12 @@ public partial class ViewerServerTab
 {
     /* The menu-item headers — the single source of truth shared by the real WPF construction below and the
        pure ChartMenuHeaderOrder contract the tests pin. */
-    internal const string CopyImageHeader = "Copy Image";
-    internal const string SaveImageHeader = "Save Image As...";
-    internal const string OpenInNewWindowHeader = "Open in New Window";
-    internal const string RevertHeader = "Revert (or double-click)";
-    internal const string ExportDataToCsvHeader = "Export Data to CSV...";
-    internal const string ShowDataSourceHeader = "Show Data Source";
+    internal const string CopyImageHeader = "_Copy Image";
+    internal const string SaveImageHeader = "_Save Image As...";
+    internal const string OpenInNewWindowHeader = "_Open in New Window";
+    internal const string RevertHeader = "_Revert (or double-click)";
+    internal const string ExportDataToCsvHeader = "_Export Data to CSV...";
+    internal const string ShowDataSourceHeader = "Show _Data Source";
 
     /// <summary>Sentinel for a <see cref="Separator"/> in the pure <see cref="ChartMenuHeaderOrder"/> contract.</summary>
     internal const string MenuSeparatorMarker = "---";
@@ -304,6 +304,13 @@ public partial class ViewerServerTab
                     var seriesName = scatter.LegendText ?? $"Series{seriesIndex}";
                     foreach (var point in scatter.Data.GetScatterPoints())
                     {
+                        /* #1944's gap markers are fabricated mid-gap timestamps with NaN values -
+                           rendering artifacts, never collected data. Exports carry only real rows. */
+                        if (double.IsNaN(point.Y))
+                        {
+                            continue;
+                        }
+
                         sb.AppendLine(FormatChartCsvLine(DateTime.FromOADate(point.X), seriesName, point.Y, sep));
                     }
 

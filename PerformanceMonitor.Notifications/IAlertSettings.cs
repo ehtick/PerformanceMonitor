@@ -68,6 +68,20 @@ public interface IAlertSettings
 
     string GenericWebhookProxyAddress { get; }
 
+    /* PagerDuty webhook — Events API v2. The routing key is a bearer-secret-like opaque token
+       (comparable to the Teams/Slack/Generic webhook URLs), so every app stores it the same way
+       those URLs are stored (Lite/Dashboard: Credential Manager; Darling: a column-REVOKEd
+       control-plane column). No separate enable flag — enabled is derived from a non-empty routing
+       key, matching every existing webhook channel's "no speculative enable flags" rule. */
+    bool   PagerDutyEnabled { get; }
+    string PagerDutyRoutingKey { get; }
+    bool   PagerDutyUseEuRegion { get; }
+
+    /// <summary>Optional proxy for the PagerDuty channel (#1945) - PagerDuty's endpoints are fixed public
+    /// URLs, so a locked-down network that proxies webhook egress needs this like the sibling channels.
+    /// Empty means direct, matching Teams/Slack/Generic.</summary>
+    string PagerDutyProxyAddress { get; }
+
     /* Scheduled-analysis notifications */
     double AnalysisNotifySeverity { get; }
     int    AnalysisNotifyCooldownMinutes { get; }

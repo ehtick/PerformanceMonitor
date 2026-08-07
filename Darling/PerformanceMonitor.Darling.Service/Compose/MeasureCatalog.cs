@@ -320,6 +320,11 @@ public static class MeasureCatalog
         new ComposeDimension("database_size_stats", "file_type_desc", "file_type_desc", Likeable: true),
         new ComposeDimension("database_size_stats", "recovery_model_desc", "recovery_model_desc", Likeable: true),
 
+        new ComposeDimension("pvs_stats", "database_name", "database_name", Likeable: true),
+
+        new ComposeDimension("plan_correction", "database_name", "database_name", Likeable: true),
+        new ComposeDimension("plan_correction", "recommendation_state", "recommendation_state", Likeable: true),
+
         new ComposeDimension("index_object_stats", "database_name", "database_name", Likeable: true),
         new ComposeDimension("index_object_stats", "schema_name", "schema_name", Likeable: true),
         new ComposeDimension("index_object_stats", "table_name", "table_name", Likeable: true),
@@ -460,6 +465,9 @@ public static class MeasureCatalog
     private static readonly string[] ClerkDims = { "clerk_type" };
     private static readonly string[] PlanCacheDims = { "cacheobjtype", "objtype" };
     private static readonly string[] DbSizeDims = { "database_name", "file_name", "file_type_desc", "recovery_model_desc" };
+
+    /* pvs_stats is per DATABASE, not per file, so it carries only the database dimension. */
+    private static readonly string[] PvsDims = { "database_name" };
     private static readonly string[] IndexDims = { "database_name", "schema_name", "table_name", "index_name", "index_type_desc" };
     private static readonly string[] SessionStatsDims = { "program_name" };
     private static readonly string[] WaitingTaskDims = { "wait_type", "database_name" };
@@ -467,6 +475,7 @@ public static class MeasureCatalog
     private static readonly string[] BlockingDims = { "database_name", "contentious_object", "lock_mode" };
     private static readonly string[] DmvBlockingDims = { "database_name", "contentious_object", "lock_mode", "blocking_status" };
     private static readonly string[] DeadlockDims = { "database_name" };
+    private static readonly string[] PlanCorrectionDims = { "database_name", "recommendation_state" };
     private static readonly string[] SysHealthDims = { "event_type" };
     private static readonly string[] DefaultTraceDims = { "event_name", "database_name", "object_name", "login_name" };
     private static readonly string[] RunningJobDims = { "job_name" };
@@ -819,6 +828,33 @@ public static class MeasureCatalog
             DefaultTimeAgg = ComposeAggregate.Max, ValidAggs = GaugeAggs, AllowedDimensions = DbSizeDims,
         },
 
+        /* ── pvs_stats (#1951 ADR persistent version store; Gauge, per database). Sizes are OFF-ROW
+             versions only — MS documents persistent_version_store_size_kb as excluding in-row versions —
+             so the display names say so rather than promising total version space. Max is the default time
+             aggregate for the sizes, matching database_size_stats: a pressure peak inside the bucket is the
+             thing worth seeing, and averaging it away is how a spike disappears at coarse grain. ── */
+        new ComposeMeasure
+        {
+            Key = "pvs_size_mb", DisplayName = "PVS off-row size", Category = CatDatabaseSize, SourceTable = "pvs_stats",
+            Archetype = MeasureArchetype.Gauge, Column = "persistent_version_store_size_mb",
+            NativeUnit = "mb", DefaultUnit = "mb", UnitFamily = FamilyBytes,
+            DefaultTimeAgg = ComposeAggregate.Max, ValidAggs = GaugeAggs, AllowedDimensions = PvsDims,
+        },
+        new ComposeMeasure
+        {
+            Key = "pvs_online_index_size_mb", DisplayName = "PVS online-index version store", Category = CatDatabaseSize, SourceTable = "pvs_stats",
+            Archetype = MeasureArchetype.Gauge, Column = "online_index_version_store_size_mb",
+            NativeUnit = "mb", DefaultUnit = "mb", UnitFamily = FamilyBytes,
+            DefaultTimeAgg = ComposeAggregate.Max, ValidAggs = GaugeAggs, AllowedDimensions = PvsDims,
+        },
+        new ComposeMeasure
+        {
+            Key = "pvs_aborted_transaction_count", DisplayName = "PVS aborted transactions", Category = CatDatabaseSize, SourceTable = "pvs_stats",
+            Archetype = MeasureArchetype.Gauge, Column = "current_aborted_transaction_count",
+            NativeUnit = "count", DefaultUnit = "count", UnitFamily = FamilyCount,
+            DefaultTimeAgg = ComposeAggregate.Max, ValidAggs = GaugeAggs, AllowedDimensions = PvsDims,
+        },
+
         /* ── index_object_stats (daily; sizes + usage as a current-snapshot value — no delta column exists,
              so the cumulative usage counters are exposed as gauges over the daily snapshots) ── */
         new ComposeMeasure
@@ -939,6 +975,20 @@ public static class MeasureCatalog
             Archetype = MeasureArchetype.PerEvent, Column = "deadlock_time",
             NativeUnit = "count", DefaultUnit = "count", UnitFamily = FamilyCount,
             DefaultTimeAgg = ComposeAggregate.Count, ValidAggs = CountOnlyAggs, AllowedDimensions = DeadlockDims,
+        },
+
+        /* ── plan_correction (#2028, per-event, count-only — no numeric per-event column worth charting).
+           HONESTY NOTE: the collector snapshots sys.dm_db_tuning_recommendations on a schedule, so a
+           long-lived recommendation lands one row PER CAPTURE — this counts captures (APC activity
+           observed), not distinct recommendations, and the recommendation_state dimension is what makes
+           it useful (Active vs Success vs Reverted over time). Enablement-only rows (a database with
+           nothing to recommend) are included; they carry a NULL recommendation_state and group apart. */
+        new ComposeMeasure
+        {
+            Key = "plan_correction_captures", DisplayName = "APC recommendation captures", Category = CatQueries, SourceTable = "plan_correction",
+            Archetype = MeasureArchetype.PerEvent, Column = "recommendation_state",
+            NativeUnit = "count", DefaultUnit = "count", UnitFamily = FamilyCount,
+            DefaultTimeAgg = ComposeAggregate.Count, ValidAggs = CountOnlyAggs, AllowedDimensions = PlanCorrectionDims,
         },
 
         /* ── system_health_events (per-event, count-only) ── */

@@ -142,7 +142,7 @@ public partial class QueryStoreHistoryWindow : Window
             var xs = ordered.Select(r => r.CollectionTime.AddMinutes(Services.ServerTimeHelper.UtcOffsetMinutes).ToOADate()).ToArray();
             var ys = ordered.Select(r => GetMetricValue(r, tag)).ToArray();
 
-            var scatter = HistoryChart.Plot.Add.Scatter(xs, ys);
+            var scatter = HistoryChart.Plot.Add.TimeSeries(xs, ys);
             scatter.Color = colors[colorIndex % colors.Length];
             ChartStyle.StyleScatter(scatter);
             var seriesLabel = planGroups.Count > 1 ? $"Plan {planGroup.Key}" : label;
@@ -151,7 +151,9 @@ public partial class QueryStoreHistoryWindow : Window
             colorIndex++;
         }
 
-        HistoryChart.Plot.Axes.DateTimeTicksBottom();
+        /* #1831: the DateChange variant routes labels through the shared formatter, which converts
+           for the display mode — plain DateTimeTicksBottom() rendered raw server time. */
+        HistoryChart.Plot.Axes.DateTimeTicksBottomDateChange();
         if (planGroups.Count > 1)
         {
             _legendPanel = HistoryChart.Plot.ShowLegend(ScottPlot.Edge.Bottom);

@@ -36,6 +36,7 @@ public static class CollectorCatalog
         ServerPropertiesCollector.Instance,
         ServerConfigCollector.Instance,
         DatabaseConfigCollector.Instance,
+        DatabaseStateCollector.Instance,
         TraceFlagsCollector.Instance,
         DatabaseScopedConfigCollector.Instance,
         SessionStatsCollector.Instance,
@@ -59,6 +60,8 @@ public static class CollectorCatalog
         AgentStatusCollector.Instance,
         AgReplicaStatesCollector.Instance,
         AgDatabaseReplicaStatesCollector.Instance,
+        PlanCorrectionCollector.Instance,
+        PvsStatsCollector.Instance,
     };
 
     /// <summary>Name → definition, for the by-name target-gate lookup. Built once from <see cref="All"/>.</summary>

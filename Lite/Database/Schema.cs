@@ -97,6 +97,25 @@ CREATE TABLE IF NOT EXISTS config_edge_trigger_watermarks (
     PRIMARY KEY (server_id, metric_name)
 )";
 
+    /* Per-server collector state that is NOT derivable from the collected rows, so it cannot be a MAX()
+       over the collector's own table the way the event_time / instance_id watermarks are (#1962). Today
+       one collector declares state: default_trace_events stores the trace FILE it read, and compares it
+       next cycle to decide whether it can read just the current rollover file (the 5.0x steady-state
+       saving) or must re-read the whole set because the trace rolled. It has to live here rather than on
+       the payload because the cycles that need it most collect zero rows — a server whose trace churns
+       without producing curated events must still notice the rollover. Keyed (server_id, collector_name,
+       state_key); one short row per collector that declares a key, upserted after every cycle. Darling's
+       twin is collect.collector_state (PgMigrations V44) — same columns, same key. */
+    public const string CreateCollectorStateTable = @"
+CREATE TABLE IF NOT EXISTS collector_state (
+    server_id INTEGER NOT NULL,
+    collector_name VARCHAR NOT NULL,
+    state_key VARCHAR NOT NULL,
+    state_value VARCHAR NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+    PRIMARY KEY (server_id, collector_name, state_key)
+)";
+
     public const string CreateMuteRulesTable = @"
 CREATE TABLE IF NOT EXISTS config_mute_rules (
     id VARCHAR NOT NULL PRIMARY KEY,
@@ -124,6 +143,49 @@ CREATE TABLE IF NOT EXISTS dismissed_archive_alerts (
 CREATE INDEX IF NOT EXISTS idx_dismissed_archive_alerts
 ON dismissed_archive_alerts (alert_time, server_id, metric_name)";
 
+    /* The per-(server, database) expected state the baseline-deviation database-state alert compares
+       the current collected state against. Auto-seeded from first observation (is_user_override =
+       false) and user-editable via the override editor (is_user_override = true); the "(ignore)"
+       sentinel in expected_state opts a database out of the alert entirely. Keyed (server_id,
+       database_name); the Darling twin is config.database_state_expected (PgMigrations V40). */
+    public const string CreateDatabaseStateExpectedTable = @"
+CREATE TABLE IF NOT EXISTS config_database_state_expected (
+    server_id INTEGER NOT NULL,
+    database_name VARCHAR NOT NULL,
+    expected_state VARCHAR NOT NULL,
+    is_user_override BOOLEAN NOT NULL DEFAULT false,
+    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    PRIMARY KEY (server_id, database_name)
+)";
+
+    /* Fleet tags (#2020 2b-i): the user's visual organisation of the server list, the twin of the Darling
+       viewer's config.server_tags tree + config.server_tag_map (PgMigrations V32 + the V50 colour column).
+       server_tags is hierarchical (parent_id null = a root tag) with an optional #RRGGBB colour; server_tag_map
+       is the many-to-many join keyed on the SAME server_id hash the Overview cards use (RemoteCollectorService
+       .GetServerId). Deliberately NO IDENTITY, foreign keys, or expression unique index — DuckDB has none of
+       those the way Postgres does — so ids are assigned in C# and the tree invariants (unique name per parent,
+       cascade-on-delete, cycle + depth caps) are enforced in the tag store and the Manage Tags window, exactly
+       where the Darling viewer already enforces the ones Postgres can't. */
+    public const string CreateServerTagsTable = @"
+CREATE TABLE IF NOT EXISTS server_tags (
+    id INTEGER PRIMARY KEY,
+    name VARCHAR NOT NULL,
+    parent_id INTEGER,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    colour VARCHAR,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+)";
+
+    public const string CreateServerTagMapTable = @"
+CREATE TABLE IF NOT EXISTS server_tag_map (
+    server_id INTEGER NOT NULL,
+    tag_id INTEGER NOT NULL,
+    PRIMARY KEY (server_id, tag_id)
+)";
+
+    public const string CreateServerTagMapIndex =
+        "CREATE INDEX IF NOT EXISTS idx_server_tag_map_tag ON server_tag_map(tag_id)";
+
     /// <summary>
     /// All table creation statements: the hand-written non-collector tables, then the 36 collector
     /// tables generated from <see cref="PerformanceMonitor.Collectors.CollectorCatalog"/> by
@@ -137,8 +199,12 @@ ON dismissed_archive_alerts (alert_time, server_id, metric_name)";
         yield return CreateCollectionLogTable;
         yield return CreateAlertLogTable;
         yield return CreateEdgeTriggerWatermarksTable;
+        yield return CreateCollectorStateTable;
         yield return CreateMuteRulesTable;
         yield return CreateDismissedArchiveAlertsTable;
+        yield return CreateDatabaseStateExpectedTable;
+        yield return CreateServerTagsTable;
+        yield return CreateServerTagMapTable;
 
         foreach (var statement in DuckDbSchemaGenerator.CreateTableStatements())
         {

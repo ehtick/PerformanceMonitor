@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (c) 2026 Erik Darling, Darling Data LLC
  *
  * This file is part of the SQL Server Performance Monitor.
@@ -74,7 +74,11 @@ public sealed class ViewerDataServiceTests
 /// DPAPI entropy) is pinned against the SERVICE's DarlingSecrets/DarlingManagedPostgres here,
 /// because the viewer deliberately duplicates those constants instead of referencing the
 /// service project.
+/// <para>In the <c>darling-config-env</c> collection because the resolution test sets the process-wide
+/// <c>DARLING_CONFIG</c> variable — see <see cref="DarlingConfigEnvironmentCollection"/> for why saving
+/// and restoring it in a <c>finally</c> is not enough on its own.</para>
 /// </summary>
+[Collection("darling-config-env")]
 public sealed class ViewerSettingsTests
 {
     [Fact]
@@ -103,6 +107,9 @@ public sealed class ViewerSettingsTests
                 """;
 
             var settings = ViewerSettings.Parse(json);
+            /* The flag the startup diagnostics report (#1954): the string was DERIVED, so
+               postgres.connectionString in the file is not consulted at all. */
+            Assert.True(settings.Managed);
             var parsed = new NpgsqlConnectionStringBuilder(settings.ConnectionString);
             /* 127.0.0.1, not "localhost" — the viewer half of the managed-Host parity pair with the
                service's DarlingManagedPostgres.BuildConnectionString (darling-network-endpoints). */
@@ -215,6 +222,9 @@ public sealed class ViewerSettingsTests
         var settings = ViewerSettings.Parse(json);
 
         Assert.Equal("Host=localhost;Database=darling", settings.ConnectionString);
+        /* Bring-your-own: the string came out of the file verbatim, which is what the startup
+           diagnostics report as postgres.managed = false (#1954). */
+        Assert.False(settings.Managed);
     }
 
     [Fact]
@@ -457,6 +467,14 @@ public sealed class ViewerSchemaVersionGateTests
     public void MapProbedSchemaVersion_PayloadDimensionsAbsent_CapsAt37() =>
         Assert.Equal(37, ViewerDataService.MapProbedSchemaVersion(true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true));
 
+    /// <summary>The #1839 rung: every sentinel through V39 present but blocking_wait_seconds_threshold absent —
+    /// the probe must report 39, so the gate blocks a V40 viewer until the service migrates. Gating matters
+    /// here because the viewer's Settings window names that column in both its alert-settings SELECT and its
+    /// upsert: against a V39 store the read would fail outright with 42703 rather than degrade.</summary>
+    [Fact]
+    public void MapProbedSchemaVersion_BlockingWaitThresholdAbsent_CapsAt39() =>
+        Assert.Equal(39, ViewerDataService.MapProbedSchemaVersion(true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true));
+
     [Fact]
     public void MapProbedSchemaVersion_V23CompositeIsGatedBehindV22_NotAStandaloneTopArm()
     {
@@ -466,6 +484,55 @@ public sealed class ViewerSchemaVersionGateTests
            proving the composite is gated behind V22 rather than treated as a newest-first arm. */
         Assert.Equal(21, ViewerDataService.MapProbedSchemaVersion(true, true, true, true, true, false, true, false, false, false, false, false, false, false, false, false));
     }
+
+    /// <summary>The #1962 rung: every sentinel through V43 present but collector_state absent — the probe
+    /// must report 43, so a V43 store is correctly seen as one migration behind. This rung is unusual in
+    /// that the viewer never reads collector_state (service-only state, no view, no viewer query), so
+    /// nothing here is about a failing read: it exists so a FULLY-migrated store maps to 44 instead of
+    /// capping at 43, which is what would make the connect-time gate refuse every healthy store.</summary>
+    [Fact]
+    public void MapProbedSchemaVersion_CollectorStateAbsent_CapsAt43() =>
+        Assert.Equal(43, ViewerDataService.MapProbedSchemaVersion(true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true));
+
+    /// <summary>V46 (#1952) rung: plan_correction absent means the store stops at the V44 rung. Unlike the
+    /// V44 arm above, the viewer DOES read this table (the Plan Corrections and Automatic Tuning grids), so a
+    /// store below V46 genuinely cannot serve those reads — the cap is a real gate here, not only a
+    /// don't-under-report guard. Note the permanent V45 gap: 45 is not a rung and never will be (#1951 was
+    /// renumbered to 47), so no store can carry one.</summary>
+    [Fact]
+    public void MapProbedSchemaVersion_PlanCorrectionAbsent_CapsAt44() =>
+        Assert.Equal(44, ViewerDataService.MapProbedSchemaVersion(true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true));
+
+    /// <summary>V47 (#1951) rung: pvs_stats absent means the store stops at the V46 rung. The viewer READS
+    /// this table (the FinOps Version Store grid names it), so a store below V47 would fail 42P01 rather
+    /// than degrade — the cap is a real gate here too.</summary>
+    [Fact]
+    public void MapProbedSchemaVersion_PvsStatsAbsent_CapsAt46() =>
+        Assert.Equal(46, ViewerDataService.MapProbedSchemaVersion(true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true));
+
+    /// <summary>V48 (#1984) rung: every sentinel through V47 present but pvs_enabled absent — the probe
+    /// must report 47, so the gate blocks a V48 viewer until the service migrates. Gating matters for the
+    /// same reason as the V40 rung: the Settings window names all three PVS-pressure columns in its
+    /// alert-settings SELECT and upsert, so against a V47 store the read would fail outright with 42703
+    /// rather than degrade.</summary>
+    [Fact]
+    public void MapProbedSchemaVersion_PvsPressureKnobsAbsent_CapsAt47() =>
+        Assert.Equal(47, ViewerDataService.MapProbedSchemaVersion(true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true));
+
+    /// <summary>V50 (#2008 2a) rung: every sentinel through V49 present but the server_tags.colour column
+    /// absent — the probe must report 49, so a store one migration behind maps to 49 not 50. The viewer names
+    /// the colour column in its tag SELECT, so the cap is a real gate: a V49 store would fail 42703.</summary>
+    [Fact]
+    public void MapProbedSchemaVersion_ServerTagColourAbsent_CapsAt49() =>
+        Assert.Equal(49, ViewerDataService.MapProbedSchemaVersion(true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true));
+
+    /// <summary>V53 (#2068) rung: every sentinel through V52 present but collect.store_metrics absent — the
+    /// probe must report 52, so a store one migration behind maps to 52 not 53. Like the V44 rung the viewer
+    /// never reads this table (the service's own hourly capacity series, surfaced over MCP/REST), so the arm
+    /// is the don't-under-report guard, not a failing-read gate.</summary>
+    [Fact]
+    public void MapProbedSchemaVersion_StoreMetricsAbsent_CapsAt52() =>
+        Assert.Equal(52, ViewerDataService.MapProbedSchemaVersion(true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true));
 
     [Fact]
     public void RequiredStoreSchemaVersion_TracksTheBuildSchemaVersion_AndTheProbeCoversIt()
@@ -479,7 +546,7 @@ public sealed class ViewerSchemaVersionGateTests
            the connect-time gate refuse to open the viewer against a perfectly healthy store. */
         Assert.Equal(
             ViewerDataService.RequiredStoreSchemaVersion,
-            ViewerDataService.MapProbedSchemaVersion(true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true));
+            ViewerDataService.MapProbedSchemaVersion(true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true));
     }
 }
 

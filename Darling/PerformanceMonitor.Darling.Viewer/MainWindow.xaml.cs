@@ -17,6 +17,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
 using PerformanceMonitor.Common;
+using PerformanceMonitor.Darling.Storage;
 using PerformanceMonitor.Notifications;
 using PerformanceMonitor.Ui;
 
@@ -125,6 +126,21 @@ public partial class MainWindow : Window
     /// at the fleet bind site so tiles re-sort deterministically every refresh.</summary>
     private ServerOverviewSortMode _overviewSortMode;
 
+    /// <summary>
+    /// The non-secret configuration block shown on every connection/config failure (#1954): which
+    /// darling.json won and what was parsed from it. Built at startup before the load is attempted (so a
+    /// missing file still reports where the viewer looked) and extended with the parse summary once the file
+    /// loads. Never carries credentials — <see cref="ViewerConfigDiagnostics"/> builds it from an allowlist.
+    /// </summary>
+    private string _connectionDiagnostics = "";
+
+    /// <summary>
+    /// The EFFECTIVE store connection string (post-#1970 certificate anchoring — what Npgsql
+    /// actually opens), kept for the failure overlay's "Run self-test" (#1954 bullet 3). Null until
+    /// config resolves; the button reports that instead of probing nothing.
+    /// </summary>
+    private string? _storeConnectionString;
+
     public MainWindow()
     {
         InitializeComponent();
@@ -166,23 +182,48 @@ public partial class MainWindow : Window
     {
         Loaded -= OnLoaded;
 
+        /* #1954: say WHERE the config came from before trying to read it, so a missing or unparseable
+           darling.json still names the file the viewer looked at and the rule that picked it. Resolving
+           here (rather than inside TryLoad) also means the path we report is provably the path we load —
+           the resolved path is what gets handed to TryLoad as its explicit path. */
+        var configLocation = ViewerSettings.ResolveConfigLocation(ExplicitConfigPathFromArgs());
+        LogDiagnostics(ViewerConfigDiagnostics.DescribeConfigLocation(configLocation));
+        _connectionDiagnostics = ViewerConfigDiagnostics.BuildDetails(
+            configLocation, connectionString: null, managed: false, configLocation.Directory);
+
         ViewerSettings? settings;
         try
         {
-            settings = await Task.Run(() => ViewerSettings.TryLoad(ExplicitConfigPathFromArgs()));
+            settings = await Task.Run(() => ViewerSettings.TryLoad(configLocation.Path));
         }
         catch (Exception ex)
         {
-            ShowMessage($"darling.json could not be read: {ex.Message}");
+            ViewerLogger.Error(ViewerConfigDiagnostics.LogSource, "darling.json could not be read", ex);
+            ShowConnectionFailure($"darling.json could not be read: {ex.Message}");
             return;
         }
 
         if (settings is null)
         {
-            ShowMessage("darling.json not found — copy darling.sample.json from the service and point DARLING_CONFIG at it.");
+            ShowConnectionFailure("darling.json not found — copy darling.sample.json from the service and point DARLING_CONFIG at it.");
             return;
         }
 
+        /* The non-secret parse summary (#1954): host, port, username, database, SSL mode, search path, the
+           resolved certificate path and whether it exists, and whether the string was derived or read
+           verbatim — everything but the credential. This is what separates "it read the wrong file" from
+           "it read the right file and the value in it is wrong".
+           Summarized from the CONFIGURED string plus darling.json's directory, so the certificate is reported
+           as the operator wrote it AND as the anchor resolves it (#1970) — the same two inputs
+           ViewerCertificateAnchor already used to rewrite settings.ConnectionString, so the "resolves to" line
+           is the path Npgsql opens by construction, not by agreement. */
+        var connectionSummary = ViewerConfigDiagnostics.DescribeConnection(
+            settings.ConfiguredConnectionString, settings.Managed, configLocation.Directory);
+        LogDiagnostics(connectionSummary);
+        _connectionDiagnostics = ViewerConfigDiagnostics.BuildDetails(
+            configLocation, settings.ConfiguredConnectionString, settings.Managed, configLocation.Directory);
+
+        _storeConnectionString = settings.ConnectionString;
         _dataService = new ViewerDataService(settings.ConnectionString, _connectionTimeoutSeconds);
 
         try
@@ -200,7 +241,7 @@ public partial class MainWindow : Window
             var storeVersion = await _dataService.GetStoreSchemaVersionAsync();
             if (storeVersion is int version && version < ViewerDataService.RequiredStoreSchemaVersion)
             {
-                ShowMessage(
+                ShowConnectionFailure(
                     $"The Darling store is at schema v{version}, but this viewer needs v{ViewerDataService.RequiredStoreSchemaVersion}. " +
                     "Update or restart the Darling service so it migrates the store, then reopen the viewer.");
                 return;
@@ -215,7 +256,7 @@ public partial class MainWindow : Window
         catch (ViewerStoreUnreachableException ex)
         {
             ViewerLogger.Error("App", "Darling store unreachable", ex);
-            ShowMessage(ex.Message);
+            ShowConnectionFailure(ex.Message);
             return;
         }
         catch (Exception ex)
@@ -223,7 +264,7 @@ public partial class MainWindow : Window
             /* Reachable but the first connection failed for another reason (e.g. authentication, or the
                configured database does not exist) — show it rather than dead-ending on a blank window. */
             ViewerLogger.Error("App", "Darling store connection failed", ex);
-            ShowMessage($"Couldn't connect to the Darling store: {ex.Message}");
+            ShowConnectionFailure($"Couldn't connect to the Darling store: {ex.Message}");
             return;
         }
 
@@ -476,6 +517,9 @@ public partial class MainWindow : Window
             /* Per-server badges: always, independent of the toast master switch. */
             UpdateServerAttention(rows);
 
+            /* The sidebar's muted-bell (#2031): same cadence, its own small read (mute rules, not history). */
+            await UpdateServerSilencedAsync();
+
             /* Tray toasts: only when notifications are enabled and the tray exists. */
             if (_alertsEnabled && _trayService is not null)
             {
@@ -685,6 +729,26 @@ public partial class MainWindow : Window
         await UpdateCollectorHealthTextAsync();
     }
 
+    /// <summary>
+    /// Live server-search box (sidebar). Pushes the term into the fleet projection — the one reserved
+    /// <see cref="FleetView.SetSearch"/> seam, which matches server name AND tag names — then rebinds the
+    /// list and updates the count. Grouping, favourites, and selection all follow the projection, so nothing
+    /// else needs touching. Filtering is a cheap in-memory pass, so running it per keystroke is fine.
+    /// </summary>
+    private void ServerSearchBox_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
+    {
+        _fleet.SetSearch(ServerSearchBox.Text);
+        ServerList.ItemsSource = _fleet.Visible;
+        UpdateServerCountText();
+    }
+
+    /// <summary>The sidebar "Servers: N" label — "N of total" while a search narrows the fleet, plain total
+    /// otherwise. Centralised so the load path and the search path can't drift.</summary>
+    private void UpdateServerCountText() =>
+        ServerCountText.Text = _fleet.IsSearching
+            ? $"Servers: {_fleet.VisibleServerCount} of {_fleet.TotalCount}"
+            : $"Servers: {_fleet.TotalCount}";
+
     private async Task LoadServersAsync(bool preserveSelection = false)
     {
         if (_dataService is null)
@@ -702,7 +766,7 @@ public partial class MainWindow : Window
             var servers = ApplyFavoritesAndSort(await _dataService.GetManagedServersAsync());
             _fleet.SetAll(servers);
             ServerList.ItemsSource = _fleet.Visible;
-            ServerCountText.Text = $"Servers: {_fleet.TotalCount}";
+            UpdateServerCountText();
 
             /* The Recommendations tab has its OWN server selector, synced to the sidebar selection on a
                single-click (SyncAggregateServerSelectors) yet independently changeable while the tab is open.
@@ -755,7 +819,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            ShowMessage($"Cannot read the Darling store: {ex.Message}");
+            ShowConnectionFailure($"Cannot read the Darling store: {ex.Message}");
         }
     }
 
@@ -1031,6 +1095,47 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>Attaches each server's tags as coloured pills to its Overview summary, joining the loaded tag
+    /// list (<c>_tags</c> / <c>_serverTagIds</c>) — the summary carries no tag query of its own. Pills are
+    /// ordered by tag name so a card is stable. No tags anywhere → every card keeps its empty default.</summary>
+    private void StampTagPills(IReadOnlyList<ServerSummaryItem> summaries)
+    {
+        if (_tags.Count == 0 || _serverTagIds.Count == 0)
+        {
+            return;
+        }
+
+        var tagById = _tags.ToDictionary(t => t.Id);
+        foreach (var summary in summaries)
+        {
+            if (!_serverTagIds.TryGetValue(summary.ServerId, out var tagIds) || tagIds.Count == 0)
+            {
+                summary.TagPills = System.Array.Empty<ServerTagPill>();
+                continue;
+            }
+
+            summary.TagPills = tagIds
+                .Select(id => tagById.TryGetValue(id, out var tag) ? tag : null)
+                .Where(t => t is not null)
+                .OrderBy(t => t!.Name, StringComparer.OrdinalIgnoreCase)
+                .Select(t => new ServerTagPill(t!.Name, t!.Colour))
+                .ToList();
+        }
+    }
+
+    /// <summary>Re-stamps tag pills onto the cards the Overview is currently showing (after a tag colour /
+    /// assignment change), reassigning ItemsSource so the change renders without a full per-server reload.
+    /// A no-op unless the Overview is populated.</summary>
+    private void RestampOverviewTagPills()
+    {
+        if (OverviewItemsControl.ItemsSource is IEnumerable<ServerSummaryItem> items)
+        {
+            var list = items.ToList();
+            StampTagPills(list);
+            OverviewItemsControl.ItemsSource = list;
+        }
+    }
+
     /// <summary>
     /// Loads a summary card for every registered server (Lite's RefreshOverviewAsync), reading each
     /// server's latest metrics concurrently over the pooled data source. Status is derived from
@@ -1078,8 +1183,11 @@ public partial class MainWindow : Window
             }
         }));
 
+        var built = summaries.OfType<ServerSummaryItem>().ToList();
+        StampTagPills(built);
+
         var cards = ServerOverviewSort.Order(
-            summaries.OfType<ServerSummaryItem>().ToList(),
+            built,
             _overviewSortMode,
             s => s.CpuPercentForAlert, s => s.DisplayName, s => s.ServerId);
         OverviewItemsControl.ItemsSource = cards;
@@ -1482,11 +1590,110 @@ public partial class MainWindow : Window
         Topmost = false;
     }
 
-    private void ShowMessage(string message)
+    /// <summary>
+    /// The full-window message state. <paramref name="details"/> is the non-secret configuration block
+    /// (#1954) rendered under the message; pass null only for a message that genuinely has no configuration
+    /// context. Every connection/config failure goes through <see cref="ShowConnectionFailure"/> instead —
+    /// pinned by <c>ViewerConfigDiagnosticsTests</c>, so a new failure branch cannot quietly ship without it.
+    /// </summary>
+    private void ShowMessage(string message, string? details)
     {
         MessageText.Text = message;
+        MessageDetailsText.Text = details ?? "";
+        MessageDetailsPanel.Visibility = string.IsNullOrWhiteSpace(details) ? Visibility.Collapsed : Visibility.Visible;
         MessageOverlay.Visibility = Visibility.Visible;
         StatusText.Text = "";
+    }
+
+    /// <summary>
+    /// A connection or configuration failure: the message, plus the diagnostics that say which darling.json
+    /// the viewer read and what it parsed out of it (#1954). The operator sees it in the window, so
+    /// diagnosing "wrong file" vs "right file, wrong value" needs no log hunt at all; the log gets it too,
+    /// flushed immediately because a stuck viewer is usually killed before the 5-second timer fires.
+    /// </summary>
+    private void ShowConnectionFailure(string message)
+    {
+        ViewerLogger.Error(ViewerConfigDiagnostics.LogSource, message);
+        ViewerLogger.Flush();
+        ShowMessage(message, _connectionDiagnostics);
+    }
+
+    /// <summary>Writes one diagnostic line per entry under the shared config tag, so an operator can grep one source.</summary>
+    private static void LogDiagnostics(IReadOnlyList<string> lines)
+    {
+        foreach (var line in lines)
+        {
+            ViewerLogger.Info(ViewerConfigDiagnostics.LogSource, line);
+        }
+    }
+
+    /// <summary>
+    /// The layered store-connection self-test (#1954 bullet 3): DNS → TCP → TLS → auth → schema
+    /// gate, against the SAME effective connection string the failed connect used, so the operator
+    /// learns WHICH layer failed instead of re-reading one collapsed Npgsql message. The report
+    /// appends under the configuration block (a re-run replaces the previous report rather than
+    /// stacking) and goes to the log, flushed — the same treatment the failure itself gets. The
+    /// probe core is shared and never throws; the catch here is a UI-thread belt-and-braces.
+    /// </summary>
+    private async void OnRunSelfTestClick(object sender, RoutedEventArgs e)
+    {
+        if (string.IsNullOrWhiteSpace(_storeConnectionString))
+        {
+            /* No connection string means config never resolved (e.g. darling.json missing) — there
+               is nothing to probe, and the overlay message already says what to fix. */
+            ViewerLogger.Warn(ViewerConfigDiagnostics.LogSource,
+                "Self-test requested, but no store connection string resolved — fix the configuration first.");
+            return;
+        }
+
+        RunSelfTestButton.IsEnabled = false;
+        var originalContent = RunSelfTestButton.Content;
+        RunSelfTestButton.Content = "Testing…";
+        try
+        {
+            var results = await StoreConnectionSelfTest.RunAsync(_storeConnectionString);
+            var report = StoreConnectionSelfTest.FormatReport(results);
+
+            foreach (var line in report.Split('\n'))
+            {
+                ViewerLogger.Info(ViewerConfigDiagnostics.LogSource, line.TrimEnd());
+            }
+
+            ViewerLogger.Flush();
+
+            /* Splice over a previous run's report (the header is the core's public seam), keep
+               whatever configuration block was already showing above it. */
+            var current = MessageDetailsText.Text ?? "";
+            var previousReport = current.IndexOf(StoreConnectionSelfTest.ReportHeader, StringComparison.Ordinal);
+            var baseText = (previousReport >= 0 ? current[..previousReport] : current).TrimEnd();
+            MessageDetailsText.Text = baseText.Length == 0
+                ? report
+                : baseText + Environment.NewLine + Environment.NewLine + report;
+            MessageDetailsPanel.Visibility = Visibility.Visible;
+        }
+        catch (Exception ex)
+        {
+            ViewerLogger.Error(ViewerConfigDiagnostics.LogSource, "Connection self-test failed to run", ex);
+        }
+        finally
+        {
+            RunSelfTestButton.Content = originalContent;
+            RunSelfTestButton.IsEnabled = true;
+        }
+    }
+
+    /// <summary>Copies the failure message plus the configuration block, so a bug report carries both.</summary>
+    private void OnCopyDiagnosticsClick(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            Clipboard.SetText(string.Join(Environment.NewLine + Environment.NewLine, MessageText.Text, MessageDetailsText.Text));
+        }
+        catch (Exception ex)
+        {
+            /* Another process can hold the clipboard open; a failed copy must not take the window down. */
+            ViewerLogger.Warn(ViewerConfigDiagnostics.LogSource, $"Copying the diagnostics failed: {ex.Message}");
+        }
     }
 
     private async void OnClosed(object? sender, EventArgs e)

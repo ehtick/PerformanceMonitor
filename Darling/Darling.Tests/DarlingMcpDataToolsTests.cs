@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (c) 2026 Erik Darling, Darling Data LLC
  *
  * This file is part of the SQL Server Performance Monitor.
@@ -243,7 +243,10 @@ public sealed class DarlingMcpDataToolsSurfaceAndSqlTests
 
         Assert.Contains("SUM(delta_worker_time)", sql, StringComparison.Ordinal);
         Assert.Contains("SUM(delta_elapsed_time)", sql, StringComparison.Ordinal);
-        Assert.Contains("GROUP BY database_name, query_hash", sql, StringComparison.Ordinal);
+        /* #2012 stage 2: host_object_name joins the key (INSERT...EXEC callers split; NULL ad-hoc
+           hosts still collapse) and pins the LATERAL to the group's own rows. */
+        Assert.Contains("GROUP BY database_name, query_hash, host_object_name", sql, StringComparison.Ordinal);
+        Assert.Contains("host_object_name IS NOT DISTINCT FROM r.host_object_name", sql, StringComparison.Ordinal);
         Assert.Contains("$5::text IS NULL OR database_name = $5", sql, StringComparison.Ordinal); /* optional db filter */
         Assert.Contains("NOT LIKE 'WAITFOR%'", sql, StringComparison.Ordinal);          /* over-fetch + trim */
         Assert.Contains("LIMIT $4", sql, StringComparison.Ordinal);
@@ -270,6 +273,23 @@ public sealed class DarlingMcpDataToolsSurfaceAndSqlTests
         Assert.Contains("GROUP BY database_name, query_id, plan_id, query_hash, replica_role", sql, StringComparison.Ordinal);
         Assert.Contains("$5::text IS NULL OR database_name = $5", sql, StringComparison.Ordinal);
         Assert.Contains("SUM(execution_count)", sql, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void QueryStoreSql_DedupsPerIntervalBeforeAggregating()
+    {
+        /* #1841. query_store_stats rows are CUMULATIVE per-interval snapshots and the collector re-fetches
+           the OPEN interval every cycle, so SUM(execution_count) over the raw rows reports 10 + 25 + 40
+           for an interval that reached 40, and the AVG(avg_*) columns become an avg-of-avgs weighted by
+           re-collection frequency. This surface feeds BOTH the MCP tool and the REST route, so inflated
+           numbers would reach an agent's reasoning as readily as the web dashboard. replica_role is in the
+           key because the aggregate GROUPs BY it — the dedup must never drop a row the read must return. */
+        var sql = DarlingDataReader.QueryStoreTopSql;
+        Assert.Contains(
+            "PARTITION BY database_name, query_id, plan_id, runtime_stats_interval_id, first_execution_time, execution_type_desc, replica_role",
+            sql, StringComparison.Ordinal);
+        Assert.Contains("ORDER BY collection_time DESC", sql, StringComparison.Ordinal);
+        Assert.Contains("WHERE rn = 1", sql, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -515,6 +535,7 @@ public sealed class DarlingMcpDataToolsLivePostgresTests
 
         await using var postgres = NpgsqlDataSource.Create(cs!);
 
+        var bodySucceeded = false;
         try
         {
             await RegisterServerAsync(connection, ct);
@@ -573,10 +594,13 @@ public sealed class DarlingMcpDataToolsLivePostgresTests
             /* ---- an EMPTY store for a tool returns the #1224 miss, not a throw. */
             await DeleteRowsAsync(connection, ct, keepServer: true);
             Assert.Equal("unavailable", StatusOf(await DarlingMcpDataTools.GetCpuUtilization(postgres, ServerName)));
+
+            bodySucceeded = true;
         }
         finally
         {
-            await DeleteRowsAsync(connection, ct);
+            await LiveStoreCleanup.RunAsync(cs!, bodySucceeded, async (cleanup, cleanupCt) =>
+                await DeleteRowsAsync(cleanup, cleanupCt));
         }
     }
 

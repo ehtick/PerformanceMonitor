@@ -45,6 +45,9 @@ internal static class AlertSeverity
         _ => metricName switch
         {
             "Blocking Detected" => ("#D97706", "ALERT", "\U0001F7E0"),
+            // #1839 total-blocked-wait gate — same tier as the count gate it sits beside; without an arm
+            // here it would render INFO-blue in email and webhooks (the #1136 fall-through).
+            "Blocking Wait Time" => ("#D97706", "ALERT", "\U0001F7E0"),
             "Deadlocks Detected" => ("#DC2626", "ALERT", "\U0001F534"),
             // Blocking/deadlock capture is broken — emailed/webhooked, and fired as an Error toast,
             // so it must not render INFO-blue like an unmapped metric (mirrors the #1136 gap fix).
@@ -56,6 +59,11 @@ internal static class AlertSeverity
             "Long-Running Job" => ("#D97706", "WARNING", "\U0001F7E0"),
             // Emailed/webhooked and fired as a Warning toast — was falling through to INFO-blue.
             "Failed Agent Job" => ("#D97706", "WARNING", "\U0001F7E0"),
+            // Database state deviated from its baseline/expected state. Always fired with an explicit
+            // severity override (WARNING, or CRITICAL for SUSPECT/RECOVERY_PENDING/EMERGENCY — see
+            // DatabaseStateTokens.SeverityFor), so this arm only styles the override-less alert-history
+            // replay; default it to WARNING-amber rather than the INFO-blue fall-through (#1136 gap).
+            "Database State" => ("#D97706", "WARNING", "\U0001F7E0"),
             "Volume Free Space" => ("#D97706", "WARNING", "\U0001F7E0"),
             "Server Unreachable" => ("#DC2626", "CRITICAL", "\U0001F534"),
             "Server Restored" => ("#16A34A", "RESOLVED", "\U0001F7E2"),
@@ -63,6 +71,17 @@ internal static class AlertSeverity
             // so its arm here is load-bearing (green/RESOLVED, matching "Server Restored"). The other four pass
             // an explicit override at the fire site and reach this map only via a renderer that has none — an
             // alert-history replay — which is exactly the INFO-blue fall-through the #1136 gap fix was about.
+            /* #2090 (gotqn): the next batch of #1136 fall-throughs — every one of these fires with an
+               explicit severity at its site (now plumbed through AlertOutcome.Severity by the deliverer),
+               so these arms exist for the renderer that has no context: alert-history replays. All six
+               self-alerts fire Critical at their sites; PVS deliberately ships without a severity tier
+               (#1984), so its replay arm is WARNING-amber like Database State. */
+            "Collection Stopped" => ("#DC2626", "CRITICAL", "\U0001F534"),
+            "Agent Not Running" => ("#DC2626", "CRITICAL", "\U0001F534"),
+            "Store Disk Pressure" => ("#DC2626", "CRITICAL", "\U0001F534"),
+            "Store Runtime Upgrade" => ("#DC2626", "CRITICAL", "\U0001F534"),
+            "Compression Job Stuck" => ("#DC2626", "CRITICAL", "\U0001F534"),
+            "Version Store (PVS)" => ("#D97706", "WARNING", "\U0001F7E0"),
             "AG Failover" => ("#D97706", "WARNING", "\U0001F7E0"),
             "AG Replica Disconnected" => ("#DC2626", "CRITICAL", "\U0001F534"),
             "AG Replica Reconnected" => ("#16A34A", "RESOLVED", "\U0001F7E2"),

@@ -430,7 +430,7 @@ public sealed class DarlingMcpDataTools
 
     /* ═══════════════════════════ query performance ═══════════════════════════ */
 
-    [McpServerTool(Name = "get_top_queries_by_cpu"), Description("Gets expensive queries from sys.dm_exec_query_stats (plan cache). Best for: currently cached queries with detailed per-execution stats, DOP, spills, and query_hash for trending. Returns query_hash, query_plan_hash, sql_handle, plan_handle. Supports database and parallelism filtering.")]
+    [McpServerTool(Name = "get_top_queries_by_cpu"), Description("Gets expensive queries from sys.dm_exec_query_stats (plan cache). Best for: currently cached queries with detailed per-execution stats, DOP, spills, and query_hash for trending. Returns query_hash, query_plan_hash, sql_handle, plan_handle, and host_object (the hosting procedure/function for proc-hosted statements, null for ad-hoc) — groups key on (database, query_hash, host_object), so INSERT...EXEC callers in different procedures report separately with their own text. distinct_texts counts statement texts merged into a group (>1 = ad-hoc literal variants or pre-upgrade history; query_text is one representative, 0 means only rows predating the text dimension). Supports database and parallelism filtering.")]
     public static async Task<string> GetTopQueriesByCpu(
         NpgsqlDataSource postgres,
         [Description("Server name or display name.")] string? server_name = null,
@@ -484,7 +484,19 @@ public sealed class DarlingMcpDataTools
                 total_rows = r.TotalRows,
                 total_spills = r.TotalSpills,
                 avg_reads = r.TotalExecutions > 0 ? (double)r.TotalLogicalReads / r.TotalExecutions : 0,
-                query_text = McpHelpers.Truncate(r.QueryText, 2000)
+                // #2012 stage 2: the statement's host object joins the GROUPING key, so proc-hosted
+                // INSERT...EXEC callers sharing a hash now land in separate, correctly-labeled rows;
+                // null = ad-hoc/prepared text (literal-collapse behavior unchanged). History rows
+                // predating the column read as null and age out with raw retention.
+                host_object = r.HostObjectName,
+                query_text = McpHelpers.Truncate(r.QueryText, 2000),
+                // #2012 stage 1's disclosure, now the residual: with proc-hosted callers split by
+                // host_object, distinct_texts > 1 marks ad-hoc literal blends (or pre-stage-2
+                // history where the split can't apply yet).
+                distinct_texts = r.DistinctTexts,
+                text_note = r.DistinctTexts > 1
+                    ? $"this group blends {r.DistinctTexts} distinct statement texts (ad-hoc literal variants; or history predating the host-object split for INSERT...EXEC callers); query_text is one representative"
+                    : null
             });
 
             return JsonSerializer.Serialize(new
@@ -663,7 +675,7 @@ public sealed class DarlingMcpDataTools
         }
     }
 
-    [McpServerTool(Name = "get_collection_health"), Description("Shows the health status of all data collectors for a server — whether they're running successfully, failing, or stale. Check this before investigating data to ensure collectors are working properly.")]
+    [McpServerTool(Name = "get_collection_health"), Description("Shows the health status of all data collectors for a server — whether they're running successfully, failing, or stale. Check this before investigating data to ensure collectors are working properly. Each row also carries last_note/note_count: what a NON-failing run reported, e.g. an enumeration that came back with 0 items. note_count equal to total_runs means the collector has been collecting nothing all window — not a fault (the target may be legitimately empty), but the reason a HEALTHY collector can still have no data. target_has_user_databases tells those two apart: true means the target DID have user databases in the same window, so an all-window empty enumeration is worth investigating (a login that cannot enter them, an exclusion filter that matched everything); false means either no user databases or no inventory to go on.")]
     public static async Task<string> GetCollectionHealth(
         NpgsqlDataSource postgres,
         [Description("Server name or display name.")] string? server_name = null)
@@ -689,7 +701,22 @@ public sealed class DarlingMcpDataTools
                 failure_rate_pct = Math.Round(r.FailureRatePercent, 1),
                 avg_duration_ms = Math.Round(r.AvgDurationMs, 0),
                 last_success = r.LastSuccessTime?.ToString("o"),
-                last_error = r.LastError
+                last_error = r.LastError,
+                /* #1837: what a NON-failing run reported — an enumeration that came back with 0 items,
+                   items whose enumeration probe failed. note_count == total_runs means every run in the
+                   window came back that way, which is the "collecting nothing for weeks" case that reads
+                   as HEALTHY (correctly — an empty target is not a fault) and needs saying out loud. */
+                last_note = r.LastNote,
+                note_count = r.NoteCount,
+                /* #1852: whether the store saw user databases on this target in the same window. The
+                   fact that separates "nothing to collect" from "collecting nothing" — a caller
+                   diagnosing an empty collector gets it as a boolean instead of parsing it out of the
+                   sentence below. False also means "no inventory to go on", never "no databases". */
+                target_has_user_databases = r.TargetHasUserDatabases,
+                /* The same string both WPF grids render, composed on this side so the web dashboard and
+                   any other consumer cannot re-derive it differently. */
+                note_summary = CollectorHealthClassifier.FormatCollectionNote(
+                    r.LastNote, r.NoteCount, r.TotalRuns, r.CollectorName, r.TargetHasUserDatabases)
             });
 
             return JsonSerializer.Serialize(new

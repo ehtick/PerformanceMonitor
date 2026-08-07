@@ -8,7 +8,7 @@
     <AssemblyName>PerformanceMonitorLite</AssemblyName>
     <RootNamespace>PerformanceMonitorLite</RootNamespace>
     <Product>SQL Server Performance Monitor Lite</Product>
-    <Version>3.3.0</Version>
+    <Version>3.4.0</Version>
     <AssemblyVersion>3.3.0.0</AssemblyVersion>
     <FileVersion>3.3.0.0</FileVersion>
     <InformationalVersion>3.3.0</InformationalVersion>
@@ -50,8 +50,8 @@
 
   <ItemGroup>
     <!-- DuckDB for local data storage -->
-    <PackageReference Include="DuckDB.NET.Data" Version="1.5.3" />
-    <PackageReference Include="DuckDB.NET.Bindings.Full" Version="1.5.3" />
+    <PackageReference Include="DuckDB.NET.Data" Version="1.5.5" />
+    <PackageReference Include="DuckDB.NET.Bindings.Full" Version="1.5.5" />
 
     <!-- SQL Server connectivity -->
     <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.2" />
@@ -73,8 +73,8 @@
     <PackageReference Include="Hardcodet.NotifyIcon.Wpf" Version="2.0.1" />
 
     <!-- MCP server for LLM tool access -->
-    <PackageReference Include="ModelContextProtocol" Version="1.4.1" />
-    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="1.4.1" />
+    <PackageReference Include="ModelContextProtocol" Version="2.0.0" />
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.0.0" />
     <PackageReference Include="Velopack" Version="1.2.0" />
   </ItemGroup>
 

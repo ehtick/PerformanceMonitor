@@ -46,15 +46,26 @@ public sealed class DarlingAlertSettings : IAlertEngineSettings, IAlertSettings
     public bool LowDiskEnabled => _config.Alerts.LowDiskEnabled;
     public bool LongRunningJobEnabled => _config.Alerts.LongRunningJobEnabled;
     public bool FailedJobEnabled => _config.Alerts.FailedJobEnabled;
+    public bool PvsEnabled => _config.Alerts.PvsEnabled;
+    public bool DatabaseStateEnabled => _config.Alerts.DatabaseStateEnabled;
 
     public int CpuThresholdPercent => _config.Alerts.CpuThresholdPercent;
     public int BlockingCountThreshold => _config.Alerts.BlockingCountThreshold;
+
+    /* #1839: floored at 0 (= off) so a negative in darling.json or the store can't make the
+       "is it above threshold" test true for every snapshot. */
+    public int BlockingWaitSecondsThreshold => Math.Max(0, _config.Alerts.BlockingWaitSecondsThreshold);
     public int DeadlockCountThreshold => _config.Alerts.DeadlockCountThreshold;
     public int PoisonWaitThresholdMs => _config.Alerts.PoisonWaitThresholdMs;
     public int LongRunningQueryThresholdMinutes => _config.Alerts.LongRunningQueryThresholdMinutes;
     public int TempDbSpaceThresholdPercent => _config.Alerts.TempDbSpaceThresholdPercent;
     public int LowDiskThresholdPercent => Math.Clamp(_config.Alerts.LowDiskThresholdPercent, 0, 100);
     public int LowDiskThresholdGb => Math.Max(0, _config.Alerts.LowDiskThresholdGb);
+
+    /* #1984: percent clamped like low-disk's (0 = off); the GB floor merely floored at 0 — unlike
+       the percent it has no meaningful upper bound. */
+    public int PvsThresholdPercent => Math.Clamp(_config.Alerts.PvsThresholdPercent, 0, 100);
+    public int PvsFloorGb => Math.Max(0, _config.Alerts.PvsFloorGb);
     public int LongRunningJobMultiplier => _config.Alerts.LongRunningJobMultiplier;
     public int FailedJobLookbackMinutes => Math.Clamp(_config.Alerts.FailedJobLookbackMinutes, 1, 1440);
     public int CooldownMinutes => Math.Clamp(_config.Alerts.CooldownMinutes, 1, 120);
@@ -141,24 +152,32 @@ public sealed class DarlingAlertSettings : IAlertEngineSettings, IAlertSettings
     public string SmtpRecipients => _config.Smtp.To;
 
     /// <summary>
-    /// DPAPI-decrypts smtp.encryptedPassword (the --encrypt-password pattern); null when unset.
-    /// Called inside EmailSendCore's send try/catch, so a decrypt failure surfaces as that
-    /// alert's send_error rather than killing the sweep.
+    /// The SMTP password: smtp.encryptedPassword (DPAPI, Windows, preferred) else smtp.password — a
+    /// literal or an <c>env:</c>/<c>file:</c> reference (#1804), the only non-Windows email path; null
+    /// when neither is set. Called inside EmailSendCore's send try/catch, so a decrypt/dereference
+    /// failure surfaces as that alert's send_error rather than killing the sweep.
     /// </summary>
     public string? GetSmtpPassword()
     {
         var blob = _config.Smtp.EncryptedPassword;
-        if (string.IsNullOrWhiteSpace(blob))
+        if (!string.IsNullOrWhiteSpace(blob))
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                throw new PlatformNotSupportedException(
+                    "smtp.encryptedPassword requires Windows (DPAPI); use smtp.password with an env:/file: reference on other platforms.");
+            }
+
+            return DarlingSecrets.Unprotect(blob);
+        }
+
+        var password = _config.Smtp.Password;
+        if (string.IsNullOrWhiteSpace(password))
         {
             return null;
         }
 
-        if (!OperatingSystem.IsWindows())
-        {
-            throw new PlatformNotSupportedException("smtp.encryptedPassword requires Windows (DPAPI).");
-        }
-
-        return DarlingSecrets.Unprotect(blob);
+        return DarlingSecretSource.Resolve(password, "smtp.password");
     }
 
     public int EmailCooldownMinutes => Math.Clamp(_config.Smtp.EmailCooldownMinutes, 1, 120);
@@ -178,6 +197,12 @@ public sealed class DarlingAlertSettings : IAlertEngineSettings, IAlertSettings
     public string GenericWebhookHeadersJson => _config.Webhooks.GenericHeaders;
     public string GenericWebhookBodyTemplate => _config.Webhooks.GenericBodyTemplate;
     public string GenericWebhookProxyAddress => _config.Webhooks.GenericProxy;
+
+    /* PagerDuty webhook — enabled by a non-empty routing key, like the sibling channels. */
+    public bool PagerDutyEnabled => !string.IsNullOrWhiteSpace(_config.Webhooks.PagerDutyRoutingKey);
+    public string PagerDutyRoutingKey => _config.Webhooks.PagerDutyRoutingKey;
+    public bool PagerDutyUseEuRegion => _config.Webhooks.PagerDutyUseEuRegion;
+    public string PagerDutyProxyAddress => _config.Webhooks.PagerDutyProxy;
 
     /* Scheduled-analysis notifications (AN3): the shared AnalysisNotificationService's severity floor
        + per-finding re-notify cooldown. The severity floor is now a control-plane knob (config Stage

@@ -122,22 +122,44 @@ public sealed class DarlingMcpHostService : BackgroundService
     /// </summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        DarlingConfig config;
-        try
-        {
-            config = DarlingConfig.Load();
-        }
-        catch (Exception ex)
-        {
-            /* The worker logs the missing/broken config as critical; without a file config there is no
-               bind/network/store definition to serve with, so the MCP host stands down entirely. */
-            _logger.LogDebug("MCP server not started (configuration unavailable): {Message}", ex.Message);
-            return;
-        }
-
+        /* Config load lives INSIDE the supervisor loop, on the failed-start backoff (#2038) — the web host's
+           twin fix. A front-loaded Load() failure used to stand this host down for the process LIFETIME at
+           Debug level, so one transient darling.json read failure at boot silently killed MCP until the next
+           manual restart. Once loaded, the config is held for the process lifetime exactly as before (the
+           network exposure block is restart-only by design). */
+        DarlingConfig? config = null;
         var lastFailedStartUtc = DateTime.MinValue;
         while (!stoppingToken.IsCancellationRequested)
         {
+            if (config is null && DateTime.UtcNow - lastFailedStartUtc >= FailedStartBackoff)
+            {
+                try
+                {
+                    config = DarlingConfig.Load();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        "MCP server configuration could not be loaded ({Message}) — retrying in {Backoff}s. The worker logs a missing/broken config as critical; a transient read failure self-heals here.",
+                        ex.Message, (int)FailedStartBackoff.TotalSeconds);
+                    lastFailedStartUtc = DateTime.UtcNow;
+                }
+            }
+
+            if (config is null)
+            {
+                try
+                {
+                    await Task.Delay(SupervisorPollInterval, stoppingToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+
+                continue;
+            }
+
             var published = _state.Read();
             var enabled = published?.Enabled ?? config.Mcp.Enabled;
             var desiredPort = published?.Port ?? config.Mcp.Port;
@@ -422,6 +444,18 @@ public sealed class DarlingMcpHostService : BackgroundService
                    get_database_sizes — the same names Lite and the Dashboard expose, over Darling's Postgres
                    store (STORED reads, no live hit). Result shapes follow Lite where the two SKUs diverge. */
                 .WithGeminiCompatibleTools<DarlingMcpBlockingTools>()
+                /* #2028 get_plan_corrections — automatic plan correction activity + per-database
+                   FORCE_LAST_GOOD_PLAN enablement, the one collected table that previously had no
+                   agent-readable path at all. Twin registered in Lite's host. */
+                .WithGeminiCompatibleTools<DarlingMcpPlanCorrectionTools>()
+                /* #2029 get_pvs_stats — the ADR persistent version store, previously reachable only
+                   indirectly (alert knobs + compose measures). Twin registered in Lite's host. */
+                .WithGeminiCompatibleTools<DarlingMcpPvsTools>()
+                /* #2068 get_store_metrics — the monitoring store's OWN hourly self-metrics series
+                   (per-hypertable size/compression, payload-dimension sizes + row counts, whole-store
+                   size + enabled-server count) for capacity forecasting. Darling-only: a single-server
+                   edition has no central store to measure, so no Lite twin. */
+                .WithGeminiCompatibleTools<DarlingMcpStoreMetricsTools>()
                 /* #1496 get_long_query_completions — the opt-in long-query completion trace (rpc/batch over
                    the duration threshold + attentions), over Darling's Postgres store (STORED read). */
                 .WithGeminiCompatibleTools<DarlingMcpLongQueryTools>()
@@ -642,7 +676,7 @@ public sealed class DarlingMcpHostService : BackgroundService
     /// LADDER itself (exposed classifier, managed gate, listen/token/allowFrom validation, family match) now
     /// lives ONCE in <see cref="DarlingHostBinding"/>; this method's contract is byte-for-byte what it was.
     /// </summary>
-    internal static McpBindDecision ResolveMcpBind(McpConfig mcp, bool managed)
+    internal static McpBindDecision ResolveMcpBind(McpConfig mcp, bool managed, bool? inContainer = null)
     {
         var network = mcp.Network;
         var decision = DarlingHostBinding.ResolveBind(
@@ -651,7 +685,9 @@ public sealed class DarlingMcpHostService : BackgroundService
             tokenPresent: network is not null
                 && (!string.IsNullOrWhiteSpace(network.EncryptedToken) || !string.IsNullOrWhiteSpace(network.Token)),
             networkConfigured: network is { IsConfigured: true },
-            managed: managed);
+            managed: managed,
+            /* #1804: tests pass this explicitly; the running host takes the ambient container marker. */
+            inContainer: inContainer ?? DarlingHostBinding.IsRunningInContainer);
 
         /* The nested McpBind* enums mirror DarlingHostBinding's BindMode/BindReason 1:1 (same member order,
            pinned equal by DarlingHostBindingTests), so a numeric cast maps them without a per-value switch. */
@@ -771,8 +807,8 @@ public sealed class DarlingMcpHostService : BackgroundService
 
             case McpBindReason.ManagedModeRequired:
                 _logger.Log(level.Value,
-                    "mcp.network.* is set but postgres.managed = false — MCP network exposure is managed-mode only and is " +
-                    "ignored; your own PostgreSQL/reverse proxy governs BYO exposure. Binding loopback-only.");
+                    "mcp.network.* is set but postgres.managed = false — MCP network exposure is managed-mode (or container, #1804) " +
+                    "only and is ignored; your own PostgreSQL/reverse proxy governs uncontained BYO exposure. Binding loopback-only.");
                 break;
 
             default:

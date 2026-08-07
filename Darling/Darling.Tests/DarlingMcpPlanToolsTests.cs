@@ -152,14 +152,17 @@ public sealed class DarlingMcpPlanToolsSurfaceAndSqlTests
     public void QueryStatsPlanSql_ReadsStoredXml_KeyedByHash_OptionalDatabase_LatestNonNull()
     {
         var sql = DarlingStoredPlanReader.QueryStatsPlanXmlByHashSql;
-        Assert.Contains("SELECT query_plan_xml", sql, StringComparison.Ordinal);
+        /* Both content forms (#2069): plans written since V54 are gzip bytes with the text NULL. */
+        Assert.Contains("SELECT query_plan_xml, query_plan_gz", sql, StringComparison.Ordinal);
         /* The RESOLVING view, not the base table (#1767): query_stats.query_plan_xml is NULL on every row
            written since the migration. Reading the base table would return NULL rather than error. */
         Assert.Contains("FROM v_query_stats", sql, StringComparison.Ordinal);
         Assert.Contains("WHERE server_id = $1", sql, StringComparison.Ordinal);
         Assert.Contains("query_hash = $2", sql, StringComparison.Ordinal);                    /* the Dashboard's key */
         Assert.Contains("$3::text IS NULL OR database_name = $3", sql, StringComparison.Ordinal); /* optional database refinement */
-        Assert.Contains("query_plan_xml IS NOT NULL", sql, StringComparison.Ordinal);         /* skip rows the collector left NULL */
+        /* The presence guard must accept EITHER form — on the text column alone it discards every
+           post-V54 plan silently (zero rows, no error), the #1767 bare-column regression re-run. */
+        Assert.Contains("(query_plan_xml IS NOT NULL OR query_plan_gz IS NOT NULL)", sql, StringComparison.Ordinal);
         Assert.Contains("ORDER BY collection_time DESC", sql, StringComparison.Ordinal);      /* most-recent plan for the key */
         Assert.Contains("LIMIT 1", sql, StringComparison.Ordinal);
     }
@@ -171,7 +174,7 @@ public sealed class DarlingMcpPlanToolsSurfaceAndSqlTests
 
         /* No v_procedure_stats exists to resolve the #1767 plan dimension, so this read joins query_plan_dim
            itself — the same shape as the viewer's ProcedureStatsPlanXmlSql twin. */
-        Assert.Contains("SELECT COALESCE(ps.query_plan_xml, qpd.query_plan_xml)", sql, StringComparison.Ordinal);
+        Assert.Contains("SELECT COALESCE(ps.query_plan_xml, qpd.query_plan_xml), qpd.query_plan_gz", sql, StringComparison.Ordinal);
         Assert.Contains("FROM procedure_stats AS ps", sql, StringComparison.Ordinal);
         Assert.DoesNotContain("v_procedure_stats", sql, StringComparison.Ordinal);            /* that view has never existed */
         Assert.Contains("LEFT JOIN query_plan_dim AS qpd", sql, StringComparison.Ordinal);
@@ -182,7 +185,7 @@ public sealed class DarlingMcpPlanToolsSurfaceAndSqlTests
         /* THE regression to guard: the presence filter must ride the COALESCED expression. On the bare
            inline column it discards every row written since #1767 before the join can resolve it — zero
            rows, no error, reads exactly like "no plan captured". */
-        Assert.Contains("AND   COALESCE(ps.query_plan_xml, qpd.query_plan_xml) IS NOT NULL", sql, StringComparison.Ordinal);
+        Assert.Contains("AND   (COALESCE(ps.query_plan_xml, qpd.query_plan_xml) IS NOT NULL OR qpd.query_plan_gz IS NOT NULL)", sql, StringComparison.Ordinal);
         Assert.DoesNotContain("AND   ps.query_plan_xml IS NOT NULL", sql, StringComparison.Ordinal);
 
         Assert.Contains("ORDER BY ps.collection_time DESC", sql, StringComparison.Ordinal);
@@ -426,10 +429,11 @@ public sealed class DarlingMcpPlanToolsLivePostgresTests
         using var connection = new NpgsqlConnection(cs);
         await connection.OpenAsync(ct);
         await PgMigrations.MigrateAsync(connection, ct);
-        await DeleteRowsAsync(connection);
+        await DeleteRowsAsync(connection, ct);
 
         await using var postgres = NpgsqlDataSource.Create(cs!);
 
+        var bodySucceeded = false;
         try
         {
             await RegisterServerAsync(connection);
@@ -492,10 +496,13 @@ public sealed class DarlingMcpPlanToolsLivePostgresTests
             /* ---- server resolution flows through the tool: an unknown name returns the listing error. */
             var unknown = await DarlingMcpPlanTools.AnalyzeQueryPlan(postgres, QueryHash, "darling-mcp-no-such-server");
             Assert.StartsWith("Could not resolve server.", unknown, StringComparison.Ordinal);
+
+            bodySucceeded = true;
         }
         finally
         {
-            await DeleteRowsAsync(connection);
+            await LiveStoreCleanup.RunAsync(cs!, bodySucceeded, async (cleanup, cleanupCt) =>
+                await DeleteRowsAsync(cleanup, cleanupCt));
         }
     }
 
@@ -594,13 +601,13 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", connection);
     private static DateTime TruncateToSeconds(DateTime value) =>
         DateTime.SpecifyKind(new DateTime(value.Ticks - (value.Ticks % TimeSpan.TicksPerSecond)), DateTimeKind.Unspecified);
 
-    private static async Task DeleteRowsAsync(NpgsqlConnection connection)
+    private static async Task DeleteRowsAsync(NpgsqlConnection connection, System.Threading.CancellationToken ct)
     {
         using var cleanup = new NpgsqlCommand(
             $"DELETE FROM query_stats WHERE server_id = {ServerId}; " +
             $"DELETE FROM procedure_stats WHERE server_id = {ServerId}; " +
             $"DELETE FROM query_store_stats WHERE server_id = {ServerId}; " +
             $"DELETE FROM servers WHERE server_id = {ServerId};", connection);
-        await cleanup.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
+        await cleanup.ExecuteNonQueryAsync(ct);
     }
 }

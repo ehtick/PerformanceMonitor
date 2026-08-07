@@ -181,6 +181,17 @@ public partial class MainWindow : Window
             var archiveService = new ArchiveService(_databaseInitializer, App.ArchiveDirectory, new AppLoggerAdapter<ArchiveService>());
             var retentionService = new RetentionService(App.ArchiveDirectory, new AppLoggerAdapter<RetentionService>());
 
+            /* #1912 one-time Query Store repair: collapse the split slices stored by pre-#1907 builds, in the
+               hot table and in the parquet archive. Runs ONCE per store, records a marker, and never throws —
+               a store that cannot be repaired must still start, and the next launch retries. Fired here rather
+               than awaited inline so a large archive rewrite cannot hold the window closed; it takes the same
+               read lock every other store operation does, so it serializes with collection rather than racing
+               it. Automatic by design: gating it behind a button would leave the users least equipped to find
+               it holding wrong numbers permanently (v39 / #1832 precedent). */
+            var sliceRepair = new QueryStoreSliceRepairService(
+                _databaseInitializer, App.ArchiveDirectory, new AppLoggerAdapter<QueryStoreSliceRepairService>());
+            _ = Task.Run(() => sliceRepair.RepairOnStartupAsync());
+
             // Routes high-severity analysis findings to email/Slack/Teams; the background
             // service runs scheduled analysis and hands findings to it.
             /* serverId resolver: Lite uses the finding's stable int id as a string (Plan E E3c). */
@@ -217,14 +228,11 @@ public partial class MainWindow : Window
             /* #1812: the adapter's snapshot-freshness bound needs the server's EFFECTIVE running_jobs
                cadence. The adapter keys servers by the deterministic int hash; ScheduleManager keys by
                the connection GUID — the same hash-match FetchFailedJobsForAlertAsync already does. */
-            _alertReadAdapter = new LiteAlertReadAdapter(_dataService, serverId =>
-            {
-                var server = _serverManager.GetAllServers().FirstOrDefault(s =>
-                    RemoteCollectorService.GetDeterministicHashCode(RemoteCollectorService.GetServerNameForStorage(s)) == serverId);
-                return server is null
-                    ? 0
-                    : _scheduleManager.GetScheduleForServer(server.Id, "running_jobs")?.FrequencyMinutes ?? 0;
-            });
+            _alertReadAdapter = new LiteAlertReadAdapter(
+                _dataService,
+                serverId => ResolveCollectorCadenceForAlerts(serverId, "running_jobs"),
+                /* #1839: the same resolution for the blocking snapshot the total-wait gate reads. */
+                serverId => ResolveCollectorCadenceForAlerts(serverId, "dmv_blocking_snapshot"));
 
             /* Phase-5 forwarding: construct the shared alert engine once, over Lite's five seam
                implementations — live App.* thresholds, the DuckDB read adapter, the DuckDB
@@ -331,6 +339,7 @@ public partial class MainWindow : Window
                     Dispatcher.Invoke(() =>
                     {
                         Title = $"Performance Monitor Lite — Update v{newVersion.TargetFullRelease.Version} available (Help > About)";
+                        AnnounceUpdate($"v{newVersion.TargetFullRelease.Version}");
                     });
                     return;
                 }
@@ -347,6 +356,7 @@ public partial class MainWindow : Window
                 Dispatcher.Invoke(() =>
                 {
                     Title = $"Performance Monitor Lite — Update {result.LatestVersion} available (Help > About)";
+                    AnnounceUpdate(result.LatestVersion);
                 });
             }
         }
@@ -354,6 +364,21 @@ public partial class MainWindow : Window
         {
             // Never crash on update check failure
         }
+    }
+
+    /// <summary>
+    /// One tray balloon per session when an update is found. The title-bar suffix was the only signal,
+    /// and a title bar nobody reads is how installs stayed on old builds — or got upgraded by re-running
+    /// Setup.exe, which used to delete the data directory (#1832). Help &gt; About does it safely and in
+    /// place. The update check itself runs once per launch, so no extra suppression is needed.
+    /// </summary>
+    private void AnnounceUpdate(string? version)
+    {
+        _trayService?.ShowNotification(
+            "Update Available",
+            $"Performance Monitor Lite {version} is available. Open Help > About to install it — that updates in "
+                + "place and keeps your data.",
+            Hardcodet.Wpf.TaskbarNotification.BalloonIcon.Info);
     }
 
     private bool _closingCleanupStarted;
@@ -504,7 +529,16 @@ public partial class MainWindow : Window
                 && server.IsOnline == true
                 && _collectorService.GetHealthSummary(server).ErroringCollectors > 0;
         }
-        ServerListView.ItemsSource = servers;
+        /* #2031: stamp the muted-bell state on each connection before the sidebar binds, so a silenced
+           server shows the bell on first render, not only after the first poll tick. */
+        RefreshSilencedIndicators();
+
+        /* #2020 2b-i-b: the sidebar now binds the FleetView projection (group headers + servers), not the
+           flat ServerConnection list. SetAll takes the whole fleet (favourites-first from ServerManager);
+           ApplyFleetTagsAndRebind folds in the last-loaded tags, binds Visible, and restores selection. */
+        var previousServerId = (ServerListView.SelectedItem as FleetServerRow)?.Server.ServerId;
+        _fleet.SetAll(servers.Select(ToFleetServer).ToList());
+        ApplyFleetTagsAndRebind(previousServerId);
 
         // Update UI based on server count
         if (servers.Count == 0 && _openServerTabs.Count == 0)
@@ -638,6 +672,11 @@ public partial class MainWindow : Window
         OverviewSortToolbar.Visibility = servers.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
         if (servers.Count == 0) return;
 
+        await LoadServerTagsAsync();
+        /* #2020 2b-i-b: fold the freshly-loaded tags into the sidebar tree — the flat SetAll in
+           RefreshServerList runs before tags are known on the very first load. */
+        ApplyFleetTagsAndRebind((ServerListView.SelectedItem as FleetServerRow)?.Server.ServerId);
+
         try
         {
             var summaries = new List<ServerSummaryItem>();
@@ -650,6 +689,7 @@ public partial class MainWindow : Window
                     if (summary != null)
                     {
                         summary.ServerName = server.ServerName;
+                        summary.IsSilenced = _alertStateService.IsServerSilenced(server.Id);
                         var connStatus = _serverManager.GetConnectionStatus(server.Id);
                         summary.IsOnline = connStatus.IsOnline;
                         if (_collectorService != null && connStatus.IsOnline == true)
@@ -663,12 +703,13 @@ public partial class MainWindow : Window
                 }
             }
 
-            var sorted = ServerOverviewSort.Order(
-                summaries, App.OverviewSortMode,
-                s => s.CpuPercentForAlert, s => s.DisplayName, s => s.ServerId);
-            OverviewItemsControl.ItemsSource = sorted;
+            StampTagPills(summaries);
+            _overviewSummaries = summaries;
+            ApplyOverviewView();
 
-            foreach (var summary in sorted)
+            /* Alerts run over the WHOLE fleet, never the filtered view — a search box narrowing what's on
+               screen must not silence alerts for the servers it hides. */
+            foreach (var summary in summaries)
             {
                 CheckPerformanceAlerts(summary);
             }
@@ -681,7 +722,9 @@ public partial class MainWindow : Window
 
     private void ServerListView_MouseDoubleClick(object sender, MouseButtonEventArgs e)
     {
-        if (ServerListView.SelectedItem is ServerConnection server)
+        /* Only a server row connects; a header row's double-click is a no-op (a single click already
+           toggles its expand/collapse via SelectionChanged). */
+        if (ServerListView.SelectedItem is FleetServerRow row && row.Server.Connection is { } server)
         {
             ConnectToServer(server);
         }
@@ -732,9 +775,99 @@ public partial class MainWindow : Window
             App.OverviewSortMode = mode;
             App.WriteSetting("overview sort",
                 root => root["overview_sort_mode"] = ServerOverviewSort.ToToken(mode));
-            if (OverviewItemsControl.ItemsSource is IEnumerable<ServerSummaryItem> items)
-                OverviewItemsControl.ItemsSource = ServerOverviewSort.Order(
-                    items, mode, s => s.CpuPercentForAlert, s => s.DisplayName, s => s.ServerId);
+            ApplyOverviewView();
+        }
+    }
+
+    /// <summary>The unfiltered Overview summaries, held so the sort and search controls can recompose the
+    /// view off the full fleet without a store round-trip (<see cref="RefreshOverviewAsync"/> refills it).</summary>
+    private List<ServerSummaryItem> _overviewSummaries = new();
+
+    /// <summary>Live name filter over the Overview cards. Re-composes the view; the search itself is a cheap
+    /// in-memory pass, so running it per keystroke is fine.</summary>
+    private void OverviewSearchBox_TextChanged(object sender, TextChangedEventArgs e) => ApplyOverviewView();
+
+    /// <summary>Projects <see cref="_overviewSummaries"/> to the cards: filter by the search box (name AND tag
+    /// names), then sort by the current mode. The single place both controls funnel through, so filter and
+    /// sort always compose the same way regardless of which the user touched last.</summary>
+    private void ApplyOverviewView()
+    {
+        var filtered = _overviewSummaries
+            .Where(s => ServerOverviewFilter.Matches(OverviewSearchBox?.Text, SearchFields(s)))
+            .ToList();
+
+        OverviewItemsControl.ItemsSource = ServerOverviewSort.Order(
+            filtered, App.OverviewSortMode,
+            s => s.CpuPercentForAlert, s => s.DisplayName, s => s.ServerId);
+    }
+
+    /// <summary>The fields a search term matches against for a card: its display and instance names, plus each
+    /// of its tag names — so typing "prod" finds both <c>sql-prod-01</c> and every server tagged Production,
+    /// the same rule the viewer's sidebar uses.</summary>
+    private static string?[] SearchFields(ServerSummaryItem s)
+    {
+        var fields = new List<string?> { s.DisplayName, s.ServerName };
+        fields.AddRange(s.TagPills.Select(p => p.Name));
+        return fields.ToArray();
+    }
+
+    // ── Tags on the Overview (#2020 2b-i) ─────────────────────────────────────────────────────────────
+
+    private List<ServerTag> _tags = new();
+
+    /// <summary>serverId → the set of tag ids assigned to it, for pill stamping and tag-name search.</summary>
+    private Dictionary<int, HashSet<int>> _serverTagIds = new();
+
+    /// <summary>Loads the fleet tags + assignments into memory (for the Overview pills and tag search). Cheap
+    /// — a couple of small reads — so it runs each Overview refresh to stay current with edits.</summary>
+    private async Task LoadServerTagsAsync()
+    {
+        if (_dataService == null) return;
+
+        try
+        {
+            _tags = await _dataService.GetServerTagsAsync();
+            var assignments = await _dataService.GetServerTagAssignmentsAsync();
+
+            var map = new Dictionary<int, HashSet<int>>();
+            foreach (var a in assignments)
+            {
+                if (!map.TryGetValue(a.ServerId, out var set))
+                {
+                    set = new HashSet<int>();
+                    map[a.ServerId] = set;
+                }
+                set.Add(a.TagId);
+            }
+            _serverTagIds = map;
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Info("Tags", $"Failed to load fleet tags: {ex.Message}");
+        }
+    }
+
+    /// <summary>Attaches each server's tags (as coloured pills) to its Overview summary, joining the loaded tag
+    /// list. Ordered by tag name so a card is stable; a server with no tags keeps its empty default.</summary>
+    private void StampTagPills(IReadOnlyList<ServerSummaryItem> summaries)
+    {
+        if (_tags.Count == 0 || _serverTagIds.Count == 0) return;
+
+        var tagById = _tags.ToDictionary(t => t.Id);
+        foreach (var summary in summaries)
+        {
+            if (!_serverTagIds.TryGetValue(summary.ServerId, out var tagIds) || tagIds.Count == 0)
+            {
+                summary.TagPills = Array.Empty<ServerTagPill>();
+                continue;
+            }
+
+            summary.TagPills = tagIds
+                .Select(id => tagById.TryGetValue(id, out var tag) ? tag : null)
+                .Where(t => t is not null)
+                .OrderBy(t => t!.Name, StringComparer.OrdinalIgnoreCase)
+                .Select(t => new ServerTagPill(t!.Name, t!.Colour))
+                .ToList();
         }
     }
 
@@ -896,7 +1029,7 @@ public partial class MainWindow : Window
 
         var acknowledgeItem = new MenuItem
         {
-            Header = "Acknowledge Alert",
+            Header = "_Acknowledge Alert",
             Tag = serverId,
             Icon = new TextBlock { Text = "✓", FontWeight = FontWeights.Bold }
         };
@@ -904,7 +1037,7 @@ public partial class MainWindow : Window
 
         var silenceItem = new MenuItem
         {
-            Header = "Silence This Server",
+            Header = "_Silence This Server",
             Tag = serverId,
             Icon = new TextBlock { Text = "🔇" }
         };
@@ -912,7 +1045,7 @@ public partial class MainWindow : Window
 
         var unsilenceItem = new MenuItem
         {
-            Header = "Unsilence",
+            Header = "_Unsilence",
             Tag = serverId,
             Icon = new TextBlock { Text = "🔔" }
         };
@@ -1091,6 +1224,9 @@ public partial class MainWindow : Window
 
             /* Hide the badge for this server (same loop as the acknowledge path). */
             HideServerBadge(serverId);
+
+            /* #2031: flip the sidebar's muted-bell immediately — the poll would catch up anyway. */
+            RefreshSilencedIndicators();
         }
     }
 
@@ -1101,6 +1237,9 @@ public partial class MainWindow : Window
             _alertStateService.UnsilenceServer(serverId);
 
             /* The next refresh cycle will show the badge if there are alerts */
+
+            /* #2031: clear the sidebar's muted-bell immediately. */
+            RefreshSilencedIndicators();
         }
     }
 
@@ -1176,7 +1315,10 @@ public partial class MainWindow : Window
 
     private void ManageServersButton_Click(object sender, RoutedEventArgs e)
     {
-        var window = new ManageServersWindow(_serverManager, _profileManager) { Owner = this };
+        /* #2033: hand this door the SAME per-server deep cleanup the sidebar Remove runs (health, AG edge
+           state, tag assignments), so the two delete paths cannot drift. The ClearHealthExcept sweep below
+           stays as the belt for anything else that changed while the dialog was open. */
+        var window = new ManageServersWindow(_serverManager, _profileManager, ForgetServerRuntimeStateAsync) { Owner = this };
         window.ShowDialog();
 
         if (window.ServersChanged)
@@ -1192,6 +1334,23 @@ public partial class MainWindow : Window
             }
 
             RefreshServerList();
+        }
+    }
+
+    private async void ManageTagsButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_dataService == null)
+        {
+            return;
+        }
+
+        var dialog = new PerformanceMonitorLite.Windows.ManageTagsWindow(
+            _dataService, _serverManager.GetAllServers()) { Owner = this };
+        dialog.ShowDialog();
+
+        if (dialog.ChangedAny)
+        {
+            await RefreshOverviewAsync();
         }
     }
 
@@ -1465,7 +1624,8 @@ public partial class MainWindow : Window
         if (sender is not MenuItem menuItem) return null;
         var contextMenu = menuItem.Parent as ContextMenu;
         var border = contextMenu?.PlacementTarget as FrameworkElement;
-        return border?.DataContext as ServerConnection;
+        /* #2020 2b-i-b: the sidebar row's DataContext is now a FleetServerRow, not a ServerConnection. */
+        return (border?.DataContext as FleetServerRow)?.Server.Connection;
     }
 
     private void ServerContextMenu_Connect_Click(object sender, RoutedEventArgs e)
@@ -1502,7 +1662,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private void ServerContextMenu_Remove_Click(object sender, RoutedEventArgs e)
+    private async void ServerContextMenu_Remove_Click(object sender, RoutedEventArgs e)
     {
         var server = GetServerFromContextMenu(sender);
         if (server == null) return;
@@ -1516,16 +1676,37 @@ public partial class MainWindow : Window
         if (result == MessageBoxResult.Yes)
         {
             CloseServerTab(server.Id);
-            var removedServerId = RemoteCollectorService.GetDeterministicHashCode(
-                RemoteCollectorService.GetServerNameForStorage(server));
-            _collectorService?.ClearHealthForServer(removedServerId);
-            /* #1696: drop this server's AG edge state, or a remove-then-re-add would compare the new first
-               sighting against the OLD role and page a phantom failover. The storage name hashes
-               deterministically, so a re-added server really does get the same id back. */
-            _agAlertEvaluator.Forget(removedServerId);
+            await ForgetServerRuntimeStateAsync(server);
             _serverManager.DeleteServer(server.Id);
             RefreshServerList();
             StatusText.Text = $"Removed server: {server.DisplayNameWithIntent}";
+        }
+    }
+
+    /// <summary>
+    /// The ONE deep-cleanup for a server leaving monitoring (#2033) — every piece of per-server runtime
+    /// state keyed on the deterministic storage-name hash, which a removed-then-re-added server gets BACK:
+    /// collection health, AG edge state (#1696 — stale role state pages a phantom failover on re-add), and
+    /// tag assignments (#2020 — stale rows silently resurrect the old tags). Both delete doors call this —
+    /// the sidebar context menu's Remove and Manage Servers' Delete — so the two paths cannot drift again;
+    /// before this, Manage Servers deleted the registry entry and left all three behind.
+    /// </summary>
+    private async Task ForgetServerRuntimeStateAsync(ServerConnection server)
+    {
+        var removedServerId = RemoteCollectorService.GetDeterministicHashCode(
+            RemoteCollectorService.GetServerNameForStorage(server));
+        _collectorService?.ClearHealthForServer(removedServerId);
+        _agAlertEvaluator.Forget(removedServerId);
+        if (_dataService != null)
+        {
+            try
+            {
+                await _dataService.ClearServerTagsForServerAsync(removedServerId);
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Info("Tags", $"Failed to clear tags for removed server: {ex.Message}");
+            }
         }
     }
 
@@ -1571,10 +1752,42 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>Flips each server's muted-bell (#2031) from the persisted whole-server silence set, so a
+    /// silenced server shows the bell right of its status dot instead of looking healthy-quiet. In-memory
+    /// lookup (no store read); rides the 30-second status poll and every list refresh, and is nudged directly
+    /// by the Silence/Unsilence handlers so the bell flips instantly. The Lite twin of the Viewer's
+    /// UpdateServerSilencedAsync, keyed on the ServerConnection GUID (what AlertStateService stores).</summary>
+    private void RefreshSilencedIndicators()
+    {
+        var overviewChanged = false;
+        foreach (var server in _serverManager.GetAllServers())
+        {
+            var silenced = _alertStateService.IsServerSilenced(server.Id);
+            server.SetSilenced(silenced);
+
+            /* Keep the Overview card's bell in step (matched by server name). Only a real flip triggers a
+               rebind, so a quiet 30-second poll never churns the Overview or resets its scroll position. */
+            foreach (var summary in _overviewSummaries)
+            {
+                if (summary.ServerName == server.ServerName && summary.IsSilenced != silenced)
+                {
+                    summary.IsSilenced = silenced;
+                    overviewChanged = true;
+                }
+            }
+        }
+
+        if (overviewChanged)
+        {
+            ApplyOverviewView();
+        }
+    }
+
     private void CheckConnectionsAndNotify()
     {
         try
         {
+            RefreshSilencedIndicators();
             var servers = _serverManager.GetAllServers();
             bool needsRefresh = false;
             foreach (var server in servers)

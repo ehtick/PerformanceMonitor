@@ -23,8 +23,14 @@ using PerformanceMonitor.Darling.Storage;
 
 namespace PerformanceMonitor.Darling.Service;
 
-/// <summary>Per-run outcome the worker logs (mirrors Lite's fetch/store phase split, #1180).</summary>
-public sealed record CollectorRunResult(int Rows, long SqlMs, long StorageMs);
+/// <summary>
+/// Per-run outcome the worker logs (mirrors Lite's fetch/store phase split, #1180). <paramref name="Note"/>
+/// annotates a run that SUCCEEDED but is worth explaining on its collection_log row — today only the
+/// empty-enumeration case (see <see cref="EnumeratedCollectorDriver.EmptyEnumerationMessage"/>). It is the
+/// Darling twin of Lite's <c>_lastCollectionNote</c>; null (the default) leaves the row's message column
+/// null exactly as before.
+/// </summary>
+public sealed record CollectorRunResult(int Rows, long SqlMs, long StorageMs, string? Note = null);
 
 /// <summary>
 /// Runs a shared collector definition against one monitored server and binary-COPYs the rows
@@ -122,6 +128,13 @@ public sealed class DarlingCollectorRunner
             && watermark is null
             && await HasPriorCollectorSuccessAsync(server.ServerId, definition.Name, cancellationToken);
 
+        /* Per-server state the definition declared keys for — the watermark's sibling for facts no MAX()
+           over the collected rows can produce (default_trace_events' last-seen trace FILE, #1962). No
+           declared keys (every other collector) means no query runs. Mirrors Lite. */
+        var collectorState = definition.StateKeys.Count == 0
+            ? null
+            : await GetCollectorStateAsync(server.ServerId, definition.Name, cancellationToken);
+
         var context = new CollectorContext
         {
             ServerId = server.ServerId,
@@ -132,6 +145,7 @@ public sealed class DarlingCollectorRunner
             Watermark = watermark,
             NumericWatermark = numericWatermark,
             HasCollectedBefore = hasCollectedBefore,
+            State = collectorState ?? CollectorContext.NoState,
             IgnoredWaitTypes = IgnoredWaitDefaults.All,
             ExcludedDatabases = server.Config.ExcludedDatabases?.ToArray() ?? Array.Empty<string>(),
             PerfmonCounterOverride = null,
@@ -146,6 +160,11 @@ public sealed class DarlingCollectorRunner
         long sqlMs = 0;
         long storageMs = 0;
         var rowsWritten = 0;
+
+        /* The collection_log note for this run (#1837) — null on every ordinary path. Only the enumeration
+           branch sets it, but it is declared here so the note reaches the single success return below when
+           items WERE found and merely some of their probes failed. Lite's twin is _lastCollectionNote. */
+        string? collectionNote = null;
 
         if (definition.RunsPerDatabase(context.Target))
         {
@@ -173,6 +192,11 @@ public sealed class DarlingCollectorRunner
             var failed = 0;
             Exception? firstFailure = null;
 
+            /* #1875: this path reads the trailing probe-failure set once PER DATABASE, so the note and the
+               log cap are decided for the cycle after the loop rather than inside it — see
+               CycleProbeFailures for why neither generalizes from the single-read plain path. */
+            var cycleProbeFailures = new CycleProbeFailures();
+
             /* One pooled store connection for the whole body; one binary COPY per database on it
                (completing an importer commits that database — commit-1..N-1 semantics on abort). */
             await using var pgConnection = await _postgres.OpenConnectionAsync(cancellationToken);
@@ -191,13 +215,42 @@ public sealed class DarlingCollectorRunner
                     if (dbPlan is null)
                     {
                         /* Null (no rows for this database yet) falls back to the definition's
-                           documented first-run window, per database. This is the XE ring-buffer path
-                           (deadlocks / BPR), NOT query_store — no 24h clamp here (those sources roll
-                           past 24h on their own; the clamp is scoped to query_store's enumeration path). */
+                           documented first-run window, per database. No clamp is applied HERE because
+                           this branch also serves the XE ring-buffer collectors (deadlocks / BPR),
+                           where flooring a stale watermark would WRONGLY truncate legitimate catch-up
+                           — those sources roll past 24h on their own. query_store also reaches this
+                           branch on Azure SQL DB (#1836) and does need the bound, so it applies
+                           WatermarkPolicy.ClampCatchup inside its own cutoff computation: the clamp
+                           travels with the collector that needs it instead of with the path. */
                         context.Watermark = await GetLastCollectedTimeForDatabaseAsync(
                             server.ServerId, definition.TargetTable, definition.WatermarkColumn!,
                             definition.PerDatabaseWatermarkColumn!, databaseName, cancellationToken);
                         dbPlan = definition.BuildQuery(context);
+
+                        /* The definition clamped its own cutoff — surface the same WARNING the
+                           enumeration path emits, so the bounded history hole stays LOGGED and does
+                           not become the one silent hole in a policy whose whole premise is that it
+                           is visible. Mirrors Lite. */
+                        if (context.CatchupClampApplied)
+                        {
+                            _logger?.LogWarning(
+                                "{Collector} on '{Server}' database [{Database}] catch-up clamped to {Hours}h (stored watermark {Raw:o} is older) — a bounded, logged history hole.",
+                                definition.Name, server.Config.DisplayName, databaseName, WatermarkPolicy.MaxCatchup.TotalHours, context.Watermark);
+
+                            /* #2058 (the Azure arm of #2022's hole recording): context.Watermark still
+                               holds the RAW value here — the definition clamped only its own cutoff
+                               parameter — so the hole is (raw, re-derived clamp floor), same merge
+                               semantics as the enumerated site. Only query_store both clamps AND has a
+                               backfill worker; the name guard keeps the XE collectors that share this
+                               branch from growing backfill state they have no worker for. */
+                            if (context.Watermark.HasValue
+                                && string.Equals(definition.Name, QueryStoreCollector.Instance.Name, StringComparison.Ordinal)
+                                && WatermarkPolicy.ClampCatchup(context.Watermark, collectionTime) is DateTime azureClampedFloor)
+                            {
+                                await RecordQueryStoreBackfillHoleAsync(
+                                    server.ServerId, databaseName, context.Watermark.Value, azureClampedFloor, cancellationToken);
+                            }
+                        }
                     }
 
                     var sqlSlice = Stopwatch.StartNew();
@@ -207,6 +260,18 @@ public sealed class DarlingCollectorRunner
                     using (var dbReader = await dbCommand.ExecuteReaderAsync(cancellationToken))
                     {
                         batch = await definition.ReadAsync(dbReader, context, cancellationToken);
+
+                        /* #1875: the payload path's probe-failure contract, on the path that used to
+                           ignore it. blocked_process_report is the declaring collector that also runs per
+                           database (Azure SQL DB, #1535), so before this its batch produced the trailing
+                           set and the loop simply never advanced the reader to it — the rows were built
+                           and dropped. Read HERE, still inside the reader and inside the per-database
+                           try, so a diagnostics fault stays a one-database skip like any other. */
+                        if (definition.EmitsProbeFailures)
+                        {
+                            cycleProbeFailures.Add(
+                                await EnumeratedCollectorDriver.ReadPayloadProbeFailuresAsync(dbReader, cancellationToken));
+                        }
                     }
                     sqlMs += sqlSlice.ElapsedMilliseconds;
 
@@ -216,6 +281,25 @@ public sealed class DarlingCollectorRunner
                         var storageSlice = Stopwatch.StartNew();
                         rowsWritten += await WriteBatchAsync(pgConnection, definition, batch, server, collectionTime, context, cancellationToken);
                         storageMs += storageSlice.ElapsedMilliseconds;
+                    }
+
+                    /* Same per-database bounded-cycle WARNING the enumeration path emits from
+                       onItemComplete, mirroring Lite. Reachable here since #1836 put query_store — the
+                       only collector that declares either bound — on this branch for Azure SQL DB;
+                       without it a database whose cycle was cut at the bound would look like a clean
+                       collection. Since #1960 a bound DEFERS the backlog to the next cycle's resume
+                       from the shipped boundary rather than dropping it — this log is how a long
+                       catch-up stays observable. Read after the flush, as on the other path: the
+                       context signal stays this database's until the next read resets it. */
+                    var capHit = definition.PerItemRowCountWarnThreshold is int cap && batch.Count >= cap;
+                    if (capHit || context.PerItemTextBudgetExceeded)
+                    {
+                        _logger?.LogWarning(
+                            "{Collector} on '{Server}' database [{Database}] hit its per-database collection bound ({Reason}) — shipped {ShippedMB:F1}MB up to {Boundary}; the backlog resumes from that boundary next cycle.",
+                            definition.Name, server.Config.DisplayName, databaseName,
+                            capHit ? $"row cap {definition.PerItemRowCountWarnThreshold}" : "text byte budget",
+                            context.PerItemTextBytesShipped / (1024.0 * 1024.0),
+                            context.PerItemShippedBoundary?.ToString("o") ?? "n/a");
                     }
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException and not OutOfMemoryException)
@@ -229,6 +313,12 @@ public sealed class DarlingCollectorRunner
             }
 
             context.CurrentDatabaseName = null;
+
+            /* #1875: ONE note for the cycle and ONE capped log burst, composed from every database's
+               failures together. Assigned unconditionally — a cycle where nothing failed composes null,
+               which is exactly what this path carried before. */
+            collectionNote = cycleProbeFailures.Note;
+            LogEnumerationProbeFailures(definition, server, cycleProbeFailures.Failures);
 
             /* One database failing is routine (offline, mid-restore, a permissions oddity) and stays a
                debug-logged skip. EVERY database failing is a systemic fault — before this check the run
@@ -255,20 +345,28 @@ public sealed class DarlingCollectorRunner
                    run one query per item ON THE SAME CONNECTION; an item that fails is skipped
                    with a warning, matching Lite. */
                 var listSlice = Stopwatch.StartNew();
-                var items = new List<string>();
+                EnumerationOutcome enumeration;
                 using (var enumerationCommand = CreateCollectorCommand(enumerationPlan, sqlConnection, CommandTimeoutSeconds))
                 using (var enumerationReader = await enumerationCommand.ExecuteReaderAsync(cancellationToken))
                 {
-                    while (await enumerationReader.ReadAsync(cancellationToken))
-                    {
-                        items.Add(enumerationReader.GetString(0));
-                    }
+                    /* Shared read (#1837): the item list, then the OPTIONAL second result set of items the
+                       enumeration could not probe. Both hosts route through it so the item read, the
+                       failure read, and the note wording cannot drift. */
+                    enumeration = await EnumeratedCollectorDriver.ReadEnumerationAsync(enumerationReader, cancellationToken);
                 }
                 sqlMs += listSlice.ElapsedMilliseconds;
 
+                var items = enumeration.Items;
+                collectionNote = enumeration.Note;
+                LogEnumerationProbeFailures(definition, server, enumeration.ProbeFailures);
+
                 if (items.Count == 0)
                 {
-                    return new CollectorRunResult(0, sqlMs, 0);
+                    /* Nothing failed outright, so this stays SUCCESS/0 rows — but the note (the
+                       empty-enumeration breadcrumb, the probe-failure summary, or both) rides onto the
+                       collection_log row so it is distinguishable from a healthy collector whose databases
+                       were simply quiet (#1837). Mirrors Lite's _lastCollectionNote. */
+                    return new CollectorRunResult(0, sqlMs, 0, enumeration.Note);
                 }
 
                 /* Optional quick scalar probe (query_store's live PRODUCTVERSION check) —
@@ -319,6 +417,18 @@ public sealed class DarlingCollectorRunner
                                 _logger?.LogWarning(
                                     "{Collector} on '{Server}' database [{Database}] catch-up clamped to {Hours}h (stored watermark {Raw:o} is older) — a bounded, logged history hole.",
                                     definition.Name, server.Config.DisplayName, item, WatermarkPolicy.MaxCatchup.TotalHours, raw.Value);
+
+                                /* #2022: the clamp opens a hole (raw, clamped) the live path will never
+                                   revisit — its next cutoff IS the clamped floor. Record it for the
+                                   backfill worker, merged wider with any hole already pending for this
+                                   database. Only query_store reaches this lambda today; the name guard
+                                   keeps a future enumeration collector from inheriting backfill state
+                                   it has no worker for. */
+                                if (clamped.HasValue
+                                    && string.Equals(definition.Name, QueryStoreCollector.Instance.Name, StringComparison.Ordinal))
+                                {
+                                    await RecordQueryStoreBackfillHoleAsync(server.ServerId, item, raw.Value, clamped.Value, ct);
+                                }
                             }
                             context.Watermark = clamped;
                         },
@@ -347,9 +457,11 @@ public sealed class DarlingCollectorRunner
                         if (capHit || context.PerItemTextBudgetExceeded)
                         {
                             _logger?.LogWarning(
-                                "{Collector} on '{Server}' database [{Database}] hit its per-database collection bound ({Reason}) — oldest rows dropped this cycle.",
+                                "{Collector} on '{Server}' database [{Database}] hit its per-database collection bound ({Reason}) — shipped {ShippedMB:F1}MB up to {Boundary}; the backlog resumes from that boundary next cycle.",
                                 definition.Name, server.Config.DisplayName, item,
-                                capHit ? $"row cap {definition.PerItemRowCountWarnThreshold}" : "256MB text budget");
+                                capHit ? $"row cap {definition.PerItemRowCountWarnThreshold}" : "text byte budget",
+                                context.PerItemTextBytesShipped / (1024.0 * 1024.0),
+                                context.PerItemShippedBoundary?.ToString("o") ?? "n/a");
                         }
                     },
                     onItemError: (item, ex) =>
@@ -373,6 +485,22 @@ public sealed class DarlingCollectorRunner
                 using (var reader = await command.ExecuteReaderAsync(cancellationToken))
                 {
                     rows = await definition.ReadAsync(reader, context, cancellationToken);
+
+                    /* #1851: a definition that declares it may hand back an OPTIONAL trailing
+                       (item_name, error_text) result set naming items its own server-side cursor
+                       reached but could not probe — database_size_stats' mid-restore / inaccessible
+                       databases, which used to vanish into an empty CATCH. Read through the SAME
+                       shared machinery as the enumeration path's failures (#1837), so the note wording
+                       and the log cap cannot drift between the two channels or between the two hosts.
+                       Read HERE, still inside the reader, and before the storage phase below: it
+                       touches only the note, never `rows`, so the payload and its delta ordering are
+                       exactly what they were. */
+                    if (definition.EmitsProbeFailures)
+                    {
+                        var probes = await EnumeratedCollectorDriver.ReadPayloadProbeFailuresAsync(reader, cancellationToken);
+                        collectionNote = probes.Note;
+                        LogEnumerationProbeFailures(definition, server, probes.ProbeFailures);
+                    }
                 }
 
                 /* Optional best-effort second query on the same connection (server_properties'
@@ -400,9 +528,54 @@ public sealed class DarlingCollectorRunner
             }
         }
 
+        /* Persist what the definition observed, AFTER the cycle completed — including a cycle that wrote
+           zero rows, which is exactly the case a row-derived watermark cannot cover (#1962). A cycle that
+           threw never reaches here, so the older state survives and the next run takes its conservative
+           path. Outside the storage-phase timer: this is host bookkeeping, not collected data. */
+        if (context.PendingState.Count > 0)
+        {
+            await SaveCollectorStateAsync(server.ServerId, definition.Name, context.PendingState, cancellationToken);
+        }
+
         _logger?.LogDebug("Collected {RowCount} {Collector} rows for server '{Server}'",
             rowsWritten, definition.Name, server.Config.DisplayName);
-        return new CollectorRunResult(rowsWritten, sqlMs, storageMs);
+        return new CollectorRunResult(rowsWritten, sqlMs, storageMs, collectionNote);
+    }
+
+    /// <summary>
+    /// Writes the per-item app-log lines for probe failures, capped at
+    /// <see cref="EnumeratedCollectorDriver.MaxLoggedProbeFailures"/> with the suppressed remainder
+    /// reported as a count. The collection_log row already carries the summary note; this is where the
+    /// actual per-database error text lands, and it is why that note says "see the app log". Lite's twin
+    /// is <c>RemoteCollectorService.LogEnumerationProbeFailures</c> — same shared templates.
+    ///
+    /// <para>Serves BOTH channels: an enumeration's second result set (#1837) and a payload collector's
+    /// trailing one (#1851). Named for the shared template it writes, which reports the failing step as
+    /// an enumeration probe — accurate for both, since a payload collector reaches this only by
+    /// enumerating and probing databases inside its own server-side cursor.</para>
+    /// </summary>
+    private void LogEnumerationProbeFailures<TRow>(
+        ICollectorDefinition<TRow> definition,
+        ServerRuntime server,
+        IReadOnlyList<EnumerationProbeFailure> probeFailures)
+    {
+        if (probeFailures.Count == 0)
+        {
+            return;
+        }
+
+        var shown = Math.Min(probeFailures.Count, EnumeratedCollectorDriver.MaxLoggedProbeFailures);
+        for (var i = 0; i < shown; i++)
+        {
+            _logger?.LogWarning(EnumeratedCollectorDriver.ProbeFailureLogTemplate,
+                definition.Name, server.Config.DisplayName, probeFailures[i].Item, probeFailures[i].Error);
+        }
+
+        if (probeFailures.Count > shown)
+        {
+            _logger?.LogWarning(EnumeratedCollectorDriver.ProbeFailureOverflowLogTemplate,
+                definition.Name, server.Config.DisplayName, probeFailures.Count, probeFailures.Count - shown, shown);
+        }
     }
 
     /// <summary>
@@ -568,6 +741,155 @@ public sealed class DarlingCollectorRunner
             /* If the Postgres query fails, caller uses fallback window */
         }
         return null;
+    }
+
+    /// <summary>
+    /// The stored per-server state for one collector's declared keys (#1962) — the sibling of
+    /// <see cref="GetLastCollectedTimeAsync"/> for state no MAX() over the collected rows can produce.
+    /// Read only for the collectors that declare keys, so it costs the rest nothing. An empty result on
+    /// failure is the SAFE direction: every definition treats absent state as its conservative path
+    /// (default_trace_events re-reads the whole rollover set), so a broken read costs time, never events.
+    /// Lite's twin is <c>RemoteCollectorService.GetCollectorStateAsync</c> — same table, same columns.
+    /// </summary>
+    public async Task<Dictionary<string, string>> GetCollectorStateAsync(
+        int serverId, string collectorName, CancellationToken cancellationToken)
+    {
+        var state = new Dictionary<string, string>(StringComparer.Ordinal);
+        try
+        {
+            await using var connection = await _postgres.OpenConnectionAsync(cancellationToken);
+            using var command = new NpgsqlCommand(
+                "SELECT state_key, state_value FROM collector_state WHERE server_id = $1 AND collector_name = $2", connection);
+            command.Parameters.AddWithValue(serverId);
+            command.Parameters.AddWithValue(collectorName);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                if (!reader.IsDBNull(1))
+                {
+                    state[reader.GetString(0)] = reader.GetString(1);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            /* Fail toward "no state" — the definition's conservative path, never a wrong-but-plausible one. */
+            _logger?.LogDebug(ex, "Reading collector state for {Collector} failed; using the no-state path", collectorName);
+        }
+        return state;
+    }
+
+    /// <summary>
+    /// Upserts what the definition observed this cycle (<see cref="CollectorContext.PendingState"/>),
+    /// after the cycle completed — so a cycle that collected zero rows still records what it saw, which is
+    /// the whole point of keeping this state off the payload. Best-effort: a failed write leaves the older
+    /// value, and the next cycle re-derives from it or falls back.
+    /// </summary>
+    public async Task SaveCollectorStateAsync(
+        int serverId, string collectorName, IReadOnlyDictionary<string, string> state, CancellationToken cancellationToken)
+    {
+        if (state.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            await using var connection = await _postgres.OpenConnectionAsync(cancellationToken);
+            foreach (var entry in state)
+            {
+                /* One statement per key: Npgsql's positional parameters cannot span a multi-statement
+                   batch (they bind to the FIRST statement and the rest fail silently), and this loop
+                   runs over a single declared key today. */
+                using var command = new NpgsqlCommand(@"
+INSERT INTO collector_state (server_id, collector_name, state_key, state_value, updated_at)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (server_id, collector_name, state_key)
+DO UPDATE SET state_value = EXCLUDED.state_value, updated_at = EXCLUDED.updated_at", connection);
+                command.Parameters.AddWithValue(serverId);
+                command.Parameters.AddWithValue(collectorName);
+                command.Parameters.AddWithValue(entry.Key);
+                command.Parameters.AddWithValue(entry.Value);
+                /* Naive UTC, Kind-Unspecified — the product-wide PG timestamp discipline
+                   (PgAlertStateStore.NaiveUtcNow, DarlingObservability, the storedCollectionTime below).
+                   updated_at is `timestamp` WITHOUT time zone, and binding a Kind=Utc DateTime does not
+                   fail: Npgsql infers `timestamptz` from the Kind, PostgreSQL casts it into the column,
+                   and the cast renders it in the SERVER's zone — so the row lands silently offset by the
+                   server's UTC offset (measured at exactly 4h on an America/New_York store) while every
+                   other timestamp in the store is UTC. Nothing throws and nothing logs; the column simply
+                   disagrees with the rest of the store. */
+                command.Parameters.AddWithValue(DateTime.SpecifyKind(DateTime.UtcNow, DateTimeKind.Unspecified));
+                await command.ExecuteNonQueryAsync(cancellationToken);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogDebug(ex, "Storing collector state for {Collector} failed; next cycle uses the older value", collectorName);
+        }
+    }
+
+    /// <summary>
+    /// Records a clamp-opened Query Store hole for the #2022 backfill worker, under the WORKER's
+    /// collector_state name (not the definition's — query_store still declares no state keys).
+    /// Merged wider with any pending hole so a repeat outage cannot overwrite an unserviced one.
+    /// Best-effort: a lost record means a lost backfill opportunity, never wrong data — the live
+    /// path's own WARNING already disclosed the hole.
+    /// </summary>
+    private async Task RecordQueryStoreBackfillHoleAsync(
+        int serverId, string databaseName, DateTime fromUtc, DateTime toUtc, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var key = QueryStoreBackfillState.HoleKeyPrefix + databaseName;
+            var existing = await GetCollectorStateAsync(serverId, QueryStoreBackfillState.StateCollectorName, cancellationToken);
+            var merged = QueryStoreBackfillState.MergeHole(existing.TryGetValue(key, out var encoded) ? encoded : null, fromUtc, toUtc);
+            await SaveCollectorStateAsync(
+                serverId, QueryStoreBackfillState.StateCollectorName,
+                new Dictionary<string, string>(StringComparer.Ordinal) { [key] = QueryStoreBackfillState.EncodeHole(merged.FromUtc, merged.ToUtc) },
+                cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogDebug(ex, "Recording query_store backfill hole for [{Database}] failed; the live WARNING remains the disclosure", databaseName);
+        }
+    }
+
+    /// <summary>
+    /// Deletes ONE collector_state key — the backfill worker's retirement path for a serviced or
+    /// expired hole record (#2022). Best-effort like its siblings: a failed delete leaves the row,
+    /// and the worker's scan re-derives the same verdict next tick.
+    /// </summary>
+    public async Task DeleteCollectorStateKeyAsync(
+        int serverId, string collectorName, string stateKey, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var connection = await _postgres.OpenConnectionAsync(cancellationToken);
+            using var command = new NpgsqlCommand(
+                "DELETE FROM collector_state WHERE server_id = $1 AND collector_name = $2 AND state_key = $3", connection);
+            command.Parameters.AddWithValue(serverId);
+            command.Parameters.AddWithValue(collectorName);
+            command.Parameters.AddWithValue(stateKey);
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogDebug(ex, "Deleting collector state {Key} for {Collector} failed; next tick re-derives", stateKey, collectorName);
+        }
+    }
+
+    /// <summary>
+    /// The #2022 backfill write entry: the SAME private COPY writer every live path routes through
+    /// (dimension diversion, positional contract, naive-UTC stamp), on its own store connection.
+    /// <paramref name="collectionTime"/> is the slice's BACKDATED ceiling — see QueryStoreBackfill's
+    /// horizon contract for why that is safe only inside the raw tier's window.
+    /// </summary>
+    public async Task<int> WriteBackfillBatchAsync<TRow>(
+        ICollectorDefinition<TRow> definition, List<TRow> rows, ServerRuntime server,
+        DateTime collectionTime, CollectorContext context, CancellationToken cancellationToken)
+    {
+        await using var pgConnection = await _postgres.OpenConnectionAsync(cancellationToken);
+        return await WriteBatchAsync(pgConnection, definition, rows, server, collectionTime, context, cancellationToken);
     }
 
     /// <summary>
@@ -817,7 +1139,9 @@ public sealed class DarlingCollectorRunner
     internal static bool ShouldFallBackToSingleDatabaseError(int errorNumber) =>
         SqlErrorClassification.ShouldFallBackToSingleDatabase(errorNumber);
 
-    private static SqlCommand CreateCollectorCommand(CollectorQuery plan, SqlConnection connection, int commandTimeoutSeconds)
+    /* Internal, not private: QueryStoreBackfill (#2022) builds its slice commands through the same
+       parameter mapping so the two paths cannot drift on a type. */
+    internal static SqlCommand CreateCollectorCommand(CollectorQuery plan, SqlConnection connection, int commandTimeoutSeconds)
     {
         var command = new SqlCommand(plan.Text, connection) { CommandTimeout = commandTimeoutSeconds };
 
@@ -833,6 +1157,7 @@ public sealed class DarlingCollectorRunner
     {
         CollectorParameterType.DateTime2 => new SqlParameter(parameter.Name, SqlDbType.DateTime2) { Value = parameter.Value ?? DBNull.Value },
         CollectorParameterType.NVarChar128 => new SqlParameter(parameter.Name, SqlDbType.NVarChar, 128) { Value = parameter.Value ?? DBNull.Value },
+        CollectorParameterType.NVarChar260 => new SqlParameter(parameter.Name, SqlDbType.NVarChar, 260) { Value = parameter.Value ?? DBNull.Value },
         CollectorParameterType.Int32 => new SqlParameter(parameter.Name, SqlDbType.Int) { Value = parameter.Value ?? DBNull.Value },
         CollectorParameterType.BigInt => new SqlParameter(parameter.Name, SqlDbType.BigInt) { Value = parameter.Value ?? DBNull.Value },
         _ => throw new ArgumentOutOfRangeException(nameof(parameter), parameter.Type, "Unmapped collector parameter type"),

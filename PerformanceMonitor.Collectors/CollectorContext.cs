@@ -19,6 +19,13 @@ public sealed class CollectorContext
 {
     private static readonly IReadOnlySet<string> s_emptySet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// The empty <see cref="State"/> — what a host passes for a definition that declares no state keys
+    /// (so it ran no state query), and what a definition sees when nothing has been stored yet.
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, string> NoState =
+        new Dictionary<string, string>(StringComparer.Ordinal);
+
     public required int ServerId { get; init; }
 
     public required string ServerName { get; init; }
@@ -78,6 +85,28 @@ public sealed class CollectorContext
     /// </summary>
     public bool HasCollectedBefore { get; init; }
 
+    /// <summary>
+    /// The per-server collector state the host loaded from ITS store (Lite: DuckDB; Darling: Postgres)
+    /// for the keys this definition declared in <c>StateKeys</c> — the sibling of <see cref="Watermark"/>
+    /// for state no MAX() over the collected rows can produce. Empty when the definition declares no
+    /// keys (every collector but default_trace_events), when nothing has been stored yet, or when the
+    /// state read failed: a definition MUST treat "absent" as its documented conservative path, because
+    /// absent is what a first run, a restarted host, and a broken store all look like.
+    /// </summary>
+    public IReadOnlyDictionary<string, string> State { get; init; } = NoState;
+
+    /// <summary>
+    /// State the definition wants persisted for the NEXT cycle, written during this cycle (typically in
+    /// <c>ReadAsync</c>, from a value the query itself returned) and upserted by the host once the cycle
+    /// completes — so a cycle that collected zero rows still records what it observed. Nothing is written
+    /// for a cycle that threw: the next run then re-reads the older state and takes its conservative
+    /// path, which is the safe direction. One of the context members the definition writes back to the
+    /// host (the others are <see cref="PerItemTextBudgetExceeded"/> with its
+    /// <see cref="PerItemTextBytesShipped"/>/<see cref="PerItemShippedBoundary"/> companions, and
+    /// <see cref="CatchupClampApplied"/>).
+    /// </summary>
+    public Dictionary<string, string> PendingState { get; } = new(StringComparer.Ordinal);
+
     /// <summary>Wait types excluded from collection (Lite: ignored_wait_types.json — #1240).</summary>
     public IReadOnlySet<string> IgnoredWaitTypes { get; init; } = s_emptySet;
 
@@ -128,12 +157,41 @@ public sealed class CollectorContext
     public object? EnumerationProbeResult { get; set; }
 
     /// <summary>
-    /// Truncation signal for the per-item text-byte budget (#1556), set by a definition's
-    /// <see cref="ICollectorDefinition{TRow}.ReadItemAsync"/> when it stops reading an enumerated item
-    /// because its <see cref="ICollectorDefinition{TRow}.PerItemTextByteBudget"/> was reached, and read
-    /// back by the host to surface the collection WARNING. Written per item (each definition that
-    /// enforces a budget resets it at the top of its ReadItemAsync), so the host reads it immediately
-    /// after ReadItemAsync returns. False in the common case — only budgeted collectors touch it.
+    /// Truncation signal for the per-item text-byte budget (#1556), set by a definition's read method
+    /// when it stops reading a database's rows because its
+    /// <see cref="ICollectorDefinition{TRow}.PerItemTextByteBudget"/> was reached, and read back by the
+    /// host to surface the collection WARNING. Written per database (each definition that enforces a
+    /// budget resets it at the top of its read), so the host reads it immediately after the read
+    /// returns — on the enumerated path from <c>ReadItemAsync</c>, and on the Azure per-database path
+    /// from <c>ReadAsync</c> (#1836). False in the common case — only budgeted collectors touch it.
     /// </summary>
     public bool PerItemTextBudgetExceeded { get; set; }
+
+    /// <summary>
+    /// Cumulative text bytes the budgeted read actually materialized for the item just read (#1960),
+    /// reset and written alongside <see cref="PerItemTextBudgetExceeded"/>. Read by the host purely
+    /// for the bounded-cycle WARNING, so a long catch-up reports how much each cycle shipped rather
+    /// than just that it was cut.
+    /// </summary>
+    public long PerItemTextBytesShipped { get; set; }
+
+    /// <summary>
+    /// The watermark-column value of the LAST row the budgeted read kept for the item just read
+    /// (#1960) — under oldest-first shipping, the exact boundary the next cycle resumes from. Reset
+    /// and written alongside <see cref="PerItemTextBudgetExceeded"/>; null when the read kept no
+    /// rows or the boundary row carried no watermark value. Read by the host for the bounded-cycle
+    /// WARNING.
+    /// </summary>
+    public DateTime? PerItemShippedBoundary { get; set; }
+
+    /// <summary>
+    /// Catch-up signal (#1836): set by a definition whose cutoff computation floored a stale watermark
+    /// to the <see cref="WatermarkPolicy"/> horizon, so the host can log the bounded history hole the
+    /// clamp deliberately creates. Only query_store clamps, and only the Azure per-database branch
+    /// needs this: on the enumeration path the HOST clamps (and logs) before the definition ever sees
+    /// the watermark, so the definition's own clamp is a no-op there and this stays false — the same
+    /// signal cannot produce a duplicate warning. Written per database, at query build time, so the
+    /// host reads it right after building that database's query.
+    /// </summary>
+    public bool CatchupClampApplied { get; set; }
 }

@@ -33,6 +33,7 @@ public sealed class LiteAlertReadAdapter : IAlertReadAdapter
 {
     private readonly LocalDataService _dataService;
     private readonly Func<int, int>? _runningJobsCadenceMinutes;
+    private readonly Func<int, int>? _blockingSnapshotCadenceMinutes;
 
     /// <param name="runningJobsCadenceMinutes">
     /// Resolves a server's EFFECTIVE running_jobs collection cadence (minutes) for the #1812
@@ -40,10 +41,17 @@ public sealed class LiteAlertReadAdapter : IAlertReadAdapter
     /// call sites) or a non-positive answer falls back to the shared
     /// <see cref="CollectorScheduleDefaults"/> cadence.
     /// </param>
-    public LiteAlertReadAdapter(LocalDataService dataService, Func<int, int>? runningJobsCadenceMinutes = null)
+    /// <param name="blockingSnapshotCadenceMinutes">
+    /// The same resolver for the dmv_blocking_snapshot cadence, behind #1839's freshness bound.
+    /// </param>
+    public LiteAlertReadAdapter(
+        LocalDataService dataService,
+        Func<int, int>? runningJobsCadenceMinutes = null,
+        Func<int, int>? blockingSnapshotCadenceMinutes = null)
     {
         _dataService = dataService ?? throw new ArgumentNullException(nameof(dataService));
         _runningJobsCadenceMinutes = runningJobsCadenceMinutes;
+        _blockingSnapshotCadenceMinutes = blockingSnapshotCadenceMinutes;
     }
 
     /// <summary>
@@ -57,6 +65,26 @@ public sealed class LiteAlertReadAdapter : IAlertReadAdapter
         var serverId = ParseServerKey(serverKey);
         var rows = await Task.Run(() => _dataService.GetRecentBlockedProcessReportsAsync(serverId, hoursBack), cancellationToken);
         return new List<BlockedProcessAlertRow>(rows);
+    }
+
+    /// <summary>
+    /// #1839: the latest blocking snapshot's summed wait time, with the #1812 freshness verdict
+    /// attached at the server's effective dmv_blocking_snapshot cadence.
+    /// </summary>
+    public async Task<CurrentBlockingWaitResult?> GetCurrentBlockingWaitAsync(
+        string serverKey, CancellationToken cancellationToken = default)
+    {
+        var serverId = ParseServerKey(serverKey);
+        var snapshot = await Task.Run(() => _dataService.GetCurrentBlockingWaitAsync(serverId), cancellationToken);
+        if (snapshot is null)
+        {
+            return null;
+        }
+
+        var cadence = ResolveCadence(_blockingSnapshotCadenceMinutes, serverId, "dmv_blocking_snapshot");
+        bool isFresh = DateTime.UtcNow - snapshot.Value.SnapshotTime <= CurrentBlockingWaitResult.MaxSnapshotAge(cadence);
+        return new CurrentBlockingWaitResult(
+            snapshot.Value.SnapshotTime, snapshot.Value.TotalWaitMs, snapshot.Value.BlockedSessionCount, isFresh);
     }
 
     public async Task<List<DeadlockAlertRow>> GetRecentDeadlocksAsync(
@@ -113,6 +141,13 @@ public sealed class LiteAlertReadAdapter : IAlertReadAdapter
         return await Task.Run(() => _dataService.GetVolumeFreeSpaceAsync(serverId), cancellationToken);
     }
 
+    public async Task<List<PvsPressureInfo>> GetPvsPressureAsync(
+        string serverKey, CancellationToken cancellationToken = default)
+    {
+        var serverId = ParseServerKey(serverKey);
+        return await Task.Run(() => _dataService.GetPvsPressureAsync(serverId), cancellationToken);
+    }
+
     public async Task<TempDbSpaceInfo?> GetTempDbSpaceAsync(
         string serverKey, CancellationToken cancellationToken = default)
     {
@@ -141,15 +176,35 @@ public sealed class LiteAlertReadAdapter : IAlertReadAdapter
         return new AnomalousJobsResult(SnapshotIsFresh: true, jobs);
     }
 
-    private int ResolveRunningJobsCadence(int serverId)
+    /// <summary>
+    /// Databases deviating from their expected (baseline/override) state — delegates to
+    /// <see cref="LocalDataService.GetDatabaseStateDeviationsAsync"/>, which also auto-seeds the
+    /// first-observation baseline. Task.Run-wrapped like the other reads to keep DuckDB's synchronous
+    /// I/O off the WPF dispatcher (#1202).
+    /// </summary>
+    public async Task<List<DatabaseStateInfo>> GetDatabaseStatesAsync(
+        string serverKey, CancellationToken cancellationToken = default)
     {
-        var resolved = _runningJobsCadenceMinutes?.Invoke(serverId) ?? 0;
+        var serverId = ParseServerKey(serverKey);
+        return await Task.Run(() => _dataService.GetDatabaseStateDeviationsAsync(serverId), cancellationToken);
+    }
+
+    private int ResolveRunningJobsCadence(int serverId) =>
+        ResolveCadence(_runningJobsCadenceMinutes, serverId, "running_jobs");
+
+    /// <summary>
+    /// A server's effective cadence for one collector: the host's resolver when it answers usefully,
+    /// otherwise the shipped default, otherwise 2 minutes (an unregistered collector name).
+    /// </summary>
+    private static int ResolveCadence(Func<int, int>? resolver, int serverId, string collectorName)
+    {
+        var resolved = resolver?.Invoke(serverId) ?? 0;
         if (resolved > 0)
         {
             return resolved;
         }
 
-        return PerformanceMonitor.Collectors.CollectorScheduleDefaults.All.TryGetValue("running_jobs", out var schedule)
+        return PerformanceMonitor.Collectors.CollectorScheduleDefaults.All.TryGetValue(collectorName, out var schedule)
             ? schedule.FrequencyMinutes
             : 2;
     }

@@ -109,22 +109,45 @@ public sealed class DarlingWebHostService : BackgroundService
     /// </summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        DarlingConfig config;
-        try
-        {
-            config = DarlingConfig.Load();
-        }
-        catch (Exception ex)
-        {
-            /* The worker logs the missing/broken config as critical; without a file config there is no
-               bind/network/store definition to serve with, so the web host stands down entirely. */
-            _logger.LogDebug("Web dashboard not started (configuration unavailable): {Message}", ex.Message);
-            return;
-        }
-
+        /* Config load lives INSIDE the supervisor loop, on the failed-start backoff (#2038). It used to be a
+           single front-loaded Load() whose failure stood this host down for the process LIFETIME, logged only
+           at Debug — so one transient darling.json read failure at boot (an AV pass over the file mid service
+           restart is enough) silently killed the dashboard until the next manual restart while the worker kept
+           collecting, and the default-level log said nothing. Once loaded, the config is held for the process
+           lifetime exactly as before (the network exposure block is restart-only by design). */
+        DarlingConfig? config = null;
         var lastFailedStartUtc = DateTime.MinValue;
         while (!stoppingToken.IsCancellationRequested)
         {
+            if (config is null && DateTime.UtcNow - lastFailedStartUtc >= FailedStartBackoff)
+            {
+                try
+                {
+                    config = DarlingConfig.Load();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        "Web dashboard configuration could not be loaded ({Message}) — retrying in {Backoff}s. The worker logs a missing/broken config as critical; a transient read failure self-heals here.",
+                        ex.Message, (int)FailedStartBackoff.TotalSeconds);
+                    lastFailedStartUtc = DateTime.UtcNow;
+                }
+            }
+
+            if (config is null)
+            {
+                try
+                {
+                    await Task.Delay(SupervisorPollInterval, stoppingToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+
+                continue;
+            }
+
             var published = _state.Read();
             var enabled = published?.Enabled ?? config.Web.Enabled;
             var desiredPort = published?.Port ?? config.Web.Port;
@@ -222,7 +245,7 @@ public sealed class DarlingWebHostService : BackgroundService
     /// the --configure-network wizard validates candidate web blocks through the SAME resolver the host
     /// fail-closes on (#1617), exactly as the wizard's MCP path calls ResolveMcpBind.
     /// </summary>
-    internal static DarlingHostBinding.BindDecision ResolveWebBind(WebConfig web, bool managed)
+    internal static DarlingHostBinding.BindDecision ResolveWebBind(WebConfig web, bool managed, bool? inContainer = null)
     {
         var network = web.Network;
         return DarlingHostBinding.ResolveBind(
@@ -231,7 +254,9 @@ public sealed class DarlingWebHostService : BackgroundService
             tokenPresent: network is not null
                 && (!string.IsNullOrWhiteSpace(network.EncryptedToken) || !string.IsNullOrWhiteSpace(network.Token)),
             networkConfigured: network is { IsConfigured: true },
-            managed: managed);
+            managed: managed,
+            /* #1804: tests pass this explicitly; the running host takes the ambient container marker. */
+            inContainer: inContainer ?? DarlingHostBinding.IsRunningInContainer);
     }
 
     /// <summary>
@@ -776,8 +801,8 @@ public sealed class DarlingWebHostService : BackgroundService
 
             case DarlingHostBinding.BindReason.ManagedModeRequired:
                 _logger.Log(level.Value,
-                    "web.network.* is set but postgres.managed = false — web dashboard network exposure is managed-mode only and is " +
-                    "ignored; your own reverse proxy governs BYO exposure. Binding loopback-only.");
+                    "web.network.* is set but postgres.managed = false — web dashboard network exposure is managed-mode (or container, " +
+                    "#1804) only and is ignored; your own reverse proxy governs uncontained BYO exposure. Binding loopback-only.");
                 break;
 
             default:

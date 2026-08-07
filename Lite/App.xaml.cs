@@ -65,8 +65,10 @@ public partial class App : Application
 
     /// <summary>
     /// Gets the per-user config directory path. Holds settings.json, schedules, and
-    /// other per-user preferences. Stays in %LOCALAPPDATA% so Velopack updates can
-    /// replace the app directory without losing data.
+    /// other per-user preferences. Lives under the data root, which is deliberately a
+    /// SIBLING of the install directory rather than inside it — Velopack's in-place
+    /// update left data alone, but re-running Setup.exe deletes the install directory
+    /// outright (#1832). See <see cref="Services.DataRootMigration"/>.
     /// </summary>
     public static string ConfigDirectory { get; private set; } = string.Empty;
 
@@ -123,6 +125,13 @@ public partial class App : Application
     public static CpuAlertMode AlertCpuMode { get; set; } = CpuAlertMode.Total;
     public static bool AlertBlockingEnabled { get; set; } = true;
     public static int AlertBlockingThreshold { get; set; } = 1;
+    /// <summary>
+    /// #1839: fire when the latest blocking snapshot's TOTAL blocked wait reaches this many seconds.
+    /// 0 = off, and off ships by default — a count threshold can't tell one session blocked for an hour
+    /// from one blocked for a second, but turning this on for everyone would change what existing
+    /// installs alert about.
+    /// </summary>
+    public static int AlertBlockingWaitSecondsThreshold { get; set; }
     public static bool AlertDeadlockEnabled { get; set; } = true;
     public static int AlertDeadlockThreshold { get; set; } = 1;
     public static bool AlertPoisonWaitEnabled { get; set; } = true;
@@ -141,10 +150,17 @@ public partial class App : Application
     public static bool AlertLowDiskEnabled { get; set; } = true;
     public static int AlertLowDiskThresholdPercent { get; set; } = 10; // Alert when a volume's free space < X% (0 disables this check)
     public static int AlertLowDiskThresholdGb { get; set; } = 5;        // Alert when a volume's free space < X GB (0 disables this check)
+    public static bool AlertPvsEnabled { get; set; } = true;            // #1984 ADR persistent version store pressure
+    public static int AlertPvsThresholdPercent { get; set; } = 40;      // Alert when an ADR database's PVS >= X% of its data files (0 disables this check)
+    public static int AlertPvsFloorGb { get; set; } = 1;                // AND-qualifier: the PVS must also be >= X GB (0 removes the floor)
     public static bool AlertLongRunningJobEnabled { get; set; } = true;
     public static int AlertLongRunningJobMultiplier { get; set; } = 3;
     public static bool AlertFailedJobEnabled { get; set; } = true;
     public static int AlertFailedJobLookbackMinutes { get; set; } = 60;  // Look back this many minutes for failed Agent job runs
+    /* Database-state alert: fire when a database's current state deviates from its expected
+       (auto-seeded baseline or per-database override) state. Per-database expected states live in the
+       config_database_state_expected table, not here — this is only the master enable. */
+    public static bool AlertDatabaseStateEnabled { get; set; } = true;
     public static int AlertCooldownMinutes { get; set; } = 5;  // Tray notification cooldown between repeated alerts
     public static int EmailCooldownMinutes { get; set; } = 15; // Email cooldown between repeated alerts
     /* #1141: deadlock/blocking notification delivery — Summary (one batched card per cycle, the default)
@@ -190,6 +206,11 @@ public partial class App : Application
     /* NOC Overview tile sort ("Cpu" = CPU% descending default, or "Name") */
     public static ServerOverviewSortMode OverviewSortMode { get; set; } = ServerOverviewSort.Default;
 
+    /// <summary>Sidebar fleet-tree groups the user has collapsed (#2020 2b-i-b), each a
+    /// <c>FleetGroupKey.ToStorageString()</c> value ("Favorites" / "Untagged" / "Tag:{id}"), so expand/collapse
+    /// survives a restart — the Lite twin of the viewer's <c>ViewerPreferences.CollapsedFleetGroups</c>.</summary>
+    public static List<string> CollapsedFleetGroups { get; set; } = new();
+
     /* Update check settings */
     public static bool CheckForUpdatesOnStartup { get; set; } = true;
 
@@ -214,10 +235,19 @@ public partial class App : Application
     public static string GenericWebhookBodyTemplate { get; set; } = "";
     public static string GenericWebhookProxyAddress { get; set; } = "";
 
+    /* PagerDuty webhook settings — Events API v2. The routing key is a bearer secret like the Teams/Slack
+       URLs, so it lives in Credential Manager, never in settings.json; only the enable flag and the EU-region
+       toggle are plain prefs. */
+    public static bool PagerDutyWebhookEnabled { get; set; } = false;
+    public static string PagerDutyRoutingKey { get; set; } = "";
+    public static bool PagerDutyUseEuRegion { get; set; } = false;
+    public static string PagerDutyProxyAddress { get; set; } = "";
+
     private const string TeamsWebhookCredentialKey = "TeamsWebhook";
     private const string SlackWebhookCredentialKey = "SlackWebhook";
     private const string GenericWebhookCredentialKey = "GenericWebhook";
     private const string GenericWebhookHeadersCredentialKey = "GenericWebhookHeaders";
+    private const string PagerDutyWebhookCredentialKey = "PagerDutyWebhook";
 
     /// <summary>
     /// Gets a webhook URL from Windows Credential Manager.
@@ -349,11 +379,29 @@ public partial class App : Application
         System.Windows.Media.RenderOptions.ProcessRenderMode =
             System.Windows.Interop.RenderMode.SoftwareOnly;
 
-        // Initialize paths — store data in %LOCALAPPDATA% so Velopack updates
-        // can replace the app directory without losing data
-        var appDataRoot = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "PerformanceMonitorLite");
+        /* Initialize paths. Data lives in %LOCALAPPDATA%\PerformanceMonitorLite-Data, NOT in
+           %LOCALAPPDATA%\PerformanceMonitorLite — that second path is Velopack's install root, and
+           re-running Setup.exe over an existing install renames it aside and deletes it, taking the
+           store, the archive and settings.json with it (#1832). Local rather than roaming: the DuckDB
+           store must not be dragged across a roaming profile. Migration runs first, before anything
+           reads settings or opens the store; AppLogger buffers until Initialize, so its log lines
+           land in the file a few statements later. */
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var appDataRoot = Path.Combine(localAppData, Services.DataRootMigration.DataRootName);
+
+        var migration = Services.DataRootMigration.Migrate(
+            Path.Combine(localAppData, Services.DataRootMigration.LegacyRootName),
+            appDataRoot,
+            message => AppLogger.Info("DataRoot", message));
+
+        if (migration.Failed.Count > 0)
+        {
+            AppLogger.Error("DataRoot",
+                $"{migration.Failed.Count} item(s) could not be moved out of the install directory and are " +
+                $"NOT in use: {string.Join(", ", migration.Failed)}. Close any other Lite instance and restart " +
+                "to retry.");
+        }
+
         DataDirectory = appDataRoot;
         ConfigDirectory = Path.Combine(appDataRoot, "config");
         DatabasePath = Path.Combine(appDataRoot, "monitor.duckdb");
@@ -526,11 +574,35 @@ public partial class App : Application
         catch { /* Use default */ }
     }
 
-    public static void LoadAlertSettings()
+    public static void LoadAlertSettings() => LoadAlertSettings(ConfigDirectory, GetWebhookUrl, SaveWebhookUrl);
+
+    /// <summary>
+    /// Path- and secret-store-injected form, so the "secrets load even without settings.json" contract is
+    /// testable without touching the process-wide config directory or the real Credential Manager.
+    /// <paramref name="writeSecret"/> is required rather than optional on purpose: this method WRITES to the
+    /// credential store on the #1506 legacy-plaintext-URL path, and a test that forgot to intercept that
+    /// would silently overwrite the operator's real webhook URL.
+    /// </summary>
+    internal static void LoadAlertSettings(
+        string configDirectory,
+        Func<string, string> readSecret,
+        Action<string, string> writeSecret)
     {
+        /* Webhook secrets live in Credential Manager, never in settings.json, so they load FIRST and
+           unconditionally — before the early return below. They used to load at the tail of the
+           settings.json parse, which meant a missing settings.json (exactly what the #1832 install-root
+           wipe produced) left the Settings window's webhook boxes blank while the credentials were still
+           there. Saving from that window then wrote the blank back, and SaveWebhookUrl DELETES on blank —
+           so opening Settings once after the data loss destroyed the surviving webhook URLs too. */
+        TeamsWebhookUrl = readSecret(TeamsWebhookCredentialKey);
+        SlackWebhookUrl = readSecret(SlackWebhookCredentialKey);
+        GenericWebhookUrl = readSecret(GenericWebhookCredentialKey);
+        GenericWebhookHeadersJson = readSecret(GenericWebhookHeadersCredentialKey);
+        PagerDutyRoutingKey = readSecret(PagerDutyWebhookCredentialKey);
+
         try
         {
-            var path = Path.Combine(ConfigDirectory, "settings.json");
+            var path = Path.Combine(configDirectory, "settings.json");
             if (!File.Exists(path)) return;
 
             using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(path));
@@ -551,6 +623,7 @@ public partial class App : Application
                 AlertCpuMode = mode;
             if (root.TryGetProperty("alert_blocking_enabled", out v)) AlertBlockingEnabled = v.GetBoolean();
             if (root.TryGetProperty("alert_blocking_threshold", out v)) AlertBlockingThreshold = v.GetInt32();
+            if (root.TryGetProperty("alert_blocking_wait_seconds_threshold", out v)) AlertBlockingWaitSecondsThreshold = v.GetInt32();
             if (root.TryGetProperty("alert_deadlock_enabled", out v)) AlertDeadlockEnabled = v.GetBoolean();
             if (root.TryGetProperty("alert_deadlock_threshold", out v)) AlertDeadlockThreshold = v.GetInt32();
             if (root.TryGetProperty("alert_poison_wait_enabled", out v)) AlertPoisonWaitEnabled = v.GetBoolean();
@@ -577,10 +650,14 @@ public partial class App : Application
             if (root.TryGetProperty("alert_low_disk_enabled", out v)) AlertLowDiskEnabled = v.GetBoolean();
             if (root.TryGetProperty("alert_low_disk_threshold_percent", out v)) AlertLowDiskThresholdPercent = (int)Math.Clamp(v.GetInt64(), 0, 100);
             if (root.TryGetProperty("alert_low_disk_threshold_gb", out v)) AlertLowDiskThresholdGb = (int)Math.Max(0, v.GetInt64());
+            if (root.TryGetProperty("alert_pvs_enabled", out v)) AlertPvsEnabled = v.GetBoolean();
+            if (root.TryGetProperty("alert_pvs_threshold_percent", out v)) AlertPvsThresholdPercent = (int)Math.Clamp(v.GetInt64(), 0, 100);
+            if (root.TryGetProperty("alert_pvs_floor_gb", out v)) AlertPvsFloorGb = (int)Math.Max(0, v.GetInt64());
             if (root.TryGetProperty("alert_long_running_job_enabled", out v)) AlertLongRunningJobEnabled = v.GetBoolean();
             if (root.TryGetProperty("alert_long_running_job_multiplier", out v)) AlertLongRunningJobMultiplier = v.GetInt32();
             if (root.TryGetProperty("alert_failed_job_enabled", out v)) AlertFailedJobEnabled = v.GetBoolean();
             if (root.TryGetProperty("alert_failed_job_lookback_minutes", out v)) AlertFailedJobLookbackMinutes = (int)Math.Clamp(v.GetInt64(), 1, 1440);
+            if (root.TryGetProperty("alert_database_state_enabled", out v)) AlertDatabaseStateEnabled = v.GetBoolean();
             if (root.TryGetProperty("alert_cooldown_minutes", out v)) AlertCooldownMinutes = (int)Math.Clamp(v.GetInt64(), 1, 120);
             if (root.TryGetProperty("email_cooldown_minutes", out v)) EmailCooldownMinutes = (int)Math.Clamp(v.GetInt64(), 1, 120);
             if (root.TryGetProperty("alert_delivery_mode", out v) && Enum.TryParse<AlertNotificationMode>(v.GetString(), out var deliveryMode))
@@ -633,6 +710,15 @@ public partial class App : Application
             /* NOC Overview tile sort */
             if (root.TryGetProperty("overview_sort_mode", out v)) OverviewSortMode = ServerOverviewSort.ParseMode(v.GetString());
 
+            /* Sidebar fleet-tree collapsed groups (#2020 2b-i-b) */
+            if (root.TryGetProperty("collapsed_fleet_groups", out v) && v.ValueKind == JsonValueKind.Array)
+            {
+                CollapsedFleetGroups = v.EnumerateArray()
+                    .Where(e => e.ValueKind == JsonValueKind.String)
+                    .Select(e => e.GetString()!)
+                    .ToList();
+            }
+
             /* Update check settings */
             if (root.TryGetProperty("check_for_updates_on_startup", out v)) CheckForUpdatesOnStartup = v.GetBoolean();
 
@@ -650,13 +736,22 @@ public partial class App : Application
             if (root.TryGetProperty("generic_proxy_address", out v)) GenericWebhookProxyAddress = v.GetString() ?? "";
             if (root.TryGetProperty("generic_body_template", out v)) GenericWebhookBodyTemplate = v.GetString() ?? "";
 
-            /* Migrate webhook URLs from plaintext settings.json to Credential Manager */
+            /* PagerDuty webhook settings. The routing key is a secret and loads from Credential Manager below;
+               only the enable flag and EU-region toggle are plain prefs. */
+            if (root.TryGetProperty("pagerduty_webhook_enabled", out v)) PagerDutyWebhookEnabled = v.GetBoolean();
+            if (root.TryGetProperty("pagerduty_use_eu_region", out v)) PagerDutyUseEuRegion = v.GetBoolean();
+            if (root.TryGetProperty("pagerduty_proxy_address", out v)) PagerDutyProxyAddress = v.GetString() ?? "";
+
+            /* Migrate webhook URLs from plaintext settings.json to Credential Manager. A legacy plaintext
+               URL still wins over whatever the store held, matching the old order (save, then read back);
+               the live property is set here rather than re-reading, since we just wrote the value. */
             if (root.TryGetProperty("teams_webhook_url", out v))
             {
                 var legacyUrl = v.GetString() ?? "";
                 if (!string.IsNullOrWhiteSpace(legacyUrl))
                 {
-                    SaveWebhookUrl(TeamsWebhookCredentialKey, legacyUrl);
+                    writeSecret(TeamsWebhookCredentialKey, legacyUrl);
+                    TeamsWebhookUrl = legacyUrl;
                 }
             }
             if (root.TryGetProperty("slack_webhook_url", out v))
@@ -664,16 +759,10 @@ public partial class App : Application
                 var legacyUrl = v.GetString() ?? "";
                 if (!string.IsNullOrWhiteSpace(legacyUrl))
                 {
-                    SaveWebhookUrl(SlackWebhookCredentialKey, legacyUrl);
+                    writeSecret(SlackWebhookCredentialKey, legacyUrl);
+                    SlackWebhookUrl = legacyUrl;
                 }
             }
-
-            /* Load webhook URLs from Credential Manager. The generic channel's headers JSON rides the same
-               secure store as a URL — it carries the Authorization bearer token (#1506). */
-            TeamsWebhookUrl = GetWebhookUrl(TeamsWebhookCredentialKey);
-            SlackWebhookUrl = GetWebhookUrl(SlackWebhookCredentialKey);
-            GenericWebhookUrl = GetWebhookUrl(GenericWebhookCredentialKey);
-            GenericWebhookHeadersJson = GetWebhookUrl(GenericWebhookHeadersCredentialKey);
 
             /* SMTP settings */
             if (root.TryGetProperty("smtp_enabled", out v)) SmtpEnabled = v.GetBoolean();

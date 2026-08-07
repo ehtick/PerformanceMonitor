@@ -290,14 +290,16 @@ public partial class SettingsWindow : Window
         {
             CollectionStatusText.Text = "Status: not connected to the Darling store";
             PauseResumeButton.IsEnabled = false;
-            PauseResumeButton.Content = "Pause Collection";
+            PauseResumeButton.Content = "Pause Co_llection";
             return;
         }
 
         CollectionStatusText.Text = _paused
             ? "Status: Paused — the Darling service is not collecting"
             : "Status: Collecting — managed by the Darling service";
-        PauseResumeButton.Content = _paused ? "Resume Collection" : "Pause Collection";
+        /* The "_" keeps Alt+L alive across the state swap — see the XAML for why the key is on
+           "Collection" (the word both states share) rather than on the verb. */
+        PauseResumeButton.Content = _paused ? "Resume Co_llection" : "Pause Co_llection";
         PauseResumeButton.IsEnabled = !_dataService.IsReadOnly;
     }
 
@@ -494,6 +496,17 @@ public partial class SettingsWindow : Window
         editor.ShowDialog();
     }
 
+    private void ConfigureDatabaseStatesButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_dataService is null)
+        {
+            return;
+        }
+
+        var editor = new DatabaseStateOverridesWindow(_dataService, _servers) { Owner = this };
+        editor.ShowDialog();
+    }
+
     // ── Viewer defaults (connection timeout, CSV separator, timestamp display) — viewer-local ──
 
     private void LoadConnectionTimeout() =>
@@ -670,6 +683,7 @@ public partial class SettingsWindow : Window
         AlertCpuModeBox.SelectedIndex = ViewerDataService.MapCpuModeFromStore(r.CpuMode) == "SqlOnly" ? 1 : 0;
         AlertBlockingCheckBox.IsChecked = r.BlockingEnabled;
         AlertBlockingThresholdBox.Text = r.BlockingCountThreshold.ToString(CultureInfo.InvariantCulture);
+        AlertBlockingWaitSecondsBox.Text = r.BlockingWaitSecondsThreshold.ToString(CultureInfo.InvariantCulture);
         AlertDeadlockCheckBox.IsChecked = r.DeadlockEnabled;
         AlertDeadlockThresholdBox.Text = r.DeadlockCountThreshold.ToString(CultureInfo.InvariantCulture);
         AlertPoisonWaitCheckBox.IsChecked = r.PoisonWaitEnabled;
@@ -689,10 +703,14 @@ public partial class SettingsWindow : Window
         AlertLowDiskCheckBox.IsChecked = r.LowDiskEnabled;
         AlertLowDiskThresholdPercentBox.Text = r.LowDiskThresholdPercent.ToString(CultureInfo.InvariantCulture);
         AlertLowDiskThresholdGbBox.Text = r.LowDiskThresholdGb.ToString(CultureInfo.InvariantCulture);
+        AlertPvsCheckBox.IsChecked = r.PvsEnabled;
+        AlertPvsThresholdPercentBox.Text = r.PvsThresholdPercent.ToString(CultureInfo.InvariantCulture);
+        AlertPvsFloorGbBox.Text = r.PvsFloorGb.ToString(CultureInfo.InvariantCulture);
         AlertLongRunningJobCheckBox.IsChecked = r.LongRunningJobEnabled;
         AlertLongRunningJobMultiplierBox.Text = r.LongRunningJobMultiplier.ToString(CultureInfo.InvariantCulture);
         AlertFailedJobCheckBox.IsChecked = r.FailedJobEnabled;
         AlertFailedJobLookbackBox.Text = r.FailedJobLookbackMinutes.ToString(CultureInfo.InvariantCulture);
+        AlertDatabaseStateCheckBox.IsChecked = r.DatabaseStateEnabled;
         AlertCooldownBox.Text = r.CooldownMinutes.ToString(CultureInfo.InvariantCulture);
         AnalysisEnabledCheckBox.IsChecked = r.AnalysisEnabled;
         AnalysisIntervalBox.Text = r.AnalysisIntervalMinutes.ToString(CultureInfo.InvariantCulture);
@@ -740,8 +758,10 @@ public partial class SettingsWindow : Window
             LongRunningQueryExcludeCdc = LrqExcludeCdcCheckBox.IsChecked == true,
             TempDbSpaceEnabled = AlertTempDbSpaceCheckBox.IsChecked == true,
             LowDiskEnabled = AlertLowDiskCheckBox.IsChecked == true,
+            PvsEnabled = AlertPvsCheckBox.IsChecked == true,
             LongRunningJobEnabled = AlertLongRunningJobCheckBox.IsChecked == true,
             FailedJobEnabled = AlertFailedJobCheckBox.IsChecked == true,
+            DatabaseStateEnabled = AlertDatabaseStateCheckBox.IsChecked == true,
             AnalysisEnabled = AnalysisEnabledCheckBox.IsChecked == true,
             AnalysisNotificationsEnabled = AnalysisNotificationsCheckBox.IsChecked == true,
             ExcludedDatabases = AlertExcludedDatabasesBox.Text
@@ -755,6 +775,10 @@ public partial class SettingsWindow : Window
             row.CpuThresholdPercent = cpu;
         if (int.TryParse(AlertBlockingThresholdBox.Text, out var blocking) && blocking > 0)
             row.BlockingCountThreshold = blocking;
+        /* #1839: >= 0, not > 0 like its siblings — 0 is this setting's OFF value, so rejecting it would
+           make the gate impossible to turn back off once enabled. */
+        if (int.TryParse(AlertBlockingWaitSecondsBox.Text, out var blockingWait) && blockingWait >= 0)
+            row.BlockingWaitSecondsThreshold = blockingWait;
         if (int.TryParse(AlertDeadlockThresholdBox.Text, out var deadlock) && deadlock > 0)
             row.DeadlockCountThreshold = deadlock;
         if (int.TryParse(AlertPoisonWaitThresholdBox.Text, out var poisonWait) && poisonWait > 0)
@@ -770,6 +794,10 @@ public partial class SettingsWindow : Window
             row.LowDiskThresholdPercent = lowDiskPct;
         if (int.TryParse(AlertLowDiskThresholdGbBox.Text, out var lowDiskGb) && lowDiskGb >= 0)
             row.LowDiskThresholdGb = lowDiskGb;
+        if (int.TryParse(AlertPvsThresholdPercentBox.Text, out var pvsPct) && pvsPct is >= 0 and <= 100)
+            row.PvsThresholdPercent = pvsPct;
+        if (int.TryParse(AlertPvsFloorGbBox.Text, out var pvsFloor) && pvsFloor >= 0)
+            row.PvsFloorGb = pvsFloor;
         if (int.TryParse(AlertLongRunningJobMultiplierBox.Text, out var jobMult) && jobMult is >= 2 and <= 20)
             row.LongRunningJobMultiplier = jobMult;
         if (int.TryParse(AlertFailedJobLookbackBox.Text, out var failedJobLookback) && failedJobLookback is >= 1 and <= 1440)
@@ -818,6 +846,7 @@ public partial class SettingsWindow : Window
         AlertCpuThresholdBox.Text = "80";
         AlertCpuModeBox.SelectedIndex = 0; // Total
         AlertBlockingThresholdBox.Text = "1";
+        AlertBlockingWaitSecondsBox.Text = "0";
         AlertDeadlockThresholdBox.Text = "1";
         AlertPoisonWaitThresholdBox.Text = "500";
         AlertLongRunningQueryThresholdBox.Text = "30";
@@ -831,6 +860,8 @@ public partial class SettingsWindow : Window
         AlertTempDbSpaceThresholdBox.Text = "80";
         AlertLowDiskThresholdPercentBox.Text = "10";
         AlertLowDiskThresholdGbBox.Text = "5";
+        AlertPvsThresholdPercentBox.Text = "40";
+        AlertPvsFloorGbBox.Text = "1";
         AlertLongRunningJobMultiplierBox.Text = "3";
         AlertFailedJobLookbackBox.Text = "60";
         AlertCooldownBox.Text = "5";
@@ -865,7 +896,12 @@ public partial class SettingsWindow : Window
             parts.Add($"{cpuLabel} > {AlertCpuThresholdBox.Text}%");
         }
         if (AlertBlockingCheckBox.IsChecked == true)
+        {
             parts.Add($"blocking >= {AlertBlockingThresholdBox.Text}");
+            /* #1839: only summarize the wait gate when it is actually on (0 = off). */
+            if (int.TryParse(AlertBlockingWaitSecondsBox.Text, out var blockingWaitPreview) && blockingWaitPreview > 0)
+                parts.Add($"blocked wait >= {blockingWaitPreview}s");
+        }
         if (AlertDeadlockCheckBox.IsChecked == true)
             parts.Add($"deadlocks >= {AlertDeadlockThresholdBox.Text}");
         if (AlertPoisonWaitCheckBox.IsChecked == true)
@@ -876,6 +912,8 @@ public partial class SettingsWindow : Window
             parts.Add($"tempdb > {AlertTempDbSpaceThresholdBox.Text}%");
         if (AlertLowDiskCheckBox.IsChecked == true)
             parts.Add($"disk free < {AlertLowDiskThresholdPercentBox.Text}% or {AlertLowDiskThresholdGbBox.Text}GB");
+        if (AlertPvsCheckBox.IsChecked == true)
+            parts.Add($"PVS >= {AlertPvsThresholdPercentBox.Text}% of database");
         if (AlertLongRunningJobCheckBox.IsChecked == true)
             parts.Add($"jobs > {AlertLongRunningJobMultiplierBox.Text}x avg");
         if (AlertFailedJobCheckBox.IsChecked == true)
@@ -901,6 +939,7 @@ public partial class SettingsWindow : Window
         AlertCpuModeBox.IsEnabled = enabled;
         AlertBlockingCheckBox.IsEnabled = enabled;
         AlertBlockingThresholdBox.IsEnabled = enabled;
+        AlertBlockingWaitSecondsBox.IsEnabled = enabled;
         AlertDeadlockCheckBox.IsEnabled = enabled;
         AlertDeadlockThresholdBox.IsEnabled = enabled;
         AlertPoisonWaitCheckBox.IsEnabled = enabled;
@@ -918,6 +957,9 @@ public partial class SettingsWindow : Window
         AlertTempDbSpaceThresholdBox.IsEnabled = enabled;
         AlertLowDiskCheckBox.IsEnabled = enabled;
         AlertLowDiskThresholdPercentBox.IsEnabled = enabled;
+        AlertPvsCheckBox.IsEnabled = enabled;
+        AlertPvsThresholdPercentBox.IsEnabled = enabled;
+        AlertPvsFloorGbBox.IsEnabled = enabled;
         AlertLowDiskThresholdGbBox.IsEnabled = enabled;
         AlertLongRunningJobCheckBox.IsEnabled = enabled;
         AlertLongRunningJobMultiplierBox.IsEnabled = enabled;
@@ -967,10 +1009,16 @@ public partial class SettingsWindow : Window
             : r.GenericBodyTemplate;
         GenericWebhookProxyAddressBox.Text = r.GenericProxy;
 
+        PagerDutyWebhookEnabledCheckBox.IsChecked = !string.IsNullOrWhiteSpace(r.PagerDutyRoutingKey);
+        PagerDutyRoutingKeyBox.Text = r.PagerDutyRoutingKey;
+        PagerDutyEuRegionCheckBox.IsChecked = r.PagerDutyUseEuRegion;
+        PagerDutyProxyAddressBox.Text = r.PagerDutyProxy;
+
         UpdateSmtpControlStates();
         UpdateTeamsControlStates();
         UpdateSlackControlStates();
         UpdateGenericControlStates();
+        UpdatePagerDutyControlStates();
     }
 
     /// <summary>Builds the <see cref="NotificationRow"/> from the SMTP + webhook controls. A DISABLED channel
@@ -1028,6 +1076,13 @@ public partial class SettingsWindow : Window
             {
                 errors.Add(configError);
             }
+        }
+
+        if (PagerDutyWebhookEnabledCheckBox.IsChecked == true)
+        {
+            row.PagerDutyRoutingKey = PagerDutyRoutingKeyBox.Text?.Trim() ?? "";
+            row.PagerDutyUseEuRegion = PagerDutyEuRegionCheckBox.IsChecked == true;
+            row.PagerDutyProxy = PagerDutyProxyAddressBox.Text?.Trim() ?? "";
         }
 
         return row;
@@ -1112,7 +1167,7 @@ public partial class SettingsWindow : Window
         }
         finally
         {
-            TestEmailButton.Content = "Send Test Email";
+            TestEmailButton.Content = "Send Test _Email";
             TestEmailButton.IsEnabled = true;
         }
     }
@@ -1149,6 +1204,48 @@ public partial class SettingsWindow : Window
         TestGenericButton.IsEnabled = enabled;
     }
 
+    private void PagerDutyWebhookEnabledCheckBox_Changed(object sender, RoutedEventArgs e) => UpdatePagerDutyControlStates();
+
+    private void UpdatePagerDutyControlStates()
+    {
+        var enabled = PagerDutyWebhookEnabledCheckBox.IsChecked == true;
+        PagerDutyRoutingKeyBox.IsEnabled = enabled;
+        PagerDutyEuRegionCheckBox.IsEnabled = enabled;
+        PagerDutyProxyAddressBox.IsEnabled = enabled;
+        TestPagerDutyButton.IsEnabled = enabled;
+    }
+
+    private async void TestPagerDutyButton_Click(object sender, RoutedEventArgs e)
+    {
+        TestPagerDutyButton.IsEnabled = false;
+        TestPagerDutyButton.Content = "Sending...";
+
+        try
+        {
+            var routingKey = PagerDutyRoutingKeyBox.Text?.Trim() ?? "";
+            var useEuRegion = PagerDutyEuRegionCheckBox.IsChecked == true;
+            var error = await WebhookAlertService.SendTestPagerDutyAsync(routingKey, useEuRegion, s_branding, PagerDutyProxyAddressBox.Text?.Trim());
+
+            if (error == null)
+            {
+                MessageBox.Show("PagerDuty test notification sent successfully!", "Test Webhook", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            else
+            {
+                MessageBox.Show($"Failed to send PagerDuty test notification:\n\n{error}", "Test Webhook Failed", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Failed to send PagerDuty test notification:\n\n{ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            TestPagerDutyButton.Content = "Send Test Notification";
+            TestPagerDutyButton.IsEnabled = true;
+        }
+    }
+
     private async void TestTeamsButton_Click(object sender, RoutedEventArgs e)
     {
         TestTeamsButton.IsEnabled = false;
@@ -1175,7 +1272,7 @@ public partial class SettingsWindow : Window
         }
         finally
         {
-            TestTeamsButton.Content = "Send Test Notification";
+            TestTeamsButton.Content = "Send Test to _Teams";
             TestTeamsButton.IsEnabled = true;
         }
     }
@@ -1206,7 +1303,7 @@ public partial class SettingsWindow : Window
         }
         finally
         {
-            TestSlackButton.Content = "Send Test Notification";
+            TestSlackButton.Content = "Send Test to Slac_k";
             TestSlackButton.IsEnabled = true;
         }
     }
@@ -1267,7 +1364,7 @@ public partial class SettingsWindow : Window
         }
         finally
         {
-            TestGenericButton.Content = "Send Test Notification";
+            TestGenericButton.Content = "Send Test to _Webhook";
             TestGenericButton.IsEnabled = true;
         }
     }
@@ -1424,6 +1521,11 @@ public partial class SettingsWindow : Window
         public string GenericWebhookHeadersJson { get; private init; } = "";
         public string GenericWebhookBodyTemplate { get; private init; } = "";
         public string GenericWebhookProxyAddress { get; private init; } = "";
+
+        public bool PagerDutyEnabled { get; private init; }
+        public string PagerDutyRoutingKey { get; private init; } = "";
+        public bool PagerDutyUseEuRegion { get; private init; }
+        public string PagerDutyProxyAddress { get; private init; } = "";
 
         public double AnalysisNotifySeverity { get; private init; }
         public int AnalysisNotifyCooldownMinutes { get; private init; }

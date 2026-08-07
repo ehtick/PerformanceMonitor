@@ -88,6 +88,7 @@ public sealed class AlertEngine
        the deliverer's own email/webhook cooldown seeds, not these). */
     private readonly ConcurrentDictionary<string, DateTime> _lastCpuAlert = new();
     private readonly ConcurrentDictionary<string, DateTime> _lastBlockingAlert = new();
+    private readonly ConcurrentDictionary<string, DateTime> _lastBlockingWaitAlert = new();
     private readonly ConcurrentDictionary<string, DateTime> _lastDeadlockAlert = new();
     private readonly ConcurrentDictionary<string, DateTime> _lastPoisonWaitAlert = new();
     private readonly ConcurrentDictionary<string, DateTime> _lastLongRunningQueryAlert = new();
@@ -103,6 +104,7 @@ public sealed class AlertEngine
        Lite's MainWindow.xaml.cs:78-89. */
     private readonly ConcurrentDictionary<string, bool> _activeCpuAlert = new();
     private readonly ConcurrentDictionary<string, bool> _activeBlockingAlert = new();
+    private readonly ConcurrentDictionary<string, bool> _activeBlockingWaitAlert = new();
     private readonly ConcurrentDictionary<string, bool> _activeDeadlockAlert = new();
     private readonly ConcurrentDictionary<string, bool> _activePoisonWaitAlert = new();
     private readonly ConcurrentDictionary<string, bool> _activeLongRunningQueryAlert = new();
@@ -114,6 +116,12 @@ public sealed class AlertEngine
        MainWindow.xaml.cs:88; gated by LowDiskAlertGate; removed on resolve. */
     private readonly ConcurrentDictionary<string, double> _lastAlertedLowDiskPercent = new();
 
+    /* #1984 — the PVS twins of the low-disk trio: cooldown watermark, standing-condition flag
+       for the resolved transition, and the PvsAlertGate worsening watermark. */
+    private readonly ConcurrentDictionary<string, DateTime> _lastPvsAlert = new();
+    private readonly ConcurrentDictionary<string, bool> _activePvsAlert = new();
+    private readonly ConcurrentDictionary<string, double> _lastAlertedPvsPercent = new();
+
     /* Rolling-count edge-trigger watermarks (#1091) — Lite's MainWindow.xaml.cs:103-104;
        persisted through IAlertStateStore on change (#1145). */
     private readonly ConcurrentDictionary<string, int> _lastAlertedBlockingCount = new();
@@ -122,6 +130,14 @@ public sealed class AlertEngine
     /* Newest already-alerted failed-job run time (SERVER-LOCAL) — Lite's MainWindow.xaml.cs:96;
        persisted through IAlertStateStore on change (#1145 parity). */
     private readonly ConcurrentDictionary<string, DateTime> _lastAlertedFailedJobTime = new();
+
+    /* Database-state alert (offline/unhealthy) — a PER-DATABASE standing condition. The active set is
+       the databases currently alerting on this server (outer keyed serverKey; the inner set is only
+       ever touched under this server's evaluation gate, so a plain HashSet is safe). The cooldown dict
+       is keyed per database (serverKey + "|" + dbName) so each database throttles independently, and
+       an entry is removed when its database recovers. In-memory only, like the other family state. */
+    private readonly ConcurrentDictionary<string, HashSet<string>> _activeDatabaseStateAlerts = new();
+    private readonly ConcurrentDictionary<string, DateTime> _lastDatabaseStateAlert = new();
 
     /// <param name="settings">Live threshold surface — read every sweep, never cached.</param>
     /// <param name="readAdapter">The collected alert feeds (slice B seam).</param>
@@ -216,8 +232,10 @@ public sealed class AlertEngine
         await CheckLongRunningQueriesAsync(key, serverName, now, alertCooldown, suppressed, ct);
         await CheckTempDbSpaceAsync(key, serverName, now, alertCooldown, suppressed, ct);
         bool lowDiskConditionPresent = await CheckLowDiskAsync(key, serverName, now, alertCooldown, suppressed, ct);
+        await CheckPvsPressureAsync(key, serverName, now, alertCooldown, suppressed, ct);
         await CheckAnomalousJobsAsync(key, serverName, now, alertCooldown, suppressed, ct);
         bool failedJobConditionPresent = await CheckFailedJobsAsync(snapshot, key, serverName, now, alertCooldown, suppressed, ct);
+        await CheckDatabaseStateAsync(key, serverName, now, alertCooldown, suppressed, ct);
 
         return new AlertSweepResult(true, lowDiskConditionPresent, failedJobConditionPresent);
     }
@@ -298,14 +316,18 @@ public sealed class AlertEngine
 
                 var cpuDetailText = $"  {cpuMetricLabel}: {alertCpuValue:F0}%\n  Threshold: {_settings.CpuThresholdPercent}%"; /* :89 */
 
-                /* :91-98 — CPU passes no context and no numerics, exactly Lite.
-                   ShortMessage = the toast body of :84 minus the server-name prefix. */
+                /* :91-98 — CPU passes no context; ShortMessage = the toast body of :84 minus the
+                   server-name prefix. The numerics are REQUIRED, not optional (#1830): the ported
+                   no-numerics form left the history stores parsing "87% (Total CPU)", which fails on
+                   the parenthesized label, so every High CPU row stored current_value 0 in Lite AND
+                   Darling while the toast/email/webhook text stayed correct. HasValue is guaranteed
+                   here — cpuExceeded requires it. */
                 await FireAsync(new AlertOutcome(
                     key, serverName, "High CPU",
                     $"{alertCpuValue:F0}% ({cpuMetricLabel})",
                     $"{_settings.CpuThresholdPercent}%",
                     Context: null, DetailText: cpuDetailText,
-                    NumericCurrentValue: null, NumericThresholdValue: null,
+                    NumericCurrentValue: alertCpuValue, NumericThresholdValue: _settings.CpuThresholdPercent,
                     Muted: isMuted, Severity: null,
                     ShortMessage: $"{cpuMetricLabel} at {alertCpuValue:F0}% (threshold: {_settings.CpuThresholdPercent}%)"), ct);
             }
@@ -400,14 +422,15 @@ public sealed class AlertEngine
             var detailText = AlertContextBuilders.ContextToDetailText(blockingContext);
 
             /* :175-183 — SendDetectedAlertAsync's #1141/#1236 delivery-mode fan-out is an
-               IAlertDeliverer concern; the engine emits one outcome. No numerics, exactly Lite.
-               ShortMessage = the toast body of :167. */
+               IAlertDeliverer concern; the engine emits one outcome. ShortMessage = the toast body
+               of :167. Numerics carried explicitly (#1830): the count text happens to parse today,
+               but the stored value must not depend on parse luck. */
             await FireAsync(new AlertOutcome(
                 key, serverName, "Blocking Detected",
                 effectiveBlockingCount.ToString(),
                 _settings.BlockingCountThreshold.ToString(),
                 blockingContext, detailText,
-                NumericCurrentValue: null, NumericThresholdValue: null,
+                NumericCurrentValue: effectiveBlockingCount, NumericThresholdValue: _settings.BlockingCountThreshold,
                 Muted: isMuted, Severity: blockingContext?.SeverityOverride,
                 ShortMessage: $"{effectiveBlockingCount} blocking session(s)"), ct);
         }
@@ -419,6 +442,106 @@ public sealed class AlertEngine
                     key, serverName, "Blocking Detected",
                     "Blocking Cleared",                                             /* :190 */
                     $"{serverName}: No active blocking"), ct);                      /* :191 */
+            }
+        }
+
+        /* #1839 — the second, independent blocking gate, evaluated here so it can reuse THIS sweep's
+           blocked-process rows for its content instead of refetching them. Deliberately downstream of
+           the count gate's fetch-failure `return` above: when the store can't answer for blocked
+           processes it can't answer for blocking snapshots either, and firing a wait alert with no
+           incident content is worse than skipping the sweep (state untouched, same as every other
+           check's failure shape). */
+        await CheckBlockingWaitAsync(key, serverName, now, alertCooldown, suppressed, blockingRows, ct);
+    }
+
+    /* ---------------- blocking wait time (#1839) ---------------- */
+
+    /// <summary>
+    /// The total-blocked-wait gate: LEVEL-triggered on the sum of <c>wait_time_ms</c> in the latest
+    /// blocking snapshot, mirroring the High CPU mechanism above (active flag → cooldown re-fire while
+    /// still above → resolve on the way down) rather than the count gate's rolling-window edge trigger.
+    /// The two answer different questions — a count cannot distinguish one session blocked for an hour
+    /// from one blocked for a second — so this reports under its OWN metric name, keeping mute rules,
+    /// history rows and cooldown state from tangling with "Blocking Detected".
+    /// <para>
+    /// Both gates sit under <see cref="IAlertEngineSettings.BlockingEnabled"/>: turning blocking alerts
+    /// off must silence both, exactly as a user reading one toggle would expect. With the threshold at
+    /// its shipped 0 the adapter read never happens at all.
+    /// </para>
+    /// </summary>
+    private async Task CheckBlockingWaitAsync(
+        string key, string serverName, DateTime now, TimeSpan alertCooldown, bool suppressed,
+        List<BlockedProcessAlertRow>? blockingRows, CancellationToken ct)
+    {
+        int thresholdSeconds = _settings.BlockingWaitSecondsThreshold;
+        bool enabled = _settings.BlockingEnabled && thresholdSeconds > 0;
+
+        CurrentBlockingWaitResult? current = null;
+        if (enabled)
+        {
+            try
+            {
+                current = await _readAdapter.GetCurrentBlockingWaitAsync(key, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                /* Log and skip for the sweep — state untouched, so a transient store error neither
+                   fires nor resolves (the same adaptation (2) shape as the count gate). */
+                _logger?.LogError("Failed to check blocking wait time for {Server}: {Message}", serverName, ex.Message);
+                return;
+            }
+        }
+
+        /* A stale snapshot is NOT evidence (#1812's rule): it neither fires nor holds the alert
+           active — see CurrentBlockingWaitResult for why staleness resolves here but not for jobs. */
+        long thresholdMs = (long)thresholdSeconds * 1000L;
+        bool exceeded = enabled
+            && current is { SnapshotIsFresh: true }
+            && current.TotalWaitMs >= thresholdMs;
+
+        if (exceeded)
+        {
+            _activeBlockingWaitAlert[key] = true;
+            if (!suppressed && CooldownElapsed(_lastBlockingWaitAlert, key, now, alertCooldown))
+            {
+                var muteCtx = new AlertMuteContext { ServerName = serverName, MetricName = "Blocking Wait Time" };
+                bool isMuted = _isAlertMuted(muteCtx);
+                _lastBlockingWaitAlert[key] = now;                                  /* stamped even when muted */
+
+                /* Same incident content the count gate ships, built from the rows this sweep already
+                   fetched — an operator who gets this alert gets today's Blocking Detected detail. */
+                var blockingContext = AlertContextBuilders.BuildBlockingContext(serverName, blockingRows, _settings.ExcludedDatabases);
+                var detailText = AlertContextBuilders.ContextToDetailText(blockingContext);
+
+                /* REAL numerics (#1830): the display text is prose ("745s across 3 blocked session(s)"),
+                   which no history-store parser could turn back into a number — the value has to travel
+                   as a number or every history row lands at 0, which is the defect #1830 just fixed. */
+                double totalWaitSeconds = current!.TotalWaitSeconds;
+                await FireAsync(new AlertOutcome(
+                    key, serverName, "Blocking Wait Time",
+                    $"{totalWaitSeconds:F0}s across {current.BlockedSessionCount} blocked session(s)",
+                    $"{thresholdSeconds}s",
+                    blockingContext, detailText,
+                    NumericCurrentValue: totalWaitSeconds, NumericThresholdValue: thresholdSeconds,
+                    Muted: isMuted, Severity: blockingContext?.SeverityOverride,
+                    ShortMessage: $"{totalWaitSeconds:F0}s total blocked wait across {current.BlockedSessionCount} session(s) (threshold: {thresholdSeconds}s)"), ct);
+            }
+        }
+        else if (_activeBlockingWaitAlert.TryGetValue(key, out var wasActive) && wasActive)
+        {
+            _activeBlockingWaitAlert[key] = false;
+            /* Announced only while the gate is still on — disabling it, or zeroing the threshold, flips
+               `exceeded` false without blocking having actually cleared (the CPU check's rule). */
+            if (!suppressed && enabled)
+            {
+                await NotifyResolutionAsync(new AlertResolution(
+                    key, serverName, "Blocking Wait Time",
+                    "Blocking Wait Cleared",
+                    $"{serverName}: Total blocked wait back under {thresholdSeconds}s"), ct);
             }
         }
     }
@@ -486,13 +609,14 @@ public sealed class AlertEngine
             var deadlockContext = AlertContextBuilders.BuildDeadlockContext(serverName, deadlockRows, _settings.ExcludedDatabases);
             var detailText = AlertContextBuilders.ContextToDetailText(deadlockContext);
 
-            /* :252-260 — no numerics, exactly Lite. ShortMessage = the toast body of :244. */
+            /* :252-260 — ShortMessage = the toast body of :244. Numerics carried explicitly (#1830):
+               the count text happens to parse today, but the stored value must not depend on parse luck. */
             await FireAsync(new AlertOutcome(
                 key, serverName, "Deadlocks Detected",
                 effectiveDeadlockCount.ToString(),
                 _settings.DeadlockCountThreshold.ToString(),
                 deadlockContext, detailText,
-                NumericCurrentValue: null, NumericThresholdValue: null,
+                NumericCurrentValue: effectiveDeadlockCount, NumericThresholdValue: _settings.DeadlockCountThreshold,
                 Muted: isMuted, Severity: deadlockContext?.SeverityOverride,
                 ShortMessage: $"{effectiveDeadlockCount} deadlock(s) in the last hour"), ct);
         }
@@ -799,6 +923,83 @@ public sealed class AlertEngine
         return conditionPresent;
     }
 
+    /* ---------------- persistent version store (#1984) ---------------- */
+
+    /// <summary>
+    /// The ADR persistent-version-store twin of <see cref="CheckLowDiskAsync"/>: reads the newest
+    /// pvs_stats snapshot's ADR databases, breaches on PVS percent-of-database AND the GB floor
+    /// (<see cref="AlertContextBuilders.GetBreachedPvsDatabases"/>), names the worst database with
+    /// up to five breaching in the context, and re-fires only on a fresh or worsening breach
+    /// (<see cref="PvsAlertGate"/>) — a large PVS stays allocated even after its cause clears, so
+    /// without the gate a recovered incident would re-notify every cooldown for hours. No severity
+    /// tier: MS documents no "critical" PVS level, and inventing one is the folklore the collector
+    /// deliberately avoided. Level-triggered with a resolved transition when no database breaches.
+    /// </summary>
+    private async Task CheckPvsPressureAsync(
+        string key, string serverName, DateTime now, TimeSpan alertCooldown, bool suppressed, CancellationToken ct)
+    {
+        if (!_settings.PvsEnabled || _settings.PvsThresholdPercent <= 0)
+        {
+            return;
+        }
+
+        try
+        {
+            var databases = await _readAdapter.GetPvsPressureAsync(key, ct);
+            var breached = AlertContextBuilders.GetBreachedPvsDatabases(databases, _settings.PvsThresholdPercent, _settings.PvsFloorGb);
+
+            if (breached.Count > 0)
+            {
+                var worst = breached[0];
+                _activePvsAlert[key] = true;
+                double? lastPvsPercent =
+                    _lastAlertedPvsPercent.TryGetValue(key, out var pvsPct) ? pvsPct : (double?)null;
+                if (!suppressed
+                    && PvsAlertGate.ShouldAlert(worst.PvsPercent, lastPvsPercent)
+                    && CooldownElapsed(_lastPvsAlert, key, now, alertCooldown))
+                {
+                    var muteCtx = new AlertMuteContext { ServerName = serverName, MetricName = "Version Store (PVS)" };
+                    bool isMuted = _isAlertMuted(muteCtx);
+                    _lastPvsAlert[key] = now;
+                    _lastAlertedPvsPercent[key] = worst.PvsPercent;
+
+                    var pvsContext = AlertContextBuilders.BuildPvsPressureContext(serverName, breached);
+                    var detailText = AlertContextBuilders.ContextToDetailText(pvsContext);
+
+                    await FireAsync(new AlertOutcome(
+                        key, serverName, "Version Store (PVS)",
+                        $"{worst.DatabaseName} PVS {worst.PvsPercent:F0}% of database ({worst.PvsGb:F1} GB)",
+                        AlertContextBuilders.FormatPvsThreshold(_settings.PvsThresholdPercent, _settings.PvsFloorGb),
+                        pvsContext, detailText,
+                        NumericCurrentValue: worst.PvsPercent,
+                        NumericThresholdValue: _settings.PvsThresholdPercent,
+                        Muted: isMuted, Severity: null,
+                        ShortMessage: $"{worst.DatabaseName} PVS {worst.PvsPercent:F0}% of database ({worst.PvsGb:F1} GB)"), ct);
+                }
+            }
+            else if (_activePvsAlert.TryGetValue(key, out var wasPvs) && wasPvs)
+            {
+                _activePvsAlert[key] = false;
+                _lastAlertedPvsPercent.TryRemove(key, out _);
+                if (!suppressed)
+                {
+                    await NotifyResolutionAsync(new AlertResolution(
+                        key, serverName, "Version Store (PVS)",
+                        "Version Store (PVS) Resolved",
+                        $"{serverName}: All version stores back below threshold"), ct);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError("Failed to check PVS pressure for {Server}: {Message}", serverName, ex.Message);
+        }
+    }
+
     /* ---------------- anomalous Agent jobs (Lite AlertEngine.cs:557-632) ---------------- */
 
     private async Task CheckAnomalousJobsAsync(
@@ -965,6 +1166,145 @@ public sealed class AlertEngine
 
         return conditionPresent;
     }
+
+    /* ---------------- database state (offline / unhealthy) ---------------- */
+
+    /// <summary>
+    /// Fires when a monitored database's current state DEVIATES from its expected state — the
+    /// expected state being the auto-seeded first-observation baseline or the operator's per-database
+    /// override (a log-shipping secondary baselines at STANDBY and so never alerts; an "ignore"
+    /// override opts a database out entirely). The store computes the deviating set (a two-sample rule)
+    /// and does the baseline/ignore comparison (see <see cref="IAlertReadAdapter.GetDatabaseStatesAsync"/>); this
+    /// method owns the per-database fire/cooldown/resolution and mute gating. PER-DATABASE: each
+    /// deviating database fires and cools down independently, and emits a "recovered" resolution when
+    /// its state returns to expected. Severity is graded at the fire site
+    /// (<see cref="DatabaseStateTokens.SeverityFor"/>): CRITICAL for the integrity-failure states,
+    /// WARNING otherwise. The shared <see cref="IAlertEngineSettings.ExcludedDatabases"/> list is
+    /// honoured (parity with the other database-scoped alerts). The read is not freshness-gated (a
+    /// standing condition).
+    /// </summary>
+    private async Task CheckDatabaseStateAsync(
+        string key, string serverName, DateTime now, TimeSpan alertCooldown, bool suppressed, CancellationToken ct)
+    {
+        if (!_settings.DatabaseStateEnabled)
+        {
+            return;
+        }
+
+        List<DatabaseStateInfo> deviations;
+        try
+        {
+            deviations = await _readAdapter.GetDatabaseStatesAsync(key, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            /* Log-and-skip, like the other collected reads: never resolve an active database on a
+               failed fetch (that would fabricate a recovery), and never fire on absent evidence. */
+            _logger?.LogError("Failed to check database state for {Server}: {Message}", serverName, ex.Message);
+            return;
+        }
+
+        var excluded = _settings.ExcludedDatabases;
+
+        /* The store already filtered to deviations (current != expected, not ignored); here we only
+           drop databases on the shared excluded list, for parity with the other database-scoped alerts.
+           Per-database keys (this dict and the active set below) are ORDINAL — case-sensitive — to match
+           the stores' case-sensitive expected-state joins, so a database can't key differently here than
+           it does in the baseline table. The excluded-databases list stays case-insensitive, matching the
+           other alerts' treatment of that user-facing list. */
+        var current = new Dictionary<string, DatabaseStateInfo>(StringComparer.Ordinal);
+        foreach (var db in deviations)
+        {
+            if (string.IsNullOrWhiteSpace(db.StateDesc) || string.IsNullOrWhiteSpace(db.DatabaseName))
+            {
+                continue;
+            }
+
+            if (excluded.Count > 0 && excluded.Any(e => string.Equals(e, db.DatabaseName, StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            current[db.DatabaseName] = db;
+        }
+
+        /* Inner set is only touched under this server's evaluation gate (see class remarks), so a
+           plain HashSet is safe; the outer dictionary is concurrent across servers. */
+        var active = _activeDatabaseStateAlerts.GetOrAdd(key, _ => new HashSet<string>(StringComparer.Ordinal));
+
+        foreach (var (dbName, db) in current)
+        {
+            active.Add(dbName);
+            var cooldownKey = DatabaseStateCooldownKey(key, dbName);
+            if (!suppressed && CooldownElapsed(_lastDatabaseStateAlert, cooldownKey, now, alertCooldown))
+            {
+                var severity = DatabaseStateTokens.SeverityFor(db.StateDesc);
+                var stateText = DatabaseStateTokens.Humanize(db.StateDesc);
+                /* An empty expected state means this database was first observed in a critical state and
+                   has no accepted baseline yet (see IAlertReadAdapter.GetDatabaseStatesAsync) — surface it
+                   as a first-observation alert rather than "expected UNKNOWN". */
+                bool pending = string.IsNullOrEmpty(db.ExpectedState);
+                var expectedText = pending ? "(no baseline yet)" : DatabaseStateTokens.Humanize(db.ExpectedState);
+                var muteCtx = new AlertMuteContext
+                {
+                    ServerName = serverName,
+                    MetricName = DatabaseStateTokens.MetricName,
+                    DatabaseName = dbName
+                };
+                bool isMuted = _isAlertMuted(muteCtx);
+                _lastDatabaseStateAlert[cooldownKey] = now; /* stamped even when muted, like the others */
+
+                var detailText = pending
+                    ? $"  Database: {dbName}\n  Current: {stateText}\n  First observed in a critical state — no baseline established yet."
+                    : $"  Database: {dbName}\n  Expected: {expectedText}\n  Current: {stateText}";
+                var shortMessage = pending
+                    ? $"{dbName} first observed {stateText} (no baseline yet)"
+                    : $"{dbName} changed to {stateText} (expected {expectedText})";
+
+                await FireAsync(new AlertOutcome(
+                    key, serverName, DatabaseStateTokens.MetricName,
+                    $"{dbName}: {stateText}",
+                    expectedText,
+                    Context: null, DetailText: detailText,
+                    NumericCurrentValue: null, NumericThresholdValue: null,
+                    Muted: isMuted, Severity: severity,
+                    ShortMessage: shortMessage), ct);
+            }
+        }
+
+        /* Databases that were alerting but no longer deviate (state returned to expected, or the
+           operator re-baselined / set the override to match) — announce a per-database recovery and
+           drop their cooldown. Guarded by the master enable (we're past the early return), matching
+           the other families' "only announce recovery while still enabled". */
+        if (active.Count > 0)
+        {
+            var recovered = active.Where(d => !current.ContainsKey(d)).ToList();
+            foreach (var dbName in recovered)
+            {
+                active.Remove(dbName);
+                _lastDatabaseStateAlert.TryRemove(DatabaseStateCooldownKey(key, dbName), out _);
+                if (!suppressed)
+                {
+                    await NotifyResolutionAsync(new AlertResolution(
+                        key, serverName, DatabaseStateTokens.MetricName,
+                        "Database State Resolved",
+                        $"{serverName}: {dbName} back to expected state"), ct);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Per-database cooldown key. The serverKey is always a digit-only int (see the adapters'
+    /// ParseServerKey), so the first '|' unambiguously ends it regardless of what the database name
+    /// contains — no collision between e.g. (server 1, db "23") and (server 12, db "3").
+    /// </summary>
+    private static string DatabaseStateCooldownKey(string serverKey, string dbName) =>
+        serverKey + "|" + dbName;
 
     /* ---------------- helpers ---------------- */
 

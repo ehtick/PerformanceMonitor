@@ -129,6 +129,53 @@ else {
     Write-Host "Created service '$serviceName' (NT SERVICE virtual account, automatic start)."
 }
 
+# The account the service ACTUALLY logs on as - NOT assumed to be the virtual account. Operators using
+# integrated auth to monitored servers re-home the service to a domain account or gMSA (#1802, #1823),
+# and the upgrade path above deliberately preserves that (sc config touches binPath only). The 4b
+# hardening below must grant the account the service really runs as: rebuilding the DACL around the
+# virtual account on a re-homed install would strip the operator's grant and lock the service out of
+# its own config on the next start. Fresh installs resolve to the virtual account just created.
+#
+# Resolution failure is NOT a silent fallback. On the FRESH path the default is provably right - sc create
+# above set that very account - so a WMI hiccup there costs nothing and only warns. On the UPGRADE path we
+# do not know what the service was re-homed to, and guessing the virtual account is exactly the lockout
+# this resolution exists to prevent, so it stops the install instead of quietly ACLing the wrong principal.
+# sc.exe qc is tried first as a non-WMI second opinion, so a broken WMI repository alone cannot brick an
+# upgrade; its field labels are localized, so a non-match there just falls through to the loud failure.
+$serviceAccount = "NT SERVICE\$serviceName"
+$startName = $null
+try {
+    $startName = (Get-CimInstance -ClassName Win32_Service -Filter "Name='$serviceName'" -ErrorAction Stop).StartName
+}
+catch {
+    Write-Host "Get-CimInstance could not read the service's logon account ($($_.Exception.Message)) - falling back to sc.exe qc." -ForegroundColor Yellow
+    $qc = & sc.exe qc $serviceName 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        $match = $qc | Select-String -Pattern '^\s*SERVICE_START_NAME\s*:\s*(\S.*?)\s*$'
+        if ($match) { $startName = $match.Matches[0].Groups[1].Value }
+    }
+}
+
+if ($startName) {
+    if ($startName -eq 'LocalSystem') { $serviceAccount = 'NT AUTHORITY\SYSTEM' }
+    else { $serviceAccount = $startName -replace '^\.\\', "$env:COMPUTERNAME\" }
+}
+elseif ($existing) {
+    Fail @"
+Could not determine which account service '$serviceName' logs on as, and it already existed before this run.
+Assuming the default virtual account would re-ACL darling.json around 'NT SERVICE\$serviceName' and strip the
+grant of whatever domain account or gMSA the service was re-homed to (#1802, #1823), locking it out of its own
+config on the next start - so this install stops here instead. Nothing was ACLed; the service is stopped with
+its binPath already updated.
+
+Check the account, then re-run this script:
+  sc.exe qc $serviceName
+"@
+}
+else {
+    Write-Host "Could not determine the service's logon account; using the virtual account 'NT SERVICE\$serviceName' that sc create just set." -ForegroundColor Yellow
+}
+
 # -- 4b. Lock down darling.json (#1647) -----------------------------------------------------------
 # The config holds every monitored server's encryptedPassword plus the MCP bearer and web access tokens.
 # They are DPAPI LocalMachine scope with an entropy constant that ships in the open-source repo, so READ
@@ -148,7 +195,7 @@ else {
 # inheritable ACEs instead, so on an install under C:\ every past edit left a world-readable copy of the
 # same secrets. The service hardens new backups itself now; these are the ones already on disk.
 #
-# The service account is also made the OWNER, best-effort and separately from the DACL. Ownership carries
+# The service account is also made the OWNER, best-effort and in a try of its own. Ownership carries
 # WRITE_DAC implicitly, which is what lets the service re-assert this ACL at every start. Granting it
 # FullControl below achieves the same thing today; owning the file means it still holds if someone later
 # edits the DACL and drops that grant. Done AFTER the DACL and in its own try, so a SeRestorePrivilege
@@ -162,7 +209,7 @@ foreach ($secretFile in @($configPath) + @(Get-ChildItem -Path $root -Filter 'da
         $systemSid      = New-Object System.Security.Principal.SecurityIdentifier($wk::LocalSystemSid, $null)
         $adminsSid      = New-Object System.Security.Principal.SecurityIdentifier($wk::BuiltinAdministratorsSid, $null)
         $interactiveSid = New-Object System.Security.Principal.SecurityIdentifier($wk::InteractiveSid, $null)
-        $serviceSid     = (New-Object System.Security.Principal.NTAccount("NT SERVICE\$serviceName")).Translate([System.Security.Principal.SecurityIdentifier])
+        $serviceSid     = (New-Object System.Security.Principal.NTAccount($serviceAccount)).Translate([System.Security.Principal.SecurityIdentifier])
 
         $acl = New-Object System.Security.AccessControl.FileSecurity
         # Protect the DACL and drop every inherited ACE: access is now EXACTLY the four rules below.
@@ -184,8 +231,19 @@ foreach ($secretFile in @($configPath) + @(Get-ChildItem -Path $root -Filter 'da
         }
         Set-Acl -Path $secretFile -AclObject $acl
 
+        # The owner goes onto the file's CURRENT descriptor, never a fresh FileSecurity (#1957). Set-Acl applies
+        # the whole descriptor it is handed, so a bare object carrying nothing but an owner also wrote an empty,
+        # UNPROTECTED DACL - which re-enabled inheritance and handed BUILTIN\Users read straight back on an
+        # install under C:\. Measured on a scratch layout under C:\: immediately after this step the file read
+        # protected=False with BUILTIN\Users present, all four inherited ACEs back and every hardened ACE gone.
+        # So the verification below was failing HONESTLY - the file really was exposed at that instant - and the
+        # SECURITY WARNING that fired on three consecutive field installs was right about a hole this script had
+        # just opened itself. It stayed invisible because #1818's startup sweep re-hardens the config and its
+        # backups seconds later at the first service start, so an operator's before/after ACL captures both
+        # looked correct and only the installer disagreed. Re-reading first keeps the DACL written above in the
+        # descriptor that gets applied, which is what makes the verified state the FINAL state.
         try {
-            $owner = New-Object System.Security.AccessControl.FileSecurity
+            $owner = Get-Acl -Path $secretFile
             $owner.SetOwner($serviceSid)
             Set-Acl -Path $secretFile -AclObject $owner
         }
@@ -214,6 +272,7 @@ foreach ($secretFile in @($configPath) + @(Get-ChildItem -Path $root -Filter 'da
 
 if ($hardened.Count -gt 0) {
     Write-Host "Restricted $($hardened.Count) credential file(s) to SYSTEM, Administrators, and the service account (they hold encrypted passwords and access tokens). darling.json additionally allows INTERACTIVE read, which the Viewer and the CLI verbs need; its .bak-* copies do not."
+    Write-Host 'The service re-verifies and re-applies these ACLs on every start (#1818), so this is a floor rather than a one-time act: a later edit that loosens one is repaired at the next start without re-running the installer.'
 }
 if ($failed.Count -gt 0) {
     Write-Host ''
@@ -224,7 +283,7 @@ if ($failed.Count -gt 0) {
     Write-Host '  the file can recover all of it. Fix each one from an elevated prompt:' -ForegroundColor Red
     Write-Host "    icacls `"<file>`" /inheritance:d" -ForegroundColor Yellow
     Write-Host "    icacls `"<file>`" /remove:g `"BUILTIN\Users`"" -ForegroundColor Yellow
-    Write-Host "    icacls `"<file>`" /grant `"NT SERVICE\$serviceName`:(F)`"" -ForegroundColor Yellow
+    Write-Host "    icacls `"<file>`" /grant `"$serviceAccount`:(F)`"" -ForegroundColor Yellow
     Write-Host '  ...or move the install out of a world-readable folder such as one created directly under C:\.' -ForegroundColor Red
     Write-Host ''
 }

@@ -85,12 +85,15 @@ public sealed class DarlingAlertDeliverer : IAlertDeliverer
             {
                 foreach (var message in PerEventNotification.Split(outcome.Context, _settings.PerEventMax))
                 {
-                    /* Per-incident card: msg.CurrentValue is the incident's occurrence count; no server-level
-                       numerics (matching Lite/Dashboard's per-event sends), detail text rebuilt from the split context. */
+                    /* Per-incident card: msg.CurrentValue is the incident's occurrence count, and
+                       msg.NumericValue carries it as a number for the history row (#1830 — the
+                       overflow message's "+N more" text is unparseable, so the store's text fallback
+                       silently recorded 0). Threshold is the outcome's, unchanged. Matches Lite's
+                       per-event sends; detail text rebuilt from the split context. */
                     await SendAndRecordAsync(
                         outcome, message.CurrentValue, message.Context,
                         AlertContextBuilders.ContextToDetailText(message.Context),
-                        numericCurrentValue: null, numericThresholdValue: null);
+                        numericCurrentValue: message.NumericValue, numericThresholdValue: outcome.NumericThresholdValue);
                 }
 
                 return;
@@ -123,6 +126,18 @@ public sealed class DarlingAlertDeliverer : IAlertDeliverer
         AlertOutcome outcome, string currentValue, AlertContext? context, string? detailText,
         double? numericCurrentValue, double? numericThresholdValue)
     {
+        /* #2090: the fire site's severity rode AlertOutcome.Severity but the channel builders read
+           only Context.SeverityOverride — so every self-alert (fired with Context: null) rendered
+           INFO-blue in Teams/Slack/PagerDuty/webhooks while its log line said Critical. Fold the
+           outcome's severity into the context here, once, upstream of every channel; ??= so an
+           explicit override set by a context builder still wins. The context also serializes into
+           alert history, so replays keep the severity too. */
+        if (outcome.Severity is not null)
+        {
+            context ??= new AlertContext();
+            context.SeverityOverride ??= outcome.Severity;
+        }
+
         /* Lite's EmailAlertService.cs:65-66 — muted alerts skip both channels but still record below. */
         var result = await _core.TrySendAsync(
             outcome.MetricName, outcome.ServerName, currentValue, outcome.ThresholdValue,

@@ -46,6 +46,26 @@ public interface IAlertReadAdapter
         string serverKey, int hoursBack, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// The CURRENT total blocked wait time (#1839): the sum of <c>wait_time_ms</c> across the rows of
+    /// the LATEST <c>dmv_blocking_snapshots</c> snapshot for this server, with the distinct blocked-SPID
+    /// count. Returns null when the store holds NO snapshot for the server at all.
+    /// <para>
+    /// A snapshot sum, deliberately — see <see cref="CurrentBlockingWaitResult"/> for why the alert is
+    /// level-triggered on one snapshot rather than a rolling window. Implementations select rows by
+    /// <c>collection_time = MAX(collection_time)</c> (the snapshot identity the running-jobs and
+    /// long-running-query reads already key on), NOT by a time window.
+    /// </para>
+    /// <para>
+    /// FRESHNESS: implementations set <see cref="CurrentBlockingWaitResult.SnapshotIsFresh"/> false when
+    /// the snapshot is older than <see cref="CurrentBlockingWaitResult.MaxSnapshotAge"/> at the server's
+    /// effective <c>dmv_blocking_snapshot</c> cadence — the #1812 rule, so a collector outage cannot hold
+    /// a level-triggered alert active on frozen rows.
+    /// </para>
+    /// </summary>
+    Task<CurrentBlockingWaitResult?> GetCurrentBlockingWaitAsync(
+        string serverKey, CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Recent deadlock events for the deadlock alert, newest (by deadlock time) first, capped
     /// at 50. Excluded-database filtering happens in the builder
     /// (<see cref="AlertContextBuilders.IsDeadlockExcluded"/> parses the graph XML), not here.
@@ -102,6 +122,17 @@ public interface IAlertReadAdapter
         string serverKey, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// The newest pvs_stats snapshot's per-database persistent version store state, for the
+    /// PVS-pressure alert (#1984) — ADR-ON databases only (a database that cannot have a PVS
+    /// cannot breach), worst (highest PVS %) first. Empty when the server has no ADR databases or
+    /// pvs_stats has not collected yet — the check treats both as nothing-to-evaluate, mirroring
+    /// the low-disk alert's empty-on-Azure convention. Threshold evaluation stays engine-side
+    /// (<see cref="AlertContextBuilders.GetBreachedPvsDatabases"/>).
+    /// </summary>
+    Task<List<PvsPressureInfo>> GetPvsPressureAsync(
+        string serverKey, CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Currently-running Agent jobs whose duration is at least <paramref name="multiplier"/>x
     /// their historical average, worst (highest % of average) first, capped at 5, from the LATEST
     /// running_jobs snapshot only. Jobs averaging under 60 seconds are excluded (noise floor) —
@@ -115,4 +146,30 @@ public interface IAlertReadAdapter
     /// </summary>
     Task<AnomalousJobsResult> GetAnomalousJobsAsync(
         string serverKey, int multiplier, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// The databases whose collected state DEVIATES from their expected state in the TWO most recent
+    /// collections, for the baseline-deviation database-state alert: a two-sample rule so a restart's
+    /// RECOVERY_PENDING / RECOVERING transients (and a standby secondary's per-restore RESTORING flicker)
+    /// don't fire unless the condition sticks. The read compares the effective state (STANDBY for a
+    /// log-shipping secondary, else <c>state_desc</c>) against the per-database expected-state table and
+    /// returns the rows where <c>current != expected</c> in both samples and <c>expected</c> is not the
+    /// <see cref="DatabaseStateTokens.Ignore"/> sentinel, each carrying both the current and expected state.
+    /// <para>
+    /// CONTRACT — the read also AUTO-SEEDS and PRUNES: any database in the latest snapshot with no
+    /// expected-state row yet gets its current effective state recorded as the first-observation baseline,
+    /// EXCEPT a critical effective state (SUSPECT / RECOVERY_PENDING / EMERGENCY), which is left pending so
+    /// it alerts rather than learning the bad state as expected. Auto-baselines for databases that have
+    /// dropped off the newest snapshot are pruned (user overrides preserved). Seeding is idempotent
+    /// (insert-if-absent) and never overwrites a user override or an existing baseline.
+    /// </para>
+    /// <para>
+    /// Empty when the store has no snapshot for this server. Unlike the anomalous-jobs read this is
+    /// NOT freshness-gated: a database-state problem is a standing condition, so a stale "still
+    /// OFFLINE" snapshot correctly keeps the alert active (cooldown throttles re-fires) rather than
+    /// fabricating a recovery.
+    /// </para>
+    /// </summary>
+    Task<List<DatabaseStateInfo>> GetDatabaseStatesAsync(
+        string serverKey, CancellationToken cancellationToken = default);
 }

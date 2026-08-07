@@ -79,6 +79,10 @@ public sealed class QueryStatsCollector : CollectorDefinitionBase<QueryStatsColl
         public long PlanGenerationNum { get; set; }
         public int StatementStartOffset { get; set; }
         public int StatementEndOffset { get; set; }
+
+        /// <summary>The statement's host object (schema.name) from <c>sys.dm_exec_sql_text.objectid</c>;
+        /// NULL for ad-hoc/prepared text (#2012 stage 2 — splits INSERT...EXEC callers sharing a hash).</summary>
+        public string? HostObjectName { get; set; }
     }
 
     private const string SelectColumnsText = @"
@@ -140,41 +144,78 @@ public sealed class QueryStatsCollector : CollectorDefinitionBase<QueryStatsColl
         END,
     plan_generation_num = qs.plan_generation_num,
     statement_start_offset = qs.statement_start_offset,
-    statement_end_offset = qs.statement_end_offset";
+    statement_end_offset = qs.statement_end_offset,
+    host_object_name =
+        CASE
+            WHEN st.objectid IS NOT NULL
+            THEN ISNULL
+                 (
+                     OBJECT_SCHEMA_NAME(st.objectid, st.dbid) + N'.' + OBJECT_NAME(st.objectid, st.dbid),
+                     N'Unknown'
+                 )
+        END";
 
+    /* #1959: rank on the CHEAP DMV columns inside the derived table FIRST, and run the text apply, the
+       NOT LIKE self-filter, and the (Darling-only) plan-XML render against the survivors ONLY. The optimizer
+       does not defer the applies past the TOP on its own - a field plan showed dm_exec_text_query_plan
+       executing 2,434 times to keep 200 rows, 81% of an entire sweep, with 30-second timeout MISSES on
+       big-cache boxes - so the deferral is made structural here rather than hoped for. The derived table is
+       deliberately aliased qs so SelectColumnsText and the plan fragments splice unchanged.
+
+       The inner TOP is 300, not 200: the self-filter runs post-ranking now, so the inner set needs headroom
+       for collector-self rows that ranking admits and the filter then removes. The expensive applies still
+       run at most ~200-300 times either way; measured 6.0x on the reporting fleet's apex box (median
+       7,736 ms -> 1,286 ms), 99.2% row-identity parity with the residual explained by cache churn. */
     private const string StandardQueryText = @"
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
 SELECT /* PerformanceMonitorLite */ TOP (200)
-    database_name = d.name," + SelectColumnsText + @"/*PLAN_SELECT*/
-FROM sys.dm_exec_query_stats AS qs
-OUTER APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st/*PLAN_APPLY*/
-CROSS APPLY
+    database_name = qs.database_name," + SelectColumnsText + @"/*PLAN_SELECT*/
+FROM
 (
-    SELECT
-        dbid = CONVERT(integer, pa.value)
-    FROM sys.dm_exec_plan_attributes(qs.plan_handle) AS pa
-    WHERE pa.attribute = N'dbid'
-) AS pa
-INNER JOIN sys.databases AS d
-  ON pa.dbid = d.database_id
-WHERE pa.dbid NOT IN (1, 2, 3, 4, 32761, 32767, ISNULL(DB_ID(N'PerformanceMonitor'), 0))
-AND   st.text NOT LIKE N'%PerformanceMonitorLite%'
-AND   qs.last_execution_time >= DATEADD(MINUTE, -10, GETDATE())
-/*EXCLUSION_FILTER*/
+    SELECT TOP (300)
+        database_name = d.name,
+        qs.*
+    FROM sys.dm_exec_query_stats AS qs
+    CROSS APPLY
+    (
+        SELECT
+            dbid = CONVERT(integer, pa.value)
+        FROM sys.dm_exec_plan_attributes(qs.plan_handle) AS pa
+        WHERE pa.attribute = N'dbid'
+    ) AS pa
+    INNER JOIN sys.databases AS d
+      ON pa.dbid = d.database_id
+    WHERE pa.dbid NOT IN (1, 2, 3, 4, 32761, 32767, ISNULL(DB_ID(N'PerformanceMonitor'), 0))
+    AND   qs.last_execution_time >= DATEADD(MINUTE, -10, GETDATE())
+    /*EXCLUSION_FILTER*/
+    ORDER BY
+        qs.total_elapsed_time DESC
+) AS qs
+OUTER APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st/*PLAN_APPLY*/
+WHERE st.text NOT LIKE N'%PerformanceMonitorLite%'
 ORDER BY
     qs.total_elapsed_time DESC
 OPTION(RECOMPILE);";
 
+    /* #1959: same rank-first shape as StandardQueryText, minus the dbid apply (Azure SQL DB scopes the
+       DMV to the connected database). See the standard variant's comment for the mechanism and numbers. */
     private const string AzureSqlDbQueryText = @"
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
 SELECT /* PerformanceMonitorLite */ TOP (200)
     database_name = DB_NAME()," + SelectColumnsText + @"/*PLAN_SELECT*/
-FROM sys.dm_exec_query_stats AS qs
+FROM
+(
+    SELECT TOP (300)
+        qs.*
+    FROM sys.dm_exec_query_stats AS qs
+    WHERE qs.last_execution_time >= DATEADD(MINUTE, -10, GETDATE())
+    ORDER BY
+        qs.total_elapsed_time DESC
+) AS qs
 OUTER APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st/*PLAN_APPLY*/
 WHERE st.text NOT LIKE N'%PerformanceMonitorLite%'
-AND   qs.last_execution_time >= DATEADD(MINUTE, -10, GETDATE())
 ORDER BY
     qs.total_elapsed_time DESC
 OPTION(RECOMPILE);";
@@ -288,6 +329,9 @@ OUTER APPLY
         new CollectorColumn("delta_spills", CollectorColumnType.BigInt),
         new CollectorColumn("plan_generation_num", CollectorColumnType.BigInt),
         new CollectorColumn("sample_interval_seconds", CollectorColumnType.Integer),
+        /* #2012 stage 2 — appended LAST so every existing store column keeps its position; the
+           store-side ALTER ADDs land at the end to match. NULL for ad-hoc/prepared statements. */
+        new CollectorColumn("host_object_name", CollectorColumnType.Varchar),
     };
 
     public override async ValueTask<List<Row>> ReadAsync(DbDataReader reader, CollectorContext context, CancellationToken cancellationToken)
@@ -340,9 +384,13 @@ OUTER APPLY
                 PlanGenerationNum = reader.IsDBNull(39) ? 0L : reader.GetInt64(39),
                 StatementStartOffset = reader.IsDBNull(40) ? 0 : reader.GetInt32(40),
                 StatementEndOffset = reader.IsDBNull(41) ? 0 : reader.GetInt32(41),
+                /* #2012 stage 2: the statement's HOST OBJECT (schema.name), NULL for ad-hoc/prepared
+                   text — sys.dm_exec_sql_text.objectid resolved in the SELECT. This is what lets
+                   readers split INSERT...EXEC callers that share a query_hash. */
+                HostObjectName = reader.IsDBNull(42) ? null : reader.GetString(42),
                 /* query_plan_xml is the trailing column present only when CapturePlanXml spliced it
-                   into the SELECT (ordinal 42); the short-circuit skips it entirely when off. */
-                QueryPlanXml = context.CapturePlanXml && !reader.IsDBNull(42) ? reader.GetString(42) : null,
+                   into the SELECT (ordinal 43); the short-circuit skips it entirely when off. */
+                QueryPlanXml = context.CapturePlanXml && !reader.IsDBNull(43) ? reader.GetString(43) : null,
             });
         }
 
@@ -415,6 +463,7 @@ OUTER APPLY
             .Value(deltaRows)
             .Value(deltaSpills)
             .Value(row.PlanGenerationNum)
-            .Value(sampleIntervalSeconds);     /* sample_interval_seconds INTEGER */
+            .Value(sampleIntervalSeconds)      /* sample_interval_seconds INTEGER */
+            .Value(row.HostObjectName);        /* #2012 stage 2: NULL for ad-hoc text */
     }
 }

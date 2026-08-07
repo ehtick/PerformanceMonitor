@@ -50,9 +50,23 @@ public static class CollectorScheduleDefaults
         ["memory_pressure_events"] = new(5, 30),
         ["tempdb_stats"] = new(1, 30),
         ["perfmon_stats"] = new(1, 30),
-        ["deadlocks"] = new(1, 30),
+        /* #1963: the deadlocks read costs ~273ms of FIXED dm_xe_session_targets serialization no matter
+           how empty the ring buffer is (field-measured at 284 bytes of content), so cadence is the only
+           lever on its overhead. The buffer retains events between polls and the watermark catches up, so
+           a slower cadence keeps the same data - the trade is detection latency, and a deadlock is
+           forensic by the time anyone reads it (the victim already rolled back). Erik ruled 2026-08-01:
+           default to the 5-minute tier beside the other event-buffer readers (system_health_events,
+           default_trace_events). Loss bound: a storm big enough to cycle the buffer between polls drops
+           events a faster poll would have caught - the buffer's capacity bounds that either way. */
+        ["deadlocks"] = new(5, 30),
         ["server_config"] = new(0, 30),
         ["database_config"] = new(0, 30),
+        /* Per-database state as a time series (#db-offline-alert): unlike the load-time
+           database_config snapshot (frequency 0), this feeds the "database offline / unhealthy
+           state" alert, so it must run on a cadence to catch a database going OFFLINE / SUSPECT /
+           RESTORING after load. A few-row read against in-memory catalog metadata, so per-minute is
+           cheap — matching the other health time series (wait_stats, cpu_utilization). */
+        ["database_states"] = new(1, 30),
         ["memory_grant_stats"] = new(1, 30),
         ["waiting_tasks"] = new(1, 7),
         ["dmv_blocking_snapshot"] = new(1, 30),
@@ -81,5 +95,25 @@ public static class CollectorScheduleDefaults
            in-memory AG metadata. On an AG-less server every cycle is a zero-row read. */
         ["ag_replica_states"] = new(1, 30),
         ["ag_database_replica_states"] = new(1, 30),
+        /* #1952 automatic plan correction. Deliberately NOT the FrequencyMinutes 0 (on-load) tier the
+           other per-database config snapshots use, even though half of what it reads is enablement
+           state: sys.dm_db_tuning_recommendations is documented as living only until the instance
+           restarts, and a restart mid-verification silently unforces the plan the engine had forced.
+           An on-load-only collector would capture that database once and then miss every Active and
+           Verifying recommendation the engine worked through afterwards - and those rows exist
+           nowhere else once the engine drops them. The 5-minute tier is where the other enumerating
+           per-database reader already sits (query_store); the read itself is a handful of rows per
+           database against in-memory recommendation state, not a Query Store scan. */
+        ["plan_correction"] = new(5, 30),
+        /* #1951 ADR persistent version store. Cadence and retention deliberately MATCH
+           database_size_stats (60/90) rather than the per-minute health tier: PVS size is the same
+           kind of slow-moving disk-pressure telemetry, it is read beside database sizes, and pairing
+           the two cadences is what lets a chart put "the database grew" and "its version store grew"
+           on one time axis without resampling. The fast-moving leading indicators an operator would
+           want per-minute — the long-running transaction itself, the snapshot scan holding cleanup
+           back — are already collected per-minute by dmv_blocking_snapshot and waiting_tasks; what
+           this collector adds is the slow CONSEQUENCE, and 90 days is the window that shows a PVS
+           trend against the database-growth trend it explains. */
+        ["pvs_stats"] = new(60, 90),
     };
 }

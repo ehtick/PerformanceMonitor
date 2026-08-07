@@ -6,6 +6,9 @@ updates:
   # .NET packages across the solution (PerformanceMonitor.sln discovers all projects).
   - package-ecosystem: "nuget"
     directory: "/"
+    # All work lands on dev; the check-branches guard rejects any PR to main that is not
+    # dev itself, so Dependabot PRs against main (the previous default) could never merge.
+    target-branch: "dev"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -15,10 +18,10 @@ updates:
       nuget:
         patterns:
           - "*"
-
   # GitHub Actions used by the workflows in .github/workflows.
   - package-ecosystem: "github-actions"
     directory: "/"
+    target-branch: "dev"
     schedule:
       interval: "weekly"
       day: "monday"

@@ -36,7 +36,8 @@ public sealed class ViewerPlanHostSqlTests
     public void QueryStatsPlanXmlSql_ReadsStoredXml_KeyedByDatabaseAndHash_LatestNonNull()
     {
         var sql = ViewerDataService.QueryStatsPlanXmlSql;
-        Assert.Contains("SELECT query_plan_xml", sql, StringComparison.Ordinal);
+        /* Both content forms (#2069): plans written since V54 are gzip bytes with the text NULL. */
+        Assert.Contains("SELECT query_plan_xml, query_plan_gz", sql, StringComparison.Ordinal);
 
         /* The RESOLVING view, not the base table (#1767): query_stats.query_plan_xml is NULL on every row
            written since the migration, with the plan itself in query_plan_dim behind a digest. Reading the
@@ -45,7 +46,9 @@ public sealed class ViewerPlanHostSqlTests
         Assert.Contains("WHERE server_id = $1", sql, StringComparison.Ordinal);
         Assert.Contains("database_name = $2", sql, StringComparison.Ordinal);
         Assert.Contains("query_hash = $3", sql, StringComparison.Ordinal);
-        Assert.Contains("query_plan_xml IS NOT NULL", sql, StringComparison.Ordinal); /* skip rows the collector left NULL */
+        /* The presence guard must accept EITHER form — on the text column alone it discards every
+           post-V54 plan silently (zero rows, no error), the #1767 bare-column regression re-run. */
+        Assert.Contains("(query_plan_xml IS NOT NULL OR query_plan_gz IS NOT NULL)", sql, StringComparison.Ordinal);
         Assert.Contains("ORDER BY collection_time DESC", sql, StringComparison.Ordinal); /* most-recent plan for the key */
         Assert.Contains("LIMIT 1", sql, StringComparison.Ordinal);
     }
@@ -72,7 +75,7 @@ public sealed class ViewerPlanHostSqlTests
 
         /* There is no v_procedure_stats to resolve the #1767 plan dimension (that view has never existed),
            so this read joins query_plan_dim itself and coalesces. */
-        Assert.Contains("SELECT COALESCE(ps.query_plan_xml, qpd.query_plan_xml)", sql, StringComparison.Ordinal);
+        Assert.Contains("SELECT COALESCE(ps.query_plan_xml, qpd.query_plan_xml), qpd.query_plan_gz", sql, StringComparison.Ordinal);
         Assert.Contains("FROM procedure_stats AS ps", sql, StringComparison.Ordinal);
         Assert.DoesNotContain("v_procedure_stats", sql, StringComparison.Ordinal);
         Assert.Contains("LEFT JOIN query_plan_dim AS qpd", sql, StringComparison.Ordinal);
@@ -89,7 +92,7 @@ public sealed class ViewerPlanHostSqlTests
            could resolve it — zero rows back, no error, indistinguishable from "no plan captured". Putting
            the guard back on the bare column is the single most likely way to break this read, and it fails
            completely silently, so assert the coalesced form explicitly rather than by substring luck. */
-        Assert.Contains("AND   COALESCE(ps.query_plan_xml, qpd.query_plan_xml) IS NOT NULL", sql, StringComparison.Ordinal);
+        Assert.Contains("AND   (COALESCE(ps.query_plan_xml, qpd.query_plan_xml) IS NOT NULL OR qpd.query_plan_gz IS NOT NULL)", sql, StringComparison.Ordinal);
         Assert.DoesNotContain("AND   ps.query_plan_xml IS NOT NULL", sql, StringComparison.Ordinal);
 
         Assert.Contains("ORDER BY ps.collection_time DESC", sql, StringComparison.Ordinal); /* most-recent plan for the key */
@@ -214,7 +217,7 @@ public sealed class ViewerPlanHostLivePostgresTests
         using var connection = new NpgsqlConnection(cs);
         await connection.OpenAsync(TestContext.Current.CancellationToken);
         await PgMigrations.MigrateAsync(connection, TestContext.Current.CancellationToken);
-        await DeleteRowsAsync(connection, "query_stats", QueryStatsPlanServerId);
+        await DeleteRowsAsync(connection, "query_stats", QueryStatsPlanServerId, TestContext.Current.CancellationToken);
 
         await using var viewer = new ViewerDataService(cs!);
         var end = TruncateToSeconds(DateTime.UtcNow);
@@ -222,6 +225,7 @@ public sealed class ViewerPlanHostLivePostgresTests
         var older = start.AddHours(1);
         var newer = start.AddHours(2);
 
+        var bodySucceeded = false;
         try
         {
             /* Same (database, query_hash) captured twice with different plans — the newer collection wins. */
@@ -237,10 +241,13 @@ public sealed class ViewerPlanHostLivePostgresTests
             var row = Assert.Single(rows);
             Assert.Equal("0xPLAN", row.QueryHash);
             Assert.True(row.HasQueryPlan); /* bool_or over the group: a plan exists -> column enabled */
+
+            bodySucceeded = true;
         }
         finally
         {
-            await DeleteRowsAsync(connection, "query_stats", QueryStatsPlanServerId);
+            await LiveStoreCleanup.RunAsync(cs!, bodySucceeded, async (cleanup, cleanupCt) =>
+                await DeleteRowsAsync(cleanup, "query_stats", QueryStatsPlanServerId, cleanupCt));
         }
     }
 
@@ -253,12 +260,13 @@ public sealed class ViewerPlanHostLivePostgresTests
         using var connection = new NpgsqlConnection(cs);
         await connection.OpenAsync(TestContext.Current.CancellationToken);
         await PgMigrations.MigrateAsync(connection, TestContext.Current.CancellationToken);
-        await DeleteRowsAsync(connection, "query_stats", QueryStatsNoPlanServerId);
+        await DeleteRowsAsync(connection, "query_stats", QueryStatsNoPlanServerId, TestContext.Current.CancellationToken);
 
         await using var viewer = new ViewerDataService(cs!);
         var end = TruncateToSeconds(DateTime.UtcNow);
         var start = end.AddHours(-24);
 
+        var bodySucceeded = false;
         try
         {
             /* A query with activity but no captured plan (query_plan_xml NULL). */
@@ -271,10 +279,13 @@ public sealed class ViewerPlanHostLivePostgresTests
             var rows = await viewer.GetTopQueriesByCpuAsync(QueryStatsNoPlanServerId, start, end);
             var row = Assert.Single(rows);
             Assert.False(row.HasQueryPlan); /* no plan captured -> column disabled */
+
+            bodySucceeded = true;
         }
         finally
         {
-            await DeleteRowsAsync(connection, "query_stats", QueryStatsNoPlanServerId);
+            await LiveStoreCleanup.RunAsync(cs!, bodySucceeded, async (cleanup, cleanupCt) =>
+                await DeleteRowsAsync(cleanup, "query_stats", QueryStatsNoPlanServerId, cleanupCt));
         }
     }
 
@@ -287,11 +298,12 @@ public sealed class ViewerPlanHostLivePostgresTests
         using var connection = new NpgsqlConnection(cs);
         await connection.OpenAsync(TestContext.Current.CancellationToken);
         await PgMigrations.MigrateAsync(connection, TestContext.Current.CancellationToken);
-        await DeleteRowsAsync(connection, "query_store_stats", QueryStorePlanServerId);
+        await DeleteRowsAsync(connection, "query_store_stats", QueryStorePlanServerId, TestContext.Current.CancellationToken);
 
         await using var viewer = new ViewerDataService(cs!);
         var t = TruncateToSeconds(DateTime.UtcNow).AddHours(-1);
 
+        var bodySucceeded = false;
         try
         {
             /* plan_id 7 has a stored plan; plan_id 9 (same query) has none. */
@@ -306,10 +318,13 @@ public sealed class ViewerPlanHostLivePostgresTests
             /* The NULL-plan plan_id and an absent plan_id both fetch null. */
             Assert.Null(await viewer.GetQueryStorePlanTextAsync(QueryStorePlanServerId, "StackOverflow", 42, 9));
             Assert.Null(await viewer.GetQueryStorePlanTextAsync(QueryStorePlanServerId, "StackOverflow", 42, 999));
+
+            bodySucceeded = true;
         }
         finally
         {
-            await DeleteRowsAsync(connection, "query_store_stats", QueryStorePlanServerId);
+            await LiveStoreCleanup.RunAsync(cs!, bodySucceeded, async (cleanup, cleanupCt) =>
+                await DeleteRowsAsync(cleanup, "query_store_stats", QueryStorePlanServerId, cleanupCt));
         }
     }
 
@@ -410,9 +425,9 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $
     private static DateTime TruncateToSeconds(DateTime value) =>
         DateTime.SpecifyKind(new DateTime(value.Ticks - (value.Ticks % TimeSpan.TicksPerSecond)), DateTimeKind.Unspecified);
 
-    private static async Task DeleteRowsAsync(NpgsqlConnection connection, string table, int serverId)
+    private static async Task DeleteRowsAsync(NpgsqlConnection connection, string table, int serverId, System.Threading.CancellationToken ct)
     {
         using var cleanup = new NpgsqlCommand($"DELETE FROM {table} WHERE server_id = {serverId};", connection);
-        await cleanup.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
+        await cleanup.ExecuteNonQueryAsync(ct);
     }
 }

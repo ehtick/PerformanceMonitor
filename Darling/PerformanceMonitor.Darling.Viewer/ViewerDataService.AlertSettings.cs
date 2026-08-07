@@ -39,7 +39,7 @@ namespace PerformanceMonitor.Darling.Viewer;
 /// </summary>
 public sealed partial class ViewerDataService
 {
-    /* The 42 AlertsConfig + AnalysisConfig columns in the SAME order the service reads them
+    /* The 47 AlertsConfig + AnalysisConfig columns in the SAME order the service reads them
        (StoreConfigProvider.ReadAlertSettingsAsync), so the parity test pins one list against both ends.
        delivery_mode/per_event_max (V18, #1141) then the six long-running-query read knobs + the connection-change
        notify toggle (V20) are appended so the existing ordinals stay pinned. */
@@ -56,7 +56,8 @@ public sealed partial class ViewerDataService
         "long_running_query_exclude_misc_waits, long_running_query_exclude_cdc, notify_connection_changes, " +
         "notify_connection_down_at_startup, connection_refire_minutes, " +
         "notify_ag_health, ag_lag_alert_seconds, ag_redo_queue_alert_kb, " +
-        "ag_disconnect_refire_minutes";
+        "ag_disconnect_refire_minutes, blocking_wait_seconds_threshold, " +
+        "pvs_enabled, pvs_threshold_percent, pvs_floor_gb, database_state_enabled";
 
     /// <summary>The single global alert-settings row (id=1), for the Settings window prefill + the migrate-in
     /// defaults check. Column order matches <see cref="AlertSettingsColumns"/>.</summary>
@@ -65,11 +66,12 @@ public sealed partial class ViewerDataService
 
     /// <summary>Upserts the single global alert-settings row (Settings window Save). ON CONFLICT rewrites every
     /// column and bumps <c>modified_at</c> (and, via the V17 statement trigger, <c>config_version</c> — the
-    /// service reloads on its next sweep). $1..$42 bind the columns in <see cref="AlertSettingsColumns"/> order.</summary>
+    /// service reloads on its next sweep). $1..$47 bind the columns in <see cref="AlertSettingsColumns"/> order.</summary>
     public const string AlertSettingsUpsertSql = @"
 INSERT INTO config_alert_settings (id, " + AlertSettingsColumns + @", modified_at)
 VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
-        $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42,
+        $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43,
+        $44, $45, $46, $47,
         (now() AT TIME ZONE 'UTC'))
 ON CONFLICT (id) DO UPDATE SET
     enabled = EXCLUDED.enabled,
@@ -114,6 +116,11 @@ ON CONFLICT (id) DO UPDATE SET
     ag_lag_alert_seconds = EXCLUDED.ag_lag_alert_seconds,
     ag_redo_queue_alert_kb = EXCLUDED.ag_redo_queue_alert_kb,
     ag_disconnect_refire_minutes = EXCLUDED.ag_disconnect_refire_minutes,
+    blocking_wait_seconds_threshold = EXCLUDED.blocking_wait_seconds_threshold,
+    pvs_enabled = EXCLUDED.pvs_enabled,
+    pvs_threshold_percent = EXCLUDED.pvs_threshold_percent,
+    pvs_floor_gb = EXCLUDED.pvs_floor_gb,
+    database_state_enabled = EXCLUDED.database_state_enabled,
     modified_at = (now() AT TIME ZONE 'UTC')";
 
     /// <summary>The two <c>cpu_mode</c> values the service honors (it compares case-insensitively against
@@ -185,6 +192,11 @@ ON CONFLICT (id) DO UPDATE SET
         command.Parameters.Add(new NpgsqlParameter<int> { TypedValue = r.AgLagAlertSeconds });                // $40 (#991, V35)
         command.Parameters.Add(new NpgsqlParameter<long> { TypedValue = r.AgRedoQueueAlertKb });              // $41 (#991, V35)
         command.Parameters.Add(new NpgsqlParameter<int> { TypedValue = r.AgDisconnectRefireMinutes });        // $42 (#1696, V37)
+        command.Parameters.Add(new NpgsqlParameter<int> { TypedValue = r.BlockingWaitSecondsThreshold });    // $43 (#1839, V40)
+        command.Parameters.Add(new NpgsqlParameter<bool> { TypedValue = r.PvsEnabled });                     // $44 (#1984, V48)
+        command.Parameters.Add(new NpgsqlParameter<int> { TypedValue = r.PvsThresholdPercent });             // $45 (#1984, V48)
+        command.Parameters.Add(new NpgsqlParameter<int> { TypedValue = r.PvsFloorGb });                      // $46 (#1984, V48)
+        command.Parameters.Add(new NpgsqlParameter<bool> { TypedValue = r.DatabaseStateEnabled });            // $47 (database-state alert, V49)
     }
 
     private static AlertSettingsRow ReadAlertSettingsRow(NpgsqlDataReader reader) => new()
@@ -234,6 +246,14 @@ ON CONFLICT (id) DO UPDATE SET
         AgRedoQueueAlertKb = reader.GetInt64(40),
         /* #1696 AG disconnect re-fire appended (V37) at ordinal 41. */
         AgDisconnectRefireMinutes = reader.GetInt32(41),
+        /* #1839 total-blocked-wait gate appended (V40) at ordinal 42. */
+        BlockingWaitSecondsThreshold = reader.GetInt32(42),
+        /* #1984 PVS-pressure knobs appended (V48) at ordinals 43-45. */
+        PvsEnabled = reader.GetBoolean(43),
+        PvsThresholdPercent = reader.GetInt32(44),
+        PvsFloorGb = reader.GetInt32(45),
+        /* database-state alert master switch appended (V49) at ordinal 46. */
+        DatabaseStateEnabled = reader.GetBoolean(46),
     };
 
     /// <summary>Maps the Settings window's CPU-mode combo tag ("Total"/"SqlOnly") to the store value.</summary>
@@ -282,6 +302,9 @@ public sealed class AlertSettingsRow
     /// <summary>#1696 (V37): re-announce a still-disconnected AG replica every N minutes (0 = off).</summary>
     public int AgDisconnectRefireMinutes { get; set; }
 
+    /// <summary>Master switch for the baseline-deviation database-state alert (V40 DDL default true).</summary>
+    public bool DatabaseStateEnabled { get; set; } = true;
+
     public bool CpuEnabled { get; set; } = true;
     public int CpuThresholdPercent { get; set; } = 80;
 
@@ -290,6 +313,11 @@ public sealed class AlertSettingsRow
 
     public bool BlockingEnabled { get; set; } = true;
     public int BlockingCountThreshold { get; set; } = 1;
+
+    /// <summary>#1839 (V40): fire when the latest blocking snapshot's TOTAL blocked wait reaches this many
+    /// seconds. 0 = off, matching the V40 DDL default — the shipped behavior is unchanged on upgrade.</summary>
+    public int BlockingWaitSecondsThreshold { get; set; }
+
     public bool DeadlockEnabled { get; set; } = true;
     public int DeadlockCountThreshold { get; set; } = 1;
     public bool PoisonWaitEnabled { get; set; } = true;
@@ -301,6 +329,13 @@ public sealed class AlertSettingsRow
     public bool LowDiskEnabled { get; set; } = true;
     public int LowDiskThresholdPercent { get; set; } = 10;
     public int LowDiskThresholdGb { get; set; } = 5;
+
+    /// <summary>#1984 (V48): the PVS-pressure alert — enabled at 40% of database with a 1 GB floor
+    /// (AND semantics; percent 0 disables the check, floor 0 removes the qualifier).</summary>
+    public bool PvsEnabled { get; set; } = true;
+    public int PvsThresholdPercent { get; set; } = 40;
+    public int PvsFloorGb { get; set; } = 1;
+
     public bool LongRunningJobEnabled { get; set; } = true;
     public int LongRunningJobMultiplier { get; set; } = 3;
     public bool FailedJobEnabled { get; set; } = true;
@@ -358,11 +393,13 @@ public sealed class AlertSettingsRow
             && AgLagAlertSeconds == other.AgLagAlertSeconds
             && AgRedoQueueAlertKb == other.AgRedoQueueAlertKb
             && AgDisconnectRefireMinutes == other.AgDisconnectRefireMinutes
+            && DatabaseStateEnabled == other.DatabaseStateEnabled
             && CpuEnabled == other.CpuEnabled
             && CpuThresholdPercent == other.CpuThresholdPercent
             && string.Equals(CpuMode, other.CpuMode, StringComparison.OrdinalIgnoreCase)
             && BlockingEnabled == other.BlockingEnabled
             && BlockingCountThreshold == other.BlockingCountThreshold
+            && BlockingWaitSecondsThreshold == other.BlockingWaitSecondsThreshold
             && DeadlockEnabled == other.DeadlockEnabled
             && DeadlockCountThreshold == other.DeadlockCountThreshold
             && PoisonWaitEnabled == other.PoisonWaitEnabled
@@ -374,6 +411,9 @@ public sealed class AlertSettingsRow
             && LowDiskEnabled == other.LowDiskEnabled
             && LowDiskThresholdPercent == other.LowDiskThresholdPercent
             && LowDiskThresholdGb == other.LowDiskThresholdGb
+            && PvsEnabled == other.PvsEnabled
+            && PvsThresholdPercent == other.PvsThresholdPercent
+            && PvsFloorGb == other.PvsFloorGb
             && LongRunningJobEnabled == other.LongRunningJobEnabled
             && LongRunningJobMultiplier == other.LongRunningJobMultiplier
             && FailedJobEnabled == other.FailedJobEnabled

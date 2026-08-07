@@ -31,8 +31,16 @@
             </Style>
         </ResourceDictionary>
     </Window.Resources>
-    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-    <Grid Margin="16">
+    <!-- #2063: two fixed rows — the settings scroll, the Save/Close bar stays pinned below the
+         scroll (the Collector Schedules dialog's always-visible-actions shape), so a change made at
+         the top of a long settings list saves without a scroll to the bottom. -->
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+    <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+    <Grid Margin="16,16,16,0">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
@@ -66,7 +74,10 @@
                         <TextBlock x:Name="CollectionStatusText" Text="Status: Managed by the Darling service" FontSize="12"
                                    Foreground="{DynamicResource ForegroundMutedBrush}" Margin="0,4,0,0" TextWrapping="Wrap"/>
                     </StackPanel>
-                    <Button Grid.Column="1" x:Name="PauseResumeButton" Content="Pause Collection"
+                    <!-- The mnemonic sits on "Co_llection" rather than the verb so Alt+L works in both
+                         states: the Click handler swaps this Content to "Resume Co_llection", and a key
+                         that moved with the state would be a worse affordance than no key. -->
+                    <Button Grid.Column="1" x:Name="PauseResumeButton" Content="Pause Co_llection"
                             Click="PauseResumeButton_Click" VerticalAlignment="Center"/>
                 </Grid>
                 <CheckBox x:Name="CapturePlansCheckBox" Content="Capture execution plans (all servers)" Margin="0,12,0,0"
@@ -92,14 +103,17 @@
                     <TextBlock Text="Port:" VerticalAlignment="Center" Margin="20,0,6,0"
                                Foreground="{DynamicResource ForegroundBrush}"/>
                     <TextBox x:Name="McpPortTextBox" Width="70" Text="5152" VerticalAlignment="Center"/>
-                    <Button Content="Auto" ToolTip="Find an available port"
+                    <!-- Two "Auto" buttons exist on this page (MCP port here, web port below). The label
+                         stays as-is because each sits beside its own Port box under its own section
+                         heading; only the access keys differ, Alt+A here and Alt+O there. -->
+                    <Button Content="_Auto" ToolTip="Find an available port"
                             Margin="6,0,0,0" Padding="8,2"
                             VerticalAlignment="Center"
                             Click="AutoPortButton_Click"/>
                 </StackPanel>
                 <TextBlock x:Name="McpStatusText" FontSize="12" Foreground="{DynamicResource ForegroundMutedBrush}" Margin="0,6,0,0"/>
                 <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
-                    <Button x:Name="CopyMcpCommandButton" Content="Copy Setup Command" Click="CopyMcpCommandButton_Click"/>
+                    <Button x:Name="CopyMcpCommandButton" Content="Cop_y Setup Command" Click="CopyMcpCommandButton_Click"/>
                     <TextBlock Text="Works with Claude Code. Other LLMs may apply, but why would you?"
                                FontSize="11" FontStyle="Italic" Foreground="{DynamicResource ForegroundMutedBrush}"
                                VerticalAlignment="Center" Margin="8,0,0,0"/>
@@ -119,14 +133,15 @@
                     <TextBlock Text="Port:" VerticalAlignment="Center" Margin="20,0,6,0"
                                Foreground="{DynamicResource ForegroundBrush}"/>
                     <TextBox x:Name="WebPortTextBox" Width="70" Text="5153" VerticalAlignment="Center"/>
-                    <Button Content="Auto" ToolTip="Find an available port"
+                    <!-- Alt+O, because the MCP section's identical "Auto" button already claims Alt+A. -->
+                    <Button Content="Aut_o" ToolTip="Find an available port"
                             Margin="6,0,0,0" Padding="8,2"
                             VerticalAlignment="Center"
                             Click="WebAutoPortButton_Click"/>
                 </StackPanel>
                 <TextBlock x:Name="WebStatusText" FontSize="12" Foreground="{DynamicResource ForegroundMutedBrush}" Margin="0,6,0,0"/>
                 <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
-                    <Button x:Name="CopyWebUrlButton" Content="Copy URL" Click="CopyWebUrlButton_Click"/>
+                    <Button x:Name="CopyWebUrlButton" Content="Copy _URL" Click="CopyWebUrlButton_Click"/>
                     <TextBlock Text="Open this URL in a browser on this machine (or across the LAN when exposed)."
                                FontSize="11" FontStyle="Italic" Foreground="{DynamicResource ForegroundMutedBrush}"
                                VerticalAlignment="Center" Margin="8,0,0,0"/>
@@ -225,7 +240,7 @@
             <StackPanel>
                 <StackPanel Orientation="Horizontal">
                     <TextBlock Text="Notifications" FontSize="14" FontWeight="SemiBold" Foreground="{DynamicResource ForegroundBrush}" VerticalAlignment="Center"/>
-                    <Button x:Name="RestoreAlertDefaultsButton" Content="Restore Defaults" Margin="12,0,0,0"
+                    <Button x:Name="RestoreAlertDefaultsButton" Content="_Restore Defaults" Margin="12,0,0,0"
                             FontSize="11" VerticalAlignment="Center" Click="RestoreAlertDefaultsButton_Click"/>
                 </StackPanel>
                 <CheckBox x:Name="MinimizeToTrayCheckBox" Content="Minimize to system tray" Margin="0,8,0,0"
@@ -291,6 +306,13 @@
                     <TextBox x:Name="AlertBlockingThresholdBox" Width="45" Text="1" Margin="6,0,0,0" VerticalAlignment="Center"/>
                 </StackPanel>
                 <StackPanel Orientation="Horizontal" Margin="20,6,0,0">
+                    <TextBlock Text="Total blocked wait &#x2265;" VerticalAlignment="Center" Margin="24,0,0,0"
+                               Foreground="{DynamicResource ForegroundBrush}"/>
+                    <TextBox x:Name="AlertBlockingWaitSecondsBox" Width="45" Text="0" Margin="6,0,0,0" VerticalAlignment="Center"/>
+                    <TextBlock Text="seconds (0 = off)" VerticalAlignment="Center" Margin="4,0,0,0"
+                               Foreground="{DynamicResource ForegroundMutedBrush}"/>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" Margin="20,6,0,0">
                     <CheckBox x:Name="AlertDeadlockCheckBox" Content="Deadlocks &#x2265;" VerticalAlignment="Center"
                               Foreground="{DynamicResource ForegroundBrush}"/>
                     <TextBox x:Name="AlertDeadlockThresholdBox" Width="45" Text="1" Margin="6,0,0,0" VerticalAlignment="Center"/>
@@ -317,20 +339,22 @@
                 <!-- Long Running Query Filters -->
                 <TextBlock Text="Long Running Query Filters" FontWeight="SemiBold" FontSize="12"
                            Foreground="{DynamicResource ForegroundBrush}" Margin="20,10,0,4"/>
+                <!-- Underscores in these wait/proc names are doubled: WPF reads a single _ as an
+                     access-key marker, which both swallows the character and claims an Alt key. -->
                 <CheckBox x:Name="LrqExcludeSpServerDiagnosticsCheckBox"
-                          Content="Exclude SP_SERVER_DIAGNOSTICS"
+                          Content="Exclude SP__SERVER__DIAGNOSTICS"
                           Foreground="{DynamicResource ForegroundBrush}" Margin="20,0,0,4"/>
                 <CheckBox x:Name="LrqExcludeWaitForCheckBox"
-                          Content="Exclude WAITFOR / BROKER_RECEIVE_WAITFOR"
+                          Content="Exclude WAITFOR / BROKER__RECEIVE__WAITFOR"
                           Foreground="{DynamicResource ForegroundBrush}" Margin="20,0,0,4"/>
                 <CheckBox x:Name="LrqExcludeBackupsCheckBox"
                           Content="Exclude backup waits (BACKUPTHREAD, BACKUPIO)"
                           Foreground="{DynamicResource ForegroundBrush}" Margin="20,0,0,4"/>
                 <CheckBox x:Name="LrqExcludeMiscWaitsCheckBox"
-                          Content="Exclude miscellaneous waits (XE_LIVE_TARGET_TVF)"
+                          Content="Exclude miscellaneous waits (XE__LIVE__TARGET__TVF)"
                           Foreground="{DynamicResource ForegroundBrush}" Margin="20,0,0,4"/>
                 <CheckBox x:Name="LrqExcludeCdcCheckBox"
-                          Content="Exclude CDC capture jobs (sp_MScdc_capture_job, sp_cdc_scan)"
+                          Content="Exclude CDC capture jobs (sp__MScdc__capture__job, sp__cdc__scan)"
                           Foreground="{DynamicResource ForegroundBrush}" Margin="20,0,0,0"/>
                 <StackPanel Orientation="Horizontal" Margin="20,6,0,0">
                     <CheckBox x:Name="AlertTempDbSpaceCheckBox" Content="tempdb space usage over" VerticalAlignment="Center"
@@ -350,6 +374,16 @@
                                Foreground="{DynamicResource ForegroundBrush}"/>
                 </StackPanel>
                 <StackPanel Orientation="Horizontal" Margin="20,6,0,0">
+                    <CheckBox x:Name="AlertPvsCheckBox" Content="Version store (PVS) over" VerticalAlignment="Center"
+                              Foreground="{DynamicResource ForegroundBrush}"/>
+                    <TextBox x:Name="AlertPvsThresholdPercentBox" Width="45" Text="40" Margin="6,0,0,0" VerticalAlignment="Center"/>
+                    <TextBlock Text="% of database and at least" VerticalAlignment="Center" Margin="2,0,0,0"
+                               Foreground="{DynamicResource ForegroundBrush}"/>
+                    <TextBox x:Name="AlertPvsFloorGbBox" Width="45" Text="1" Margin="6,0,0,0" VerticalAlignment="Center"/>
+                    <TextBlock Text="GB (ADR databases only)" VerticalAlignment="Center" Margin="2,0,0,0"
+                               Foreground="{DynamicResource ForegroundBrush}"/>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" Margin="20,6,0,0">
                     <CheckBox x:Name="AlertLongRunningJobCheckBox" Content="Agent jobs running over" VerticalAlignment="Center"
                               Foreground="{DynamicResource ForegroundBrush}"/>
                     <TextBox x:Name="AlertLongRunningJobMultiplierBox" Width="35" Text="3" Margin="6,0,0,0" VerticalAlignment="Center"/>
@@ -362,6 +396,12 @@
                     <TextBox x:Name="AlertFailedJobLookbackBox" Width="45" Text="60" Margin="6,0,0,0" VerticalAlignment="Center"/>
                     <TextBlock Text="minutes" VerticalAlignment="Center" Margin="2,0,0,0"
                                Foreground="{DynamicResource ForegroundBrush}"/>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" Margin="20,6,0,0">
+                    <CheckBox x:Name="AlertDatabaseStateCheckBox" Content="Database state changed from its expected (baseline) state"
+                              VerticalAlignment="Center" Foreground="{DynamicResource ForegroundBrush}"/>
+                    <Button x:Name="ConfigureDatabaseStatesButton" Content="Configure…" Margin="8,0,0,0" Padding="8,2"
+                            VerticalAlignment="Center" Click="ConfigureDatabaseStatesButton_Click"/>
                 </StackPanel>
                 <StackPanel Orientation="Horizontal" Margin="20,10,0,0">
                     <TextBlock Text="Tray notification cooldown:" VerticalAlignment="Center" Margin="0,0,8,0"
@@ -416,7 +456,7 @@
                         <ComboBoxItem Content="Never"/>
                     </ComboBox>
                 </StackPanel>
-                <Button x:Name="ManageMuteRulesButton" Content="Manage Mute Rules..."
+                <Button x:Name="ManageMuteRulesButton" Content="_Manage Mute Rules..."
                         Click="ManageMuteRulesButton_Click" HorizontalAlignment="Left"
                         Padding="12,4" Margin="20,4,0,4"/>
                 <TextBlock Text="Create rules to suppress specific recurring alerts while still logging them."
@@ -507,8 +547,8 @@
                              ToolTip="Comma-separated email addresses"/>
 
                     <StackPanel Grid.Row="6" Grid.Column="1" Orientation="Horizontal" Margin="0,4,0,0">
-                        <Button x:Name="TestEmailButton" Content="Send Test Email" Click="TestEmailButton_Click"/>
-                        <Button x:Name="ValidateSmtpButton" Content="Validate Settings" Margin="8,0,0,0"
+                        <Button x:Name="TestEmailButton" Content="Send Test _Email" Click="TestEmailButton_Click"/>
+                        <Button x:Name="ValidateSmtpButton" Content="_Validate Settings" Margin="8,0,0,0"
                                 Click="ValidateSmtpButton_Click"/>
                         <TextBlock x:Name="SmtpStatusText" FontSize="11" FontStyle="Italic"
                                    Foreground="{DynamicResource ForegroundMutedBrush}" VerticalAlignment="Center" Margin="8,0,0,0"/>
@@ -547,7 +587,10 @@
                              ToolTip="Optional HTTP proxy (e.g. http://proxy.corp:8080). Leave blank for direct connection."/>
 
                     <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" Margin="0,4,0,0">
-                        <Button x:Name="TestTeamsButton" Content="Send Test Notification" Click="TestTeamsButton_Click"/>
+                        <!-- Named per channel: the Teams, Slack and generic-webhook buttons all read
+                             "Send Test Notification" before, which are three identical labels visible at
+                             once on one scrolling page and so could not carry distinct access keys. -->
+                        <Button x:Name="TestTeamsButton" Content="Send Test to _Teams" Click="TestTeamsButton_Click"/>
                         <TextBlock x:Name="TeamsStatusText" FontSize="11" FontStyle="Italic"
                                    Foreground="{DynamicResource ForegroundMutedBrush}" VerticalAlignment="Center" Margin="8,0,0,0"/>
                     </StackPanel>
@@ -588,7 +631,7 @@
                              ToolTip="Optional HTTP proxy (e.g. http://proxy.corp:8080). Leave blank for direct connection."/>
 
                     <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" Margin="0,4,0,0">
-                        <Button x:Name="TestSlackButton" Content="Send Test Notification" Click="TestSlackButton_Click"/>
+                        <Button x:Name="TestSlackButton" Content="Send Test to Slac_k" Click="TestSlackButton_Click"/>
                         <TextBlock x:Name="SlackStatusText" FontSize="11" FontStyle="Italic"
                                    Foreground="{DynamicResource ForegroundMutedBrush}" VerticalAlignment="Center" Margin="8,0,0,0"/>
                     </StackPanel>
@@ -598,6 +641,52 @@
                     <Hyperlink NavigateUri="https://api.slack.com/messaging/webhooks"
                                RequestNavigate="Hyperlink_RequestNavigate">
                         Slack Webhooks Documentation
+                    </Hyperlink>
+                </TextBlock>
+
+                <!-- PagerDuty -->
+                <TextBlock Text="PagerDuty Notifications" FontSize="14" FontWeight="SemiBold"
+                           Foreground="{DynamicResource ForegroundBrush}" Margin="0,20,0,0"/>
+                <TextBlock Text="Send alert notifications to PagerDuty via the Events API v2. Alerts trigger a PagerDuty incident; repeated alerts for the same condition correlate into the same incident."
+                           FontSize="12" Foreground="{DynamicResource ForegroundMutedBrush}" Margin="0,4,0,0" TextWrapping="Wrap"/>
+                <CheckBox x:Name="PagerDutyWebhookEnabledCheckBox" Content="Enable PagerDuty notifications" Margin="0,8,0,0"
+                          Foreground="{DynamicResource ForegroundBrush}" Checked="PagerDutyWebhookEnabledCheckBox_Changed" Unchecked="PagerDutyWebhookEnabledCheckBox_Changed"/>
+                <Grid Margin="20,6,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="110"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <TextBlock Grid.Row="0" Grid.Column="0" Text="Routing Key:" VerticalAlignment="Center"
+                               Foreground="{DynamicResource ForegroundBrush}" Margin="0,0,8,4"/>
+                    <TextBox Grid.Row="0" Grid.Column="1" x:Name="PagerDutyRoutingKeyBox" Margin="0,0,0,4"
+                             ToolTip="The 32-character Integration Key from a PagerDuty Events API v2 integration"/>
+
+                    <TextBlock Grid.Row="1" Grid.Column="0" Text="" VerticalAlignment="Center" Margin="0,0,8,4"/>
+                    <CheckBox Grid.Row="1" Grid.Column="1" x:Name="PagerDutyEuRegionCheckBox" Content="Use EU data center (events.eu.pagerduty.com)"
+                              Foreground="{DynamicResource ForegroundBrush}" Margin="0,0,0,4"/>
+
+                    <TextBlock Grid.Row="2" Grid.Column="0" Text="Proxy Address:" VerticalAlignment="Center"
+                               Foreground="{DynamicResource ForegroundBrush}" Margin="0,0,8,4"/>
+                    <TextBox Grid.Row="2" Grid.Column="1" x:Name="PagerDutyProxyAddressBox" Margin="0,0,0,4"
+                             ToolTip="Optional. HTTP proxy for reaching PagerDuty (e.g. http://proxy.corp.local:8080). Leave blank to connect directly."/>
+
+                    <StackPanel Grid.Row="3" Grid.Column="1" Orientation="Horizontal" Margin="0,4,0,0">
+                        <Button x:Name="TestPagerDutyButton" Content="Send Test Notification" Click="TestPagerDutyButton_Click"/>
+                        <TextBlock x:Name="PagerDutyStatusText" FontSize="11" FontStyle="Italic"
+                                   Foreground="{DynamicResource ForegroundMutedBrush}" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                    </StackPanel>
+                </Grid>
+                <TextBlock Margin="20,8,0,0" TextWrapping="Wrap" FontSize="11" Foreground="{DynamicResource ForegroundMutedBrush}">
+                    <Run Text="Setup: Create a service in PagerDuty, add an Events API v2 integration, and copy its Integration Key. "/>
+                    <Hyperlink NavigateUri="https://support.pagerduty.com/docs/services-and-integrations"
+                               RequestNavigate="Hyperlink_RequestNavigate">
+                        PagerDuty Integrations Documentation
                     </Hyperlink>
                 </TextBlock>
 
@@ -644,7 +733,7 @@
                              ToolTip="Optional HTTP proxy (e.g. http://proxy.corp:8080). Leave blank for direct connection."/>
 
                     <StackPanel Grid.Row="4" Grid.Column="1" Orientation="Horizontal" Margin="0,4,0,0">
-                        <Button x:Name="TestGenericButton" Content="Send Test Notification" Click="TestGenericButton_Click"/>
+                        <Button x:Name="TestGenericButton" Content="Send Test to _Webhook" Click="TestGenericButton_Click"/>
                         <TextBlock x:Name="GenericStatusText" FontSize="11" FontStyle="Italic"
                                    Foreground="{DynamicResource ForegroundMutedBrush}" VerticalAlignment="Center" Margin="8,0,0,0"/>
                     </StackPanel>
@@ -695,16 +784,20 @@
                            Foreground="{DynamicResource ForegroundBrush}"/>
                 <TextBlock Text="Tune how often the Darling service collects each metric and how long it keeps it — fleet-wide or per server. Blank overrides fall back to the built-in defaults; presets bulk-set frequencies."
                            FontSize="12" Foreground="{DynamicResource ForegroundMutedBrush}" Margin="0,6,0,0" TextWrapping="Wrap"/>
-                <Button x:Name="EditSchedulesButton" Content="Edit Collector Schedules..." HorizontalAlignment="Left"
+                <Button x:Name="EditSchedulesButton" Content="E_dit Collector Schedules..." HorizontalAlignment="Left"
                         Padding="12,4" Margin="0,8,0,0" Click="EditSchedulesButton_Click"/>
             </StackPanel>
         </Border>
 
-        <!-- Buttons -->
-        <StackPanel Grid.Row="9" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
-            <Button Content="Save" Click="SaveButton_Click" Style="{DynamicResource AccentButton}" Margin="0,0,8,0"/>
-            <Button Content="Close" Click="CloseButton_Click"/>
-        </StackPanel>
     </Grid>
     </ScrollViewer>
+
+        <!-- Pinned action bar (#2063) — outside the ScrollViewer, always visible. -->
+        <Border Grid.Row="1" Background="{DynamicResource BackgroundBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,1,0,0">
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="16,10,16,12">
+                <Button Content="_Save" Click="SaveButton_Click" Style="{DynamicResource AccentButton}" Margin="0,0,8,0"/>
+                <Button Content="_Close" Click="CloseButton_Click" IsCancel="True"/>
+            </StackPanel>
+        </Border>
+    </Grid>
 </Window>

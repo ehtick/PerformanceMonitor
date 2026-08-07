@@ -28,10 +28,12 @@ public sealed class PgSchemaGeneratorTests
     public void Catalog_CoversAllCollectors_WithUniqueTablesAndNames()
     {
         /* 35 through agent_status + long_query_completions (#1496 long-query trace) = 36, plus the two
-           Availability Group collectors (#991) = 38. */
-        Assert.Equal(38, CollectorCatalog.All.Count);
-        Assert.Equal(38, CollectorCatalog.All.Select(s => s.TargetTable).Distinct().Count());
-        Assert.Equal(38, CollectorCatalog.All.Select(s => s.Name).Distinct().Count());
+           Availability Group collectors (#991) = 38, plus plan_correction (#1952 automatic plan
+           correction) = 39, plus pvs_stats (#1951 ADR version store) = 40, plus database_states
+           (baseline-deviation database-state alert) = 41. */
+        Assert.Equal(41, CollectorCatalog.All.Count);
+        Assert.Equal(41, CollectorCatalog.All.Select(s => s.TargetTable).Distinct().Count());
+        Assert.Equal(41, CollectorCatalog.All.Select(s => s.Name).Distinct().Count());
     }
 
     [Fact]
@@ -421,6 +423,14 @@ public sealed class PgSchemaGeneratorTests
         Assert.Contains(CollectQualified(AgentStatusCollector.Instance), v25, StringComparison.Ordinal);
         Assert.Contains("CREATE INDEX IF NOT EXISTS idx_agent_status_time ON collect.agent_status(server_id, collection_time);", v25, StringComparison.Ordinal);
 
+        /* V47 (#1951) creates pvs_stats for an already-existing store; a fresh store gets it from V1's
+           GenerateFullSchema. Same contract as V24/V25 — and it is the ONLY thing standing between a
+           hand-typed 26-column CREATE TABLE and a silent fresh-vs-upgraded shape fork. */
+        var v47 = Lf(PgMigrations.Scripts.Single(m => m.Version == 47).Sql);
+
+        Assert.Contains(CollectQualified(PvsStatsCollector.Instance), v47, StringComparison.Ordinal);
+        Assert.Contains("CREATE INDEX IF NOT EXISTS idx_pvs_stats_time ON collect.pvs_stats(server_id, collection_time);", v47, StringComparison.Ordinal);
+
         /* V34 (#991) creates BOTH Availability Group tables in one migration body — same contract. The
            weaker `Assert.Contains(column.Name)` sweep this replaces would have passed a V34 with the
            columns reordered, is_local typed text, or a spurious NOT NULL: exactly the drifts that make an
@@ -519,6 +529,8 @@ public sealed class PgSchemaGeneratorTests
         public bool AppliesTo(CollectorTargetInfo target) => _inner.AppliesTo(target);
 
         public bool YieldsOnLockTimeout => _inner.YieldsOnLockTimeout;
+
+        public IReadOnlyList<string> StateKeys => _inner.StateKeys;
     }
 
     [Fact]
@@ -546,11 +558,12 @@ public sealed class PgSchemaGeneratorTests
         var script = PgSchemaGenerator.GenerateFullSchema();
 
         var tableCount = CollectorCatalog.All.Count(s => script.Contains($"CREATE TABLE IF NOT EXISTS {s.TargetTable} (", StringComparison.Ordinal));
-        Assert.Equal(38, tableCount);
+        Assert.Equal(41, tableCount);
 
-        /* 38 tables minus the two index-less config tables (server_config, database_config) = 36 indexes. */
+        /* 41 tables minus the two index-less config tables (server_config, database_config) = 39 indexes
+           (database_states is a time-series collector and gets the default retrieval index). */
         var indexCount = script.Split("CREATE INDEX IF NOT EXISTS").Length - 1;
-        Assert.Equal(36, indexCount);
+        Assert.Equal(39, indexCount);
 
         /* The precision guard can never regress silently. */
         Assert.DoesNotContain("numeric(0,0)", script, StringComparison.Ordinal);

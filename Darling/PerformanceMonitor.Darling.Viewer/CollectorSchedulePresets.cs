@@ -54,13 +54,17 @@ public static class CollectorSchedulePresets
                 ["query_store"] = 2, ["query_snapshots"] = 1, ["cpu_utilization"] = 1,
                 ["file_io_stats"] = 1, ["memory_stats"] = 1, ["memory_clerks"] = 2,
                 ["memory_pressure_events"] = 5,
-                ["tempdb_stats"] = 1, ["perfmon_stats"] = 1, ["deadlocks"] = 1,
+                ["tempdb_stats"] = 1, ["perfmon_stats"] = 1, ["deadlocks"] = 2,
                 ["memory_grant_stats"] = 1, ["waiting_tasks"] = 1,
                 ["dmv_blocking_snapshot"] = 1,
                 ["blocked_process_report"] = 1, ["running_jobs"] = 2,
                 ["session_summary_stats"] = 2, ["system_health_events"] = 2,
                 ["default_trace_events"] = 2, ["job_history"] = 2, ["agent_status"] = 2,
                 ["ag_replica_states"] = 1, ["ag_database_replica_states"] = 1,
+                /* plan_correction tracks query_store across the presets: same per-database enumeration
+                   shape, same default tier, so an operator backing one off wants the other to follow. */
+                ["plan_correction"] = 2,
+                ["database_states"] = 1,
             },
             ["Balanced"] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
             {
@@ -70,13 +74,16 @@ public static class CollectorSchedulePresets
                 ["query_store"] = 5, ["query_snapshots"] = 1, ["cpu_utilization"] = 1,
                 ["file_io_stats"] = 1, ["memory_stats"] = 1, ["memory_clerks"] = 5,
                 ["memory_pressure_events"] = 5,
-                ["tempdb_stats"] = 1, ["perfmon_stats"] = 1, ["deadlocks"] = 1,
+                /* deadlocks follows its new 5-minute default tier (#1963) - Balanced mirrors the defaults. */
+                ["tempdb_stats"] = 1, ["perfmon_stats"] = 1, ["deadlocks"] = 5,
                 ["memory_grant_stats"] = 1, ["waiting_tasks"] = 1,
                 ["dmv_blocking_snapshot"] = 1,
                 ["blocked_process_report"] = 1, ["running_jobs"] = 5,
                 ["session_summary_stats"] = 5, ["system_health_events"] = 5,
                 ["default_trace_events"] = 5, ["job_history"] = 5, ["agent_status"] = 5,
                 ["ag_replica_states"] = 1, ["ag_database_replica_states"] = 1,
+                ["plan_correction"] = 5,
+                ["database_states"] = 1,
             },
             ["Low-Impact"] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
             {
@@ -86,19 +93,21 @@ public static class CollectorSchedulePresets
                 ["query_store"] = 30, ["query_snapshots"] = 5, ["cpu_utilization"] = 5,
                 ["file_io_stats"] = 10, ["memory_stats"] = 10, ["memory_clerks"] = 30,
                 ["memory_pressure_events"] = 15,
-                ["tempdb_stats"] = 5, ["perfmon_stats"] = 5, ["deadlocks"] = 5,
+                ["tempdb_stats"] = 5, ["perfmon_stats"] = 5, ["deadlocks"] = 15,
                 ["memory_grant_stats"] = 5, ["waiting_tasks"] = 5,
                 ["dmv_blocking_snapshot"] = 5,
                 ["blocked_process_report"] = 5, ["running_jobs"] = 30,
                 ["session_summary_stats"] = 15, ["system_health_events"] = 15,
                 ["default_trace_events"] = 15, ["job_history"] = 15, ["agent_status"] = 15,
                 ["ag_replica_states"] = 5, ["ag_database_replica_states"] = 5,
+                ["plan_correction"] = 30,
+                ["database_states"] = 5,
             },
         };
 
     /// <summary>
     /// The full editable schedule seeded from the shared <see cref="CollectorScheduleDefaults"/> (every
-    /// collector, at its code-default frequency/retention, enabled) — the baseline the editor overlays store
+    /// collector, at its code-default frequency/retention and code-default ENABLED state) — the baseline the editor overlays store
     /// overrides onto. Ordered by collector name for a stable grid.
     /// </summary>
     public static List<CollectorScheduleEditItem> BuildDefaultSchedule() =>
@@ -107,7 +116,11 @@ public static class CollectorSchedulePresets
             .Select(kv => new CollectorScheduleEditItem
             {
                 Name = kv.Key,
-                Enabled = true,
+                /* #2064: the collector's OWN shipped enabled state, not a blanket true. Hardcoding
+                   true made the editor show a default-OFF collector (long_query_completions) as
+                   CHECKED at default scope — it read as "already enabled" while the store held
+                   nothing and the feature was off, which is exactly how #2061 was reported. */
+                Enabled = kv.Value.DefaultEnabled,
                 FrequencyMinutes = kv.Value.FrequencyMinutes,
                 RetentionDays = kv.Value.RetentionDays,
             })

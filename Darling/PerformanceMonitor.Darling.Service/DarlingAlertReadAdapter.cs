@@ -40,6 +40,7 @@ public sealed class DarlingAlertReadAdapter : IAlertReadAdapter
 {
     private readonly NpgsqlDataSource _postgres;
     private readonly Func<int, int>? _runningJobsCadenceMinutes;
+    private readonly Func<int, int>? _blockingSnapshotCadenceMinutes;
 
     /// <param name="runningJobsCadenceMinutes">
     /// Resolves a server's EFFECTIVE running_jobs collection cadence (minutes) for the #1812
@@ -47,10 +48,17 @@ public sealed class DarlingAlertReadAdapter : IAlertReadAdapter
     /// <c>StoreConfigProvider.ResolveSchedule</c> the sweep runs on). Null (test call sites) or a
     /// non-positive answer falls back to the shared <see cref="CollectorScheduleDefaults"/> cadence.
     /// </param>
-    public DarlingAlertReadAdapter(NpgsqlDataSource postgres, Func<int, int>? runningJobsCadenceMinutes = null)
+    /// <param name="blockingSnapshotCadenceMinutes">
+    /// The same resolver for the dmv_blocking_snapshot cadence, behind #1839's freshness bound.
+    /// </param>
+    public DarlingAlertReadAdapter(
+        NpgsqlDataSource postgres,
+        Func<int, int>? runningJobsCadenceMinutes = null,
+        Func<int, int>? blockingSnapshotCadenceMinutes = null)
     {
         _postgres = postgres ?? throw new ArgumentNullException(nameof(postgres));
         _runningJobsCadenceMinutes = runningJobsCadenceMinutes;
+        _blockingSnapshotCadenceMinutes = blockingSnapshotCadenceMinutes;
     }
 
     /* ---------------- blocking (XE-preferred + DMV fallback) ---------------- */
@@ -170,6 +178,62 @@ LIMIT 200";
         BlockedProcessReportMerge.AppendDmvFallbackRows(items, dmvItems);
 
         return items;
+    }
+
+    /* ---------------- current blocking wait (#1839) ---------------- */
+
+    /// <summary>
+    /// Lite's latest-blocking-snapshot sum, ported dialect-for-dialect: ONE snapshot selected by
+    /// <c>collection_time = MAX(collection_time)</c> (never a window — see
+    /// <see cref="CurrentBlockingWaitResult"/>), its <c>wait_time_ms</c> summed and its distinct
+    /// blocked SPIDs counted. $1 server_id, used twice.
+    /// <para>
+    /// ONE statement, deliberately: Npgsql fails SILENTLY on multi-statement commands with positional
+    /// parameters, so the freshness probe cannot be batched onto this — the snapshot time comes back as
+    /// a column of this same aggregate instead, which is one round trip rather than two anyway.
+    /// </para>
+    /// </summary>
+    public const string CurrentBlockingWaitSql = @"
+SELECT
+    collection_time,
+    CAST(COALESCE(SUM(wait_time_ms), 0) AS bigint) AS total_wait_ms,
+    CAST(COUNT(DISTINCT blocked_spid) AS integer) AS blocked_sessions
+FROM dmv_blocking_snapshots
+WHERE server_id = $1
+AND   collection_time = (
+    SELECT MAX(collection_time)
+    FROM dmv_blocking_snapshots
+    WHERE server_id = $1
+)
+GROUP BY collection_time";
+
+    public async Task<CurrentBlockingWaitResult?> GetCurrentBlockingWaitAsync(
+        string serverKey, CancellationToken cancellationToken = default)
+    {
+        var serverId = ParseServerKey(serverKey);
+
+        await using var connection = await _postgres.OpenConnectionAsync(cancellationToken);
+        using var command = new NpgsqlCommand(CurrentBlockingWaitSql, connection);
+        command.Parameters.AddWithValue(serverId);
+
+        using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        /* The SQL casts pin both aggregates to bigint/integer, so these read directly — PG's SUM(bigint)
+           is numeric and COUNT is bigint, neither of which Npgsql would hand back as long/int untyped. */
+        var snapshotTime = reader.GetDateTime(0);
+        var totalWaitMs = reader.IsDBNull(1) ? 0L : reader.GetInt64(1);
+        var blockedSessions = reader.IsDBNull(2) ? 0 : reader.GetInt32(2);
+
+        /* #1812 freshness, same rule as Lite's adapter — parity is the point. The stored times are
+           naive UTC, so they compare directly against DateTime.UtcNow. */
+        var cadence = ResolveCadence(_blockingSnapshotCadenceMinutes, serverId, "dmv_blocking_snapshot");
+        bool isFresh = DateTime.UtcNow - snapshotTime <= CurrentBlockingWaitResult.MaxSnapshotAge(cadence);
+
+        return new CurrentBlockingWaitResult(snapshotTime, totalWaitMs, blockedSessions, isFresh);
     }
 
     /* ---------------- deadlocks ---------------- */
@@ -423,6 +487,66 @@ ORDER BY MIN(volume_free_mb) / MAX(volume_total_mb)";
         return items;
     }
 
+    /* ---------------- persistent version store (#1984) ---------------- */
+
+    /// <summary>
+    /// The newest pvs_stats snapshot's ADR databases, worst (highest PVS share) first — the
+    /// latest-collection convention <see cref="VolumeFreeSpaceSql"/> uses. ADR-OFF rows are
+    /// excluded here rather than engine-side: a database that cannot have a PVS cannot breach,
+    /// and every collected server carries system databases with ADR off.
+    /// </summary>
+    public const string PvsPressureSql = @"
+SELECT
+    database_name,
+    persistent_version_store_size_mb,
+    database_data_size_mb,
+    current_aborted_transaction_count,
+    oldest_active_transaction_id,
+    oldest_aborted_transaction_id,
+    aborted_version_cleaner_start_time,
+    aborted_version_cleaner_end_time
+FROM pvs_stats
+WHERE server_id = $1
+AND   collection_time = (
+    SELECT MAX(collection_time)
+    FROM pvs_stats
+    WHERE server_id = $1
+)
+AND   is_accelerated_database_recovery_on
+ORDER BY
+    CASE WHEN database_data_size_mb > 0
+         THEN persistent_version_store_size_mb / database_data_size_mb
+         ELSE 0 END DESC";
+
+    public async Task<List<PvsPressureInfo>> GetPvsPressureAsync(
+        string serverKey, CancellationToken cancellationToken = default)
+    {
+        var serverId = ParseServerKey(serverKey);
+
+        var items = new List<PvsPressureInfo>();
+        await using var connection = await _postgres.OpenConnectionAsync(cancellationToken);
+        using var command = new NpgsqlCommand(PvsPressureSql, connection);
+        command.Parameters.AddWithValue(serverId);
+
+        using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            items.Add(new PvsPressureInfo
+            {
+                DatabaseName = reader.IsDBNull(0) ? "" : reader.GetString(0),
+                PvsSizeMb = reader.IsDBNull(1) ? 0 : ToDouble(reader.GetValue(1)),
+                DatabaseDataSizeMb = reader.IsDBNull(2) ? 0 : ToDouble(reader.GetValue(2)),
+                CurrentAbortedTransactionCount = reader.IsDBNull(3) ? 0 : reader.GetInt64(3),
+                OldestActiveTransactionId = reader.IsDBNull(4) ? 0 : reader.GetInt64(4),
+                OldestAbortedTransactionId = reader.IsDBNull(5) ? 0 : reader.GetInt64(5),
+                /* MS's documented shape for "cleanup is ongoing": a start time with no end time. */
+                AbortedCleanupOngoing = !reader.IsDBNull(6) && reader.IsDBNull(7)
+            });
+        }
+
+        return items;
+    }
+
     /* ---------------- tempdb ---------------- */
 
     /// <summary>Lite's latest-tempdb-snapshot read verbatim (tempdb_stats table).</summary>
@@ -538,15 +662,138 @@ LIMIT 5";
         return new AnomalousJobsResult(SnapshotIsFresh: true, items);
     }
 
-    private int ResolveRunningJobsCadence(int serverId)
+    /* ---------------- database state (baseline deviation) ---------------- */
+
+    /// <summary>
+    /// Seeds a first-observation baseline for any database in the latest snapshot that has none
+    /// (insert-if-absent; never overwrites an existing baseline or user override). A CRITICAL first
+    /// observation (SUSPECT / RECOVERY_PENDING / EMERGENCY) is deliberately NOT baselined: onboarding a
+    /// server mid-outage must not learn the bad state as expected — such a database stays pending (no
+    /// row) and the deviation read alerts on it until it recovers or an operator sets an expected state.
+    /// config schema qualified explicitly; database_states resolves to collect through the search_path.
+    /// $1 server_id.
+    /// </summary>
+    public const string SeedDatabaseStateExpectedSql = @"
+INSERT INTO config.database_state_expected (server_id, database_name, expected_state, is_user_override, updated_at)
+SELECT $1, ds.database_name, CASE WHEN ds.is_in_standby THEN 'STANDBY' ELSE ds.state_desc END, false, (now() AT TIME ZONE 'UTC')
+FROM database_states ds
+WHERE ds.server_id = $1
+AND   ds.collection_time = (SELECT MAX(collection_time) FROM database_states WHERE server_id = $1)
+AND   ds.state_desc IS NOT NULL
+AND   (CASE WHEN ds.is_in_standby THEN 'STANDBY' ELSE ds.state_desc END) NOT IN ('SUSPECT', 'RECOVERY_PENDING', 'EMERGENCY')
+ON CONFLICT (server_id, database_name) DO NOTHING";
+
+    /// <summary>
+    /// Tidies auto-baselines for databases no longer in the newest snapshot (dropped/renamed); user
+    /// overrides are kept. $1 server_id.
+    /// </summary>
+    public const string PruneDatabaseStateExpectedSql = @"
+DELETE FROM config.database_state_expected e
+WHERE e.server_id = $1
+AND   e.is_user_override = false
+AND   NOT EXISTS (
+    SELECT 1 FROM database_states ds
+    WHERE ds.server_id = $1
+    AND   ds.collection_time = (SELECT MAX(collection_time) FROM database_states WHERE server_id = $1)
+    AND   ds.database_name = e.database_name
+)";
+
+    /// <summary>
+    /// The databases whose state deviates from their expected state in BOTH of the two most recent
+    /// collections (a two-sample rule that absorbs restart transients — RECOVERY_PENDING / RECOVERING — and
+    /// a standby secondary's per-restore RESTORING flicker), plus databases with no baseline yet whose
+    /// effective state is critical in both samples (a pending critical first observation). Uses the
+    /// effective state (STANDBY for a log-shipping secondary, else state_desc). Skips the "(ignore)"
+    /// sentinel; each row carries current + expected (expected is empty for a pending row). Lite's DuckDB
+    /// read ported to Postgres. $1 server_id.
+    /// </summary>
+    public const string DatabaseStateDeviationsSql = @"
+WITH newest AS (
+    SELECT MAX(collection_time) AS t FROM database_states WHERE server_id = $1
+),
+prev AS (
+    SELECT MAX(collection_time) AS t FROM database_states
+    WHERE server_id = $1 AND collection_time < (SELECT t FROM newest)
+),
+latest AS (
+    SELECT ds.database_name, CASE WHEN ds.is_in_standby THEN 'STANDBY' ELSE ds.state_desc END AS eff
+    FROM database_states ds
+    WHERE ds.server_id = $1 AND ds.collection_time = (SELECT t FROM newest)
+),
+previous AS (
+    SELECT ds.database_name, CASE WHEN ds.is_in_standby THEN 'STANDBY' ELSE ds.state_desc END AS eff
+    FROM database_states ds
+    WHERE ds.server_id = $1 AND ds.collection_time = (SELECT t FROM prev)
+)
+SELECT l.database_name, l.eff, COALESCE(e.expected_state, '')
+FROM latest l
+JOIN previous p
+  ON p.database_name = l.database_name
+LEFT JOIN config.database_state_expected e
+  ON  e.server_id = $1
+  AND e.database_name = l.database_name
+WHERE (e.expected_state IS NULL
+        AND l.eff IN ('SUSPECT', 'RECOVERY_PENDING', 'EMERGENCY')
+        AND p.eff IN ('SUSPECT', 'RECOVERY_PENDING', 'EMERGENCY'))
+   OR (e.expected_state IS NOT NULL AND e.expected_state <> '(ignore)'
+        AND l.eff IS DISTINCT FROM e.expected_state
+        AND p.eff IS DISTINCT FROM e.expected_state)
+ORDER BY l.database_name";
+
+    public async Task<List<DatabaseStateInfo>> GetDatabaseStatesAsync(
+        string serverKey, CancellationToken cancellationToken = default)
     {
-        var resolved = _runningJobsCadenceMinutes?.Invoke(serverId) ?? 0;
+        var serverId = ParseServerKey(serverKey);
+
+        var items = new List<DatabaseStateInfo>();
+        await using var connection = await _postgres.OpenConnectionAsync(cancellationToken);
+
+        using (var seed = new NpgsqlCommand(SeedDatabaseStateExpectedSql, connection))
+        {
+            seed.Parameters.AddWithValue(serverId);
+            await seed.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        using (var prune = new NpgsqlCommand(PruneDatabaseStateExpectedSql, connection))
+        {
+            prune.Parameters.AddWithValue(serverId);
+            await prune.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        using (var command = new NpgsqlCommand(DatabaseStateDeviationsSql, connection))
+        {
+            command.Parameters.AddWithValue(serverId);
+            using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                items.Add(new DatabaseStateInfo
+                {
+                    DatabaseName = reader.IsDBNull(0) ? "" : reader.GetString(0),
+                    StateDesc = reader.IsDBNull(1) ? "" : reader.GetString(1),
+                    ExpectedState = reader.IsDBNull(2) ? "" : reader.GetString(2)
+                });
+            }
+        }
+
+        return items;
+    }
+
+    private int ResolveRunningJobsCadence(int serverId) =>
+        ResolveCadence(_runningJobsCadenceMinutes, serverId, "running_jobs");
+
+    /// <summary>
+    /// A server's effective cadence for one collector: the worker's resolver when it answers usefully,
+    /// otherwise the shipped default, otherwise 2 minutes (an unregistered collector name).
+    /// </summary>
+    private static int ResolveCadence(Func<int, int>? resolver, int serverId, string collectorName)
+    {
+        var resolved = resolver?.Invoke(serverId) ?? 0;
         if (resolved > 0)
         {
             return resolved;
         }
 
-        return PerformanceMonitor.Collectors.CollectorScheduleDefaults.All.TryGetValue("running_jobs", out var schedule)
+        return PerformanceMonitor.Collectors.CollectorScheduleDefaults.All.TryGetValue(collectorName, out var schedule)
             ? schedule.FrequencyMinutes
             : 2;
     }

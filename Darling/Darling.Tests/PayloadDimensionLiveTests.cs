@@ -265,7 +265,30 @@ public sealed class PayloadDimensionLiveTests
                     connection,
                     "SELECT is_nullable FROM information_schema.columns WHERE table_name = $1 AND column_name = $2",
                     ct, dimTable, column);
-                Assert.Equal("NO", nullable);
+
+                /* #2069: the plan dim's TEXT column is nullable BY DESIGN — new rows carry gzip bytes
+                   and leave it NULL (fresh stores create it nullable; upgraded stores get V54's DROP
+                   NOT NULL). Digest and last_seen — and the text dim entirely — stay NOT NULL. */
+                var expectNullable =
+                    string.Equals(dimTable, PayloadDimensions.CompressedContentDimTable, StringComparison.Ordinal) &&
+                    string.Equals(column, payloadColumn, StringComparison.Ordinal)
+                        ? "YES"
+                        : "NO";
+                Assert.Equal(expectNullable, nullable);
+            }
+
+            /* #2069: the plan dim also carries the gz bytea column, nullable — pre-V54 rows have text
+               only, so NOT NULL could never hold. */
+            if (string.Equals(dimTable, PayloadDimensions.CompressedContentDimTable, StringComparison.Ordinal))
+            {
+                Assert.Equal("bytea", await ScalarAsync(
+                    connection,
+                    "SELECT data_type FROM information_schema.columns WHERE table_name = $1 AND column_name = $2",
+                    ct, dimTable, PayloadDimensions.CompressedContentColumn));
+                Assert.Equal("YES", await ScalarAsync(
+                    connection,
+                    "SELECT is_nullable FROM information_schema.columns WHERE table_name = $1 AND column_name = $2",
+                    ct, dimTable, PayloadDimensions.CompressedContentColumn));
             }
 
             /* The digest is the PRIMARY KEY — that is what makes ON CONFLICT (digest) the dedup mechanism
@@ -338,21 +361,34 @@ public sealed class PayloadDimensionLiveTests
                 Assert.False(await reader.ReadAsync(ct));
             }
 
-            /* The content is in the dimensions, once. */
+            /* The content is in the dimensions, once. Text keeps its text shape; the plan dim stores
+               gzip BYTES with its text column NULL (#2069) — the digest was still computed over the
+               UNCOMPRESSED text, so identity is stable across the format change. */
             Assert.Equal(queryText, await ScalarAsync(
                 connection, "SELECT query_text FROM query_text_dim WHERE digest = $1", ct, textDigest));
-            Assert.Equal(planXml, await ScalarAsync(
-                connection, "SELECT query_plan_xml FROM query_plan_dim WHERE digest = $1", ct, planDigest));
-
-            /* And the view hands back exactly what was collected — the property every reader depends on. */
             using (var read = new NpgsqlCommand(
-                "SELECT query_text, query_plan_xml FROM v_query_stats WHERE server_id = $1", connection))
+                "SELECT query_plan_xml, query_plan_gz FROM query_plan_dim WHERE digest = $1", connection))
+            {
+                read.Parameters.AddWithValue(planDigest);
+                await using var reader = await read.ExecuteReaderAsync(ct);
+                Assert.True(await reader.ReadAsync(ct));
+                Assert.True(reader.IsDBNull(0), "query_plan_dim.query_plan_xml must be NULL on a row written since #2069");
+                Assert.Equal(planXml, PayloadDimensions.DecompressContent(reader.GetFieldValue<byte[]>(1)));
+            }
+
+            /* And the view hands back exactly what was collected. The TEXT arrives through query_text as
+               before; the PLAN arrives as gzip bytes in query_plan_gz with the coalesced query_plan_xml
+               NULL — the #2069 disclosed contract change: raw-SQL consumers of the view see NULL plan
+               text on new rows and must read the gz column (every product reader resolves text-else-gz). */
+            using (var read = new NpgsqlCommand(
+                "SELECT query_text, query_plan_xml, query_plan_gz FROM v_query_stats WHERE server_id = $1", connection))
             {
                 read.Parameters.AddWithValue(serverId);
                 await using var reader = await read.ExecuteReaderAsync(ct);
                 Assert.True(await reader.ReadAsync(ct));
                 Assert.Equal(queryText, reader.GetString(0));
-                Assert.Equal(planXml, reader.GetString(1));
+                Assert.True(reader.IsDBNull(1), "v_query_stats.query_plan_xml must be NULL for a post-#2069 plan");
+                Assert.Equal(planXml, PayloadDimensions.DecompressContent(reader.GetFieldValue<byte[]>(2)));
             }
 
             bodySucceeded = true;
@@ -627,7 +663,122 @@ public sealed class PayloadDimensionLiveTests
         }
     }
 
-    // ── (g) NUL handling ──
+    // ── (g) the recompression verb (#2076) ──
+
+    [Fact]
+    public async Task Recompression_ConvertsTextRowsToVerifiedGzip_LeavesLastSeenAndGzRowsAlone_AndConverges()
+    {
+        var connectionString = Environment.GetEnvironmentVariable("DARLING_TEST_PG");
+        Assert.SkipWhen(string.IsNullOrEmpty(connectionString), SkipReason);
+
+        var ct = TestContext.Current.CancellationToken;
+        var run = Guid.NewGuid().ToString("N")[..12];
+
+        /* Three pre-V54-shaped text rows (one carrying non-ASCII, the codec's UTF-8 leg) and one
+           already-gz row the run must not touch. The repeated operator block gives each plan realistic
+           bulk (~6 KB): a payload smaller than gzip's own framing would compress LARGER and turn the
+           smaller-than-text assertion below into a lie about real plans. */
+        var bulk = string.Concat(Enumerable.Repeat(
+            "<RelOp NodeId=\"1\" PhysicalOp=\"Index Seek\" LogicalOp=\"Index Seek\" EstimateRows=\"1\"/>", 80));
+        var textPlans = new[]
+        {
+            $"<ShowPlanXML recompress=\"a-{run}\">{bulk}<StmtSimple/></ShowPlanXML>",
+            $"<ShowPlanXML recompress=\"b-{run}\">{bulk}<StmtSimple StatementText=\"SELECT N'Ærø — 数据'\"/></ShowPlanXML>",
+            $"<ShowPlanXML recompress=\"c-{run}\">{bulk}<StmtSimple/></ShowPlanXML>",
+        };
+        var textDigests = textPlans.Select(PayloadDimensions.Digest).ToArray();
+        var gzPlan = $"<ShowPlanXML recompress=\"gz-{run}\"/>";
+        var gzDigest = PayloadDimensions.Digest(gzPlan);
+        var gzBytes = PayloadDimensions.CompressContent(gzPlan);
+        var t0 = new DateTime(2026, 4, 1, 12, 0, 0, DateTimeKind.Unspecified);
+
+        await using var connection = await OpenMigratedStoreAsync(connectionString!, ct);
+        var bodySucceeded = false;
+        try
+        {
+            for (var i = 0; i < textPlans.Length; i++)
+            {
+                using var insert = new NpgsqlCommand(
+                    "INSERT INTO query_plan_dim (digest, query_plan_xml, last_seen) VALUES ($1, $2, $3)",
+                    connection);
+                insert.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Bytea, Value = textDigests[i] });
+                insert.Parameters.AddWithValue(textPlans[i]);
+                insert.Parameters.AddWithValue(t0);
+                await insert.ExecuteNonQueryAsync(ct);
+            }
+
+            using (var insert = new NpgsqlCommand(
+                "INSERT INTO query_plan_dim (digest, query_plan_gz, last_seen) VALUES ($1, $2, $3)",
+                connection))
+            {
+                insert.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Bytea, Value = gzDigest });
+                insert.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Bytea, Value = gzBytes });
+                insert.Parameters.AddWithValue(t0);
+                await insert.ExecuteNonQueryAsync(ct);
+            }
+
+            /* The survey counts the whole table (fleet-wide on a shared rig), so pin relatively. */
+            var survey = await PlanDimRecompression.SurveyAsync(connection, ct);
+            Assert.True(survey.Pending >= textPlans.Length, "the seeded text rows must count as pending");
+
+            var result = await PlanDimRecompression.ConvertAsync(connection, progress: null, ct);
+            Assert.True(result.Rows >= textPlans.Length, "the seeded text rows must convert");
+            Assert.Equal(0, result.VerifyFailures);
+            Assert.True(result.TextBytes > result.GzipBytes, "gzip must actually be smaller than the text it replaced");
+
+            /* Each converted row: text NULL, gz decompresses to the ORIGINAL text, and last_seen is
+               UNTOUCHED — recompression is not a sighting (stamping it would push GC-eligible rows a
+               full retention window into the future). */
+            for (var i = 0; i < textPlans.Length; i++)
+            {
+                using var read = new NpgsqlCommand(
+                    "SELECT query_plan_xml, query_plan_gz, last_seen FROM query_plan_dim WHERE digest = $1",
+                    connection);
+                read.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Bytea, Value = textDigests[i] });
+                await using var reader = await read.ExecuteReaderAsync(ct);
+                Assert.True(await reader.ReadAsync(ct));
+                Assert.True(reader.IsDBNull(0), "converted row must have NULL text");
+                Assert.Equal(textPlans[i], PayloadDimensions.DecompressContent(reader.GetFieldValue<byte[]>(1)));
+                Assert.Equal(t0, reader.GetDateTime(2));
+            }
+
+            /* The already-gz row's bytes are untouched (the fetch predicate never selects it). */
+            var gzAfter = (byte[])(await ScalarAsync(
+                connection, "SELECT query_plan_gz FROM query_plan_dim WHERE digest = $1", ct, gzDigest))!;
+            Assert.Equal(gzBytes, gzAfter);
+
+            /* Convergence: a second run finds nothing left to do. */
+            var second = await PlanDimRecompression.ConvertAsync(connection, progress: null, ct);
+            Assert.Equal(0, second.Rows);
+            Assert.Equal(0, second.VerifyFailures);
+
+            /* The closing compaction (#2076): VACUUM FULL runs against a live store and the content
+               survives it byte-for-byte — the estimate is sane (positive, no bigger than the current
+               relation plus slack) and a converted row still decompresses to its original text after
+               the rewrite. */
+            var estimate = await PlanDimRecompression.EstimateCompactedBytesAsync(connection, ct);
+            Assert.True(estimate > 0, "compacted-size estimate must be positive");
+            await PlanDimRecompression.VacuumFullAsync(connection, ct);
+            Assert.Equal(textPlans[0], PayloadDimensions.DecompressContent((byte[])(await ScalarAsync(
+                connection, "SELECT query_plan_gz FROM query_plan_dim WHERE digest = $1", ct, textDigests[0]))!));
+
+            bodySucceeded = true;
+        }
+        finally
+        {
+            await LiveStoreCleanup.RunAsync(connectionString!, bodySucceeded, async (cleanup, cleanupCt) =>
+            {
+                foreach (var digest in textDigests)
+                {
+                    await DeleteDimRowAsync(cleanup, PayloadDimensions.QueryPlanDimTable, digest, cleanupCt);
+                }
+
+                await DeleteDimRowAsync(cleanup, PayloadDimensions.QueryPlanDimTable, gzDigest, cleanupCt);
+            });
+        }
+    }
+
+    // ── (h) NUL handling ──
 
     [Fact]
     public async Task NulLadenPayload_RoundTripsStripped_AndItsDigestKeysTheStoredBytes()
@@ -1288,32 +1439,6 @@ public sealed class PayloadDimensionLiveTests
         return names.ToArray();
     }
 
-    private static async Task TryExecAsync(NpgsqlConnection connection, string sql, CancellationToken ct)
-    {
-        try
-        {
-            /* A PRIOR best-effort statement may have swallowed a failure that BROKE this connection
-               (proven on CI: a RestoreCaggs drop died, the swallow hid it, and the next helper threw
-               "Connection is not open" out of an otherwise-green test). Reopening the same
-               NpgsqlConnection object checks out a fresh pooled session, so one broken statement
-               cannot cascade into every cleanup statement after it. */
-            if (connection.State != System.Data.ConnectionState.Open)
-            {
-                await connection.OpenAsync(ct);
-            }
-
-            using var command = new NpgsqlCommand(sql, connection);
-            await command.ExecuteNonQueryAsync(ct);
-        }
-        catch (Exception ex)
-        {
-            /* Cleanup is best-effort: a restore step that throws must not mask the test's own failure.
-               But say WHAT was swallowed — xUnit captures console per test, so on the next mystery this
-               line is the diagnosis instead of a silent hole. */
-            Console.WriteLine($"[cleanup best-effort] {ex.GetType().Name} ({(ex as PostgresException)?.SqlState}): {ex.Message} — {sql}");
-        }
-    }
-
     /// <summary>
     /// <see cref="TimescaleSupport.EnsureContinuousAggregatesAsync"/> and then REMOVES every rollup's
     /// refresh policy. The ensure attaches policies whose jobs fire IMMEDIATELY (the #1788 finding), and
@@ -1322,15 +1447,30 @@ public sealed class PayloadDimensionLiveTests
     /// silently strand the aggregate in the shared fixture — which is exactly how query_stats_db_hourly
     /// and query_stats_db_daily came to persist across runs and flip the #1784 gate for every later
     /// test. The tests refresh manually and deterministically; they never need the scheduler.
+    ///
+    /// <para><b>The conversion first is not optional and belongs HERE, not at the call sites (#1862).</b>
+    /// TimescaleDB will not build a continuous aggregate over a heap, and the ensure is failure-isolated per
+    /// aggregate — so against un-converted tables it creates NOTHING and says so only to a logger this class
+    /// passes as null. The next line then force-refreshes a view that was never created and the test dies on
+    /// <c>42P01 relation "collect.query_stats_hourly" does not exist</c>, naming a symptom three steps
+    /// downstream of the cause. Three of this class's four callers already convert on their own way in, which
+    /// is precisely why the fourth survived: on a shared store the conversion is PERSISTENT, so whoever ran
+    /// first covered for whoever ran next, and the gap only surfaced on a fresh database in an unlucky order.
+    /// Putting it in the helper makes "aggregates exist afterwards" true of the helper rather than true of the
+    /// caller's memory, and it costs the other three nothing — <c>if_not_exists</c> makes it a no-op.</para>
     /// </summary>
     private static async Task EnsureAggregatesWithoutPoliciesAsync(NpgsqlConnection connection, CancellationToken ct)
     {
+        await TimescaleSupport.ConvertToHypertablesAsync(connection, null, ct);
         await TimescaleSupport.EnsureContinuousAggregatesAsync(connection, null, ct);
 
-        foreach (var (view, _, _, _) in TimescaleSupport.RollupViews)
+        /* VERIFIED removals (#1873). This step is the one that closes the standing race, so a removal that
+           quietly did not happen re-opens it for every aggregate the class goes on to create — and the
+           swallow this replaces made that indistinguishable from success. */
+        var batch = new LiveCleanupBatch(connection);
+        foreach (var (view, _, _, _, _) in TimescaleSupport.RollupViews)
         {
-            await TryExecAsync(connection,
-                $"SELECT remove_continuous_aggregate_policy('collect.{view}', if_exists => true)", ct);
+            await batch.RemoveRefreshPolicyAsync(view, ct);
         }
     }
 
@@ -1352,7 +1492,11 @@ public sealed class PayloadDimensionLiveTests
     {
         await EnsureAggregatesWithoutPoliciesAsync(connection, ct);
 
-        foreach (var (relation, _, coverage) in TimescaleSupport.RawTierCoverage)
+        /* Every coverage relation, not just the first: a raw table can have more than one rollup family
+           gating its purge (#1849), and the #1784 gate is an AND over all of them — refreshing one would
+           leave the gate correctly refusing and the test looking at the wrong cause. */
+        foreach (var (relation, _, coverageRelations) in TimescaleSupport.RawTierCoverage)
+        foreach (var coverage in coverageRelations)
         {
             _ = relation;
             for (var attempt = 1; ; attempt++)
@@ -1373,18 +1517,30 @@ public sealed class PayloadDimensionLiveTests
         }
     }
 
+    /// <summary>
+    /// Puts the shared store's aggregate shape back, and CONFIRMS it (#1873).
+    ///
+    /// <para>Every removal here is retried until the catalog agrees it is gone, because the collision this
+    /// loses to is real and reproducible: a <c>DROP MATERIALIZED VIEW</c> racing a still-executing
+    /// <c>refresh_continuous_aggregate</c> fails and leaves the aggregate STANDING — as <c>40P01</c> when the
+    /// deadlock detector picks the drop as its victim, and as <c>XX000 tuple concurrently deleted</c> when the
+    /// refresh's catalog maintenance beats it to a row. Both were measured on PostgreSQL 18.4 +
+    /// TimescaleDB 2.28.1, and the retry won on the following attempt each time. What it does NOT do is
+    /// classify the SQLSTATE: <c>XX000</c> is <c>internal_error</c>, so any allow-list that looked reasonable
+    /// would have excluded the very failure it needed to survive.</para>
+    /// </summary>
     private static async Task RestoreCaggsAsync(NpgsqlConnection connection, string[] preexisting, CancellationToken ct)
     {
+        var batch = new LiveCleanupBatch(connection);
+
         foreach (var (relation, _, coverage) in TimescaleSupport.RawTierCoverage)
         {
-            await TryExecAsync(connection, $"SELECT remove_retention_policy('collect.{relation}', if_exists => true)", ct);
+            await batch.RemoveRetentionPolicyAsync(relation, ct);
             _ = coverage;
         }
 
-        foreach (var cagg in (await ExistingCaggsAsync(connection, ct)).Except(preexisting, StringComparer.Ordinal))
-        {
-            await TryExecAsync(connection, $"DROP MATERIALIZED VIEW IF EXISTS collect.{cagg} CASCADE", ct);
-        }
+        await batch.DropContinuousAggregatesAsync(
+            (await ExistingCaggsAsync(connection, ct)).Except(preexisting, StringComparer.Ordinal), ct);
     }
 
     /// <summary>

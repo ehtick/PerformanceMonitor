@@ -57,7 +57,10 @@ if (args.Length > 0 && DarlingCliCommands.IsEncryptPasswordVerb(args[0]))
     var plaintext = Console.ReadLine();
     if (string.IsNullOrEmpty(plaintext))
     {
+        /* #2097: on a non-interactive host (ISE/remote/redirected stdin) ReadLine returns null instantly
+           and stderr is invisible — the guidance must ride STDOUT, the stream every host shows. */
         Console.Error.WriteLine("No password read from stdin.");
+        DarlingCliCommands.WriteNonInteractiveGuidance(Console.Out);
         return 1;
     }
 
@@ -88,6 +91,33 @@ if (args.Length > 0 && DarlingCliCommands.IsPrintViewerConnectionVerb(args[0]))
 
     var configPath = args.Length > 1 ? args[1] : null;
     return await DarlingCliCommands.PrintViewerConnectionAsync(configPath, Console.Out, Console.Error, CancellationToken.None);
+}
+
+/* CLI verb: --export-viewer-config (#1953) — write the viewer machine's whole handoff folder (a complete
+   darling.json with "managed": false and the resolved connection string, the store's server.crt beside it, and
+   a README.txt documenting every field) instead of making the operator hand-merge --print-viewer-connection's
+   output into JSON copied out of the docs. Same DPAPI/TLS material as that verb, so the same Windows-only
+   guard. First non-flag arg = the output DIRECTORY (default: viewer-config beside darling.json); an explicit
+   config path is passed as --config <path> (this verb's positional is the destination, unlike its siblings). */
+if (args.Length > 0 && DarlingCliCommands.IsExportViewerConfigVerb(args[0]))
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        Console.Error.WriteLine("--export-viewer-config requires Windows (DPAPI).");
+        return 1;
+    }
+
+    /* Parsed STRICTLY by the pure TryParseExportViewerConfigArgs (never guess at an argument — #1581's
+       posture), so the rules are pinned by tests rather than living inline here. */
+    if (!DarlingCliCommands.TryParseExportViewerConfigArgs(
+            args[1..], out var exportConfigPath, out var exportDirectory, out var exportArgError))
+    {
+        Console.Error.WriteLine(exportArgError);
+        return 1;
+    }
+
+    return await DarlingCliCommands.ExportViewerConfigAsync(
+        exportConfigPath, exportDirectory, Console.Out, Console.Error, CancellationToken.None);
 }
 
 /* CLI verb: the interactive --configure-network wizard (#1561; web surface #1617) — guides the operator
@@ -213,6 +243,56 @@ if (args.Length > 0 && DarlingCliCommands.IsBackfillRollupsVerb(args[0]))
 
     return await DarlingCliCommands.BackfillRollupsAsync(
         backfillConfigPath, dryRun, Console.Out, Console.Error, CancellationToken.None);
+}
+
+/* #1912 — repair the pre-#1907 Query Store split slices still in stored rows, then re-materialize what they
+   fed. Same Windows-only managed-credential guard and same --dry-run shape as --backfill-rollups above. */
+if (args.Length > 0 && DarlingCliCommands.IsCollapseLegacySlicesVerb(args[0]))
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        Console.Error.WriteLine("--collapse-legacy-slices requires Windows (DPAPI store credential).");
+        return 1;
+    }
+
+    var rest = args.AsSpan(1);
+    var dryRun = false;
+    string? collapseConfigPath = null;
+    foreach (var arg in rest)
+    {
+        if (string.Equals(arg, "--dry-run", StringComparison.OrdinalIgnoreCase))
+        {
+            dryRun = true;
+        }
+        else
+        {
+            collapseConfigPath = arg;
+        }
+    }
+
+    return await DarlingCliCommands.CollapseLegacySlicesAsync(
+        collapseConfigPath, dryRun, Console.Out, Console.Error, CancellationToken.None);
+}
+
+/* #2076 — convert the plan dimension's pre-V54 text rows to gzip (#2069's write form), in batches, while
+   the service runs. Same Windows-only managed-credential guard and same --dry-run shape as the verbs above. */
+if (args.Length > 0 && DarlingCliCommands.IsRecompressPlanDimVerb(args[0]))
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        Console.Error.WriteLine("--recompress-plan-dim requires Windows (DPAPI store credential).");
+        return 1;
+    }
+
+    var (recompressConfigPath, dryRun, vacuumMode, parseError) = DarlingCliCommands.ParseRecompressArgs(args.AsSpan(1));
+    if (parseError is not null)
+    {
+        Console.Error.WriteLine(parseError);
+        return 1;
+    }
+
+    return await DarlingCliCommands.RecompressPlanDimAsync(
+        recompressConfigPath, dryRun, vacuumMode, Console.Out, Console.Error, CancellationToken.None);
 }
 
 var builder = Host.CreateApplicationBuilder(args);

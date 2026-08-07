@@ -217,6 +217,7 @@ const WAIT_COLUMNS = [
 
 const ACTIVE_COLUMNS = [
   { key: "collection_time", label: "Time", format: "time" },
+  { key: "query_text", label: "Query", render: (r) => codeDisclosure(r.query_text) },
   { key: "session_id", label: "SPID", format: "int" },
   { key: "database_name", label: "Database" },
   { key: "status", label: "Status" },
@@ -224,7 +225,6 @@ const ACTIVE_COLUMNS = [
   { key: "elapsed_time_formatted", label: "Elapsed" },
   { key: "wait_type", label: "Wait" },
   { key: "blocking_session_id", label: "Blocked by", format: "int" },
-  { key: "query_text", label: "Query", render: (r) => codeDisclosure(r.query_text) },
 ];
 
 const COLLECTOR_COLUMNS = [
@@ -236,4 +236,10 @@ const COLLECTOR_COLUMNS = [
   { key: "avg_duration_ms", label: "Avg Dur", format: "ms" },
   { key: "last_success", label: "Last Success", format: "time" },
   { key: "last_error", label: "Last Error", wrap: true },
+  /* #1837: what a NON-failing run reported (an enumeration that came back with 0 items). Blank for a
+     plainly healthy collector; the same column the two WPF grids carry, so the web view is not the one
+     Collection Health surface that still hides it. note_summary, not the raw last_note: it carries the
+     "(all N runs)" qualifier that separates a persistently empty collector from an occasionally quiet
+     one, composed server-side from the shared formatter so this table cannot render it a third way. */
+  { key: "note_summary", label: "Note", wrap: true },
 ];

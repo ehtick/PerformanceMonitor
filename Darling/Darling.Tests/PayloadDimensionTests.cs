@@ -166,6 +166,8 @@ public sealed class PayloadDimensionTests
         public bool AppliesTo(CollectorTargetInfo target) => true;
 
         public bool YieldsOnLockTimeout => false;
+
+        public IReadOnlyList<string> StateKeys => Array.Empty<string>();
     }
 
     // ── the COPY column list ──
@@ -443,13 +445,73 @@ public sealed class PayloadDimensionTests
             "WHERE query_text_dim.last_seen < EXCLUDED.last_seen - INTERVAL '1 hour'",
             sql);
 
-        /* The plan dimension is the same statement over its own content column. */
-        Assert.Contains(
-            "INSERT INTO query_plan_dim (digest, query_plan_xml, last_seen)",
-            PayloadDimensions.UpsertSql(PayloadDimensions.QueryPlanDimTable),
-            StringComparison.Ordinal);
+        /* The plan dimension upserts gzip BYTES into query_plan_gz (#2069) — same statement shape,
+           same conflict semantics, bytea payload array instead of text. The text column is never
+           written on new rows; pre-V54 rows keep theirs until the GC retires them. */
+        Assert.Equal(
+            "INSERT INTO query_plan_dim (digest, query_plan_gz, last_seen)\n" +
+            "SELECT u.digest, u.payload, $3\n" +
+            "FROM unnest($1::bytea[], $2::bytea[]) AS u(digest, payload)\n" +
+            "ON CONFLICT (digest) DO UPDATE SET last_seen = EXCLUDED.last_seen\n" +
+            "WHERE query_plan_dim.last_seen < EXCLUDED.last_seen - INTERVAL '1 hour'",
+            PayloadDimensions.UpsertSql(PayloadDimensions.QueryPlanDimTable));
 
         Assert.Throws<ArgumentOutOfRangeException>(() => PayloadDimensions.UpsertSql("not_a_dim"));
+    }
+
+    // ── the gzip codec (#2069) ──
+
+    [Fact]
+    public void CompressContent_RoundTrips_IncludingNonAscii_AndEmitsRealGzip()
+    {
+        /* Non-ASCII in the payload pins the UTF-8 leg of the codec: plan XML carries object names in
+           whatever the monitored server's collation produced. */
+        var plan = "<ShowPlanXML xmlns=\"http://schemas.microsoft.com/sqlserver/2004/07/showplan\">" +
+                   "<StmtSimple StatementText=\"SELECT N'Ærøskøbing — 数据库'\"/></ShowPlanXML>";
+
+        var compressed = PayloadDimensions.CompressContent(plan);
+
+        /* A real gzip member (RFC 1952 magic), not raw deflate — so the bytes are also recoverable
+           outside the product (gunzip, psql + a one-liner) if it ever comes to that. */
+        Assert.True(compressed.Length > 2);
+        Assert.Equal(0x1f, compressed[0]);
+        Assert.Equal(0x8b, compressed[1]);
+
+        Assert.Equal(plan, PayloadDimensions.DecompressContent(compressed));
+    }
+
+    [Fact]
+    public void DecompressContent_ResolvesAbsentToNull_NeverToEmptyText()
+    {
+        /* NULL column and empty bytea both read as "no plan" — the conservative direction every
+           reader already takes for a NULL text column. */
+        Assert.Null(PayloadDimensions.DecompressContent(null));
+        Assert.Null(PayloadDimensions.DecompressContent(Array.Empty<byte>()));
+    }
+
+    [Fact]
+    public void ResolveContent_PrefersInlineText_ElseDecompresses_ElseNull()
+    {
+        var gz = PayloadDimensions.CompressContent("<FromGz/>");
+
+        /* Text-first: a row never carries both forms, so the order only decides which column a mixed
+           RESULT (e.g. COALESCE across old/new rows) prefers — and text costs nothing to return. */
+        Assert.Equal("<FromText/>", PayloadDimensions.ResolveContent("<FromText/>", gz));
+        Assert.Equal("<FromGz/>", PayloadDimensions.ResolveContent(null, gz));
+        Assert.Null(PayloadDimensions.ResolveContent(null, null));
+    }
+
+    [Fact]
+    public void Digest_IsComputedOverTheUncompressedText_SoIdentityIsStableAcrossTheFormatChange()
+    {
+        /* The write path digests the payload STRING before compressing (#2069 changed the stored form,
+           not the key): a plan first seen pre-V54 as text and seen again post-V54 as gzip lands on the
+           SAME dim row — dedup, fact-row digests, and has_query_plan presence all survive the upgrade. */
+        const string plan = "<ShowPlanXML><StmtSimple/></ShowPlanXML>";
+        var direct = PayloadDimensions.Digest(plan);
+        var roundTripped = PayloadDimensions.Digest(
+            PayloadDimensions.DecompressContent(PayloadDimensions.CompressContent(plan))!);
+        Assert.Equal(direct, roundTripped);
     }
 
     [Fact]
@@ -481,14 +543,28 @@ public sealed class PayloadDimensionTests
     {
         /* Plain tables, deliberately NOT hypertables: no time axis to partition on, and a hypertable's
            unique constraint must include the partitioning column, which a content key cannot satisfy. */
+        /* #2069: the plan dim is the compressed-content dim — its text column is NULLABLE (new rows
+           store gzip bytes only) and the bytea column exists from creation, because fresh stores run
+           V38's generated view, which references it. */
         Assert.Equal(
             "CREATE TABLE IF NOT EXISTS query_plan_dim (\n" +
             "    digest bytea NOT NULL PRIMARY KEY,\n" +
-            "    query_plan_xml text NOT NULL,\n" +
+            "    query_plan_xml text NULL,\n" +
+            "    query_plan_gz bytea NULL,\n" +
             "    last_seen timestamp NOT NULL\n" +
             ");\n" +
             "CREATE INDEX IF NOT EXISTS idx_query_plan_dim_last_seen ON query_plan_dim(last_seen);",
             PayloadDimensions.CreateDimTable(PayloadDimensions.QueryPlanDimTable));
+
+        /* The text dim keeps the original NOT NULL text shape — compression is plan-dim-only. */
+        Assert.Equal(
+            "CREATE TABLE IF NOT EXISTS query_text_dim (\n" +
+            "    digest bytea NOT NULL PRIMARY KEY,\n" +
+            "    query_text text NOT NULL,\n" +
+            "    last_seen timestamp NOT NULL\n" +
+            ");\n" +
+            "CREATE INDEX IF NOT EXISTS idx_query_text_dim_last_seen ON query_text_dim(last_seen);",
+            PayloadDimensions.CreateDimTable(PayloadDimensions.QueryTextDimTable));
 
         Assert.Equal("query_text", PayloadDimensions.PayloadColumnOf(PayloadDimensions.QueryTextDimTable));
         Assert.Equal("query_plan_xml", PayloadDimensions.PayloadColumnOf(PayloadDimensions.QueryPlanDimTable));
@@ -564,7 +640,7 @@ public sealed class PayloadDimensionTests
     }
 
     [Fact]
-    public void ResolvingView_ProjectsEveryTableColumnInOrder_ThenTheTwoDigestsLast()
+    public void ResolvingView_ProjectsEveryTableColumnInOrder_ThenDigests_ThenPlanGzLast()
     {
         var view = PgSchemaGenerator.GenerateQueryStatsResolvingView();
         var selectList = ViewSelectList(view);
@@ -575,7 +651,7 @@ public sealed class PayloadDimensionTests
         var tableColumns = CreateTableColumns(PgSchemaGenerator.CreateTable(QueryStatsCollector.Instance));
         var digestColumns = PayloadDimensions.ForTable("query_stats").Select(d => d.DigestColumn).ToArray();
 
-        Assert.Equal(tableColumns.Length + digestColumns.Length, selectList.Length);
+        Assert.Equal(tableColumns.Length + digestColumns.Length + 1, selectList.Length);
         Assert.Equal(
             tableColumns,
             selectList.Take(tableColumns.Length).Select(OutputName).ToArray());
@@ -585,7 +661,11 @@ public sealed class PayloadDimensionTests
            replace the previous SELECT * definition on every upgraded store. */
         Assert.Equal(
             digestColumns.Select(c => "    f." + c).ToArray(),
-            selectList.Skip(tableColumns.Length).Select(entry => "    " + entry).ToArray());
+            selectList.Skip(tableColumns.Length).Take(digestColumns.Length).Select(entry => "    " + entry).ToArray());
+
+        /* #2069: the gz bytes ride LAST, after the digests, for the same replace-only-appends reason —
+           V54 regenerates this view on stores whose previous definition ended at the digests. */
+        Assert.Equal("qpd.query_plan_gz", selectList[^1]);
     }
 
     // ── the migration ──
@@ -630,6 +710,17 @@ public sealed class PayloadDimensionTests
 
         /* The view body is the generated one, not a second hand-written copy that could drift. */
         Assert.Contains(PgSchemaGenerator.GenerateQueryStatsResolvingView(), v38, StringComparison.Ordinal);
+
+        /* #2069: the generated view also projects query_plan_gz. The CREATE TABLE above already
+           carries the column on the happy path, but a plan dim that EXISTS without it — a V38 attempt
+           from a pre-#2069 build that failed after its CREATE TABLE, re-run on this build — would fail
+           the view on column-does-not-exist. So the body pre-adds it, before the view (the same
+           ladder-ordering fix as the digest pre-adds). */
+        var gzPreAdd = v38.IndexOf(
+            "ALTER TABLE query_plan_dim ADD COLUMN IF NOT EXISTS query_plan_gz bytea;", StringComparison.Ordinal);
+        Assert.True(
+            gzPreAdd >= 0 && gzPreAdd < viewIndex,
+            "V38 must add query_plan_gz before the view that projects it");
     }
 
     [Fact]
@@ -652,7 +743,11 @@ public sealed class PayloadDimensionTests
             .ToArray();
 
         Assert.NotEmpty(definers);
-        Assert.Equal(38, definers[^1].Version);
+        /* V51 (#2012 stage 2) re-defines the view after appending host_object_name — and it caught
+           exactly this tripwire's regression in review: its first cut was a SELECT * passthrough.
+           The shipped V51 DROPs the view (the new column lands mid-list, which CREATE OR REPLACE
+           refuses) and re-emits the generator's resolving definition. */
+        Assert.Equal(54, definers[^1].Version);
         Assert.Contains(
             "COALESCE(f.query_text, qtd.query_text) AS query_text",
             definers[^1].Sql,
@@ -661,6 +756,12 @@ public sealed class PayloadDimensionTests
             "VIEW v_query_stats AS SELECT * FROM query_stats",
             definers[^1].Sql,
             StringComparison.Ordinal);
+        /* Every definer must be the resolving one, not just the last — a passthrough re-expansion
+           anywhere after V38 would briefly exist mid-ladder. */
+        foreach (var definer in definers.Where(d => d.Version >= 38))
+        {
+            Assert.Contains("COALESCE(f.query_text, qtd.query_text) AS query_text", definer.Sql, StringComparison.Ordinal);
+        }
     }
 
     [Fact]
@@ -1219,9 +1320,20 @@ public sealed class PayloadDimensionTests
     /// A behavioural test cannot see that, because a duplicated list produces the same policies; only reading
     /// the construction can.</para>
     ///
-    /// <para>So this asserts the method BUILDS from the map and names none of the gated relations as literals.
+    /// <para>So this asserts the list BUILDS from the map and names none of the gated relations as literals.
     /// It is the "enforce it, don't document it" shape: the failure it prevents is a green test suite over a
     /// broken invariant.</para>
+    ///
+    /// <para><b>Re-pointed by #1905, deliberately.</b> The list used to be a local inside
+    /// <c>EnsureRetentionPoliciesAsync</c> and this read that method's body; #1905 hoisted it to
+    /// <see cref="TimescaleSupport.RetentionPolicies"/> so the horizon-ordering invariant could be walked over
+    /// it from outside. The guard reads the field's initializer now instead, and it is exactly the same
+    /// property over exactly the same text — the move was verified by watching this test go red against a
+    /// hand-rewritten raw block BEFORE the hoist and again AFTER it, which is the only way to know a re-pointed
+    /// structural guard still points at something.</para>
+    ///
+    /// <para>Comments are stripped before the literal check: a comment that happens to quote a gated relation
+    /// is prose, not a re-hardcode, and the guard is about the code.</para>
     /// </summary>
     [Fact]
     public void RawTierRetentionPolicies_AreDerivedFromTheCoverageMap_NotRehardcodedBesideIt()
@@ -1232,21 +1344,189 @@ public sealed class PayloadDimensionTests
         var source = File.ReadAllText(Path.Combine(
             root!, "Darling", "PerformanceMonitor.Darling.Storage", "TimescaleSupport.cs"));
 
-        var body = MethodBody(source, "public static async Task<int> EnsureRetentionPoliciesAsync");
-        Assert.False(string.IsNullOrEmpty(body),
-            "could not locate EnsureRetentionPoliciesAsync — the guard cannot silently pass on a parse miss");
+        var declaration = DeclarationInitializer(source, $"> {nameof(TimescaleSupport.RetentionPolicies)} =");
+        Assert.False(string.IsNullOrEmpty(declaration),
+            "could not locate the RetentionPolicies declaration — the guard cannot silently pass on a parse miss");
 
-        Assert.Contains(nameof(TimescaleSupport.RawTierCoverage), body, StringComparison.Ordinal);
+        Assert.Contains(nameof(TimescaleSupport.RawTierCoverage), declaration, StringComparison.Ordinal);
+
+        /* ANTI-TRUNCATION. A scan that ended early would still contain RawTierCoverage — it is the first token
+           — and would then check the literals below over only the part it read, passing over a hardcode
+           further down. So demand the LAST thing the initializer builds from, which only a scan that reached
+           the terminating semicolon can have seen. */
+        Assert.Contains(nameof(TimescaleSupport.BaselineAggregates), declaration, StringComparison.Ordinal);
 
         foreach (var (relation, _, _) in TimescaleSupport.RawTierCoverage)
         {
             Assert.False(
-                body.Contains('"' + relation + '"', StringComparison.Ordinal),
-                $"EnsureRetentionPoliciesAsync names \"{relation}\" as a literal. The coverage-gated tiers must " +
+                declaration.Contains('"' + relation + '"', StringComparison.Ordinal),
+                $"RetentionPolicies names \"{relation}\" as a literal. The coverage-gated tiers must " +
                 "come from RawTierCoverage so the retention policy and the catalog sweep (#1784) cannot drift " +
                 "apart about which tables are gated — re-hardcoding them passes every behavioural test until " +
                 "the two lists disagree.");
         }
+
+        /* And the sweep must still iterate the hoisted list rather than rebuilding one beside it — otherwise
+           everything above could be true of a field nothing reads. */
+        var sweep = MethodBody(source, "public static async Task<int> EnsureRetentionPoliciesAsync");
+        Assert.False(string.IsNullOrEmpty(sweep),
+            "could not locate EnsureRetentionPoliciesAsync — the guard cannot silently pass on a parse miss");
+        Assert.Contains(nameof(TimescaleSupport.RetentionPolicies), sweep, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The retention sweep's summary line must name EVERY horizon the store actually applies, and must take each
+    /// number from its constant rather than restating it (#1958, enforcing the #1942 interpolation rule).
+    ///
+    /// <para>The line read <c>"(raw {Raw}, hourly CAGGs {Hourly}; daily CAGGs kept indefinitely)"</c>, which is a
+    /// universal claim the store contradicts three times over: the interval-dedup L1 is deliberately SHORTER
+    /// than the hourly tier, its daily twin has a horizon despite the promise about dailies, and the nine
+    /// baseline aggregates have another. An operator on a 24-server field box cross-checked the line against
+    /// <c>timescaledb_information.jobs</c> — where the docs send them — met the first counterexample
+    /// immediately, and had to decide whether they had found a bug.</para>
+    ///
+    /// <para><b>The expectation is DERIVED from <see cref="TimescaleSupport.RetentionPolicies"/>, not listed
+    /// here.</b> That is the whole point: a list written out in the test drifts in exactly the same way the log
+    /// line did, and would have been just as green. Adding a tier on a NEW horizon now fails this until the
+    /// summary mentions it — which is the drift #1958 is, caught at the moment it is introduced rather than by
+    /// the next operator who checks. There was no pin on this line at all before; a doc comment claimed the
+    /// property and nothing enforced it.</para>
+    /// </summary>
+    [Fact]
+    public void RetentionSummaryLine_NamesEveryHorizon_AndInterpolatesEveryNumber()
+    {
+        var root = FindRepoRoot();
+        Assert.True(root is not null, RepoRootNotFound);
+
+        var source = File.ReadAllText(Path.Combine(
+            root!, "Darling", "PerformanceMonitor.Darling.Storage", "TimescaleSupport.cs"));
+
+        const string anchor = "\"TimescaleDB: {Applied}/{Total} retention policies in place";
+        var start = source.IndexOf(anchor, StringComparison.Ordinal);
+        Assert.True(start >= 0,
+            "could not locate the retention summary log line — the guard cannot silently pass on a parse miss");
+
+        /* The format string, then everything from it to the statement's semicolon: the arguments. */
+        var formatEnd = source.IndexOf('"', start + 1);
+        Assert.True(formatEnd > start, "the summary format string is unterminated");
+        var format = source[(start + 1)..formatEnd];
+
+        var statementEnd = source.IndexOf(';', formatEnd);
+        Assert.True(statementEnd > formatEnd, "the summary log statement has no terminating semicolon");
+        var arguments = source[(formatEnd + 1)..statementEnd].TrimEnd(')', ' ', '\r', '\n').Trim(',', ' ', '\r', '\n');
+
+        /* Every DISTINCT horizon the sweep applies, mapped back to the constant that holds it. */
+        var constants = typeof(TimescaleSupport)
+            .GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
+            .Where(f => f.IsLiteral && f.FieldType == typeof(string) && f.Name.EndsWith("RetentionInterval", StringComparison.Ordinal))
+            .ToDictionary(f => (string)f.GetRawConstantValue()!, f => f.Name, StringComparer.Ordinal);
+
+        foreach (var horizon in TimescaleSupport.RetentionPolicies.Select(p => p.DropAfter).Distinct(StringComparer.Ordinal))
+        {
+            Assert.True(constants.TryGetValue(horizon, out var constantName),
+                $"a retention policy uses the horizon \"{horizon}\", which no *RetentionInterval constant holds — " +
+                "the summary line cannot interpolate a number that has no name.");
+
+            Assert.True(arguments.Contains(constantName!, StringComparison.Ordinal),
+                $"the summary line never mentions {constantName} (\"{horizon}\"), so it describes a retention " +
+                "posture the store does not have. An operator cross-checking timescaledb_information.jobs finds " +
+                "the counterexample and has to work out whether it is a bug (#1958).");
+
+            Assert.False(format.Contains(horizon, StringComparison.Ordinal),
+                $"the summary line writes \"{horizon}\" out as a literal instead of interpolating {constantName}. " +
+                "This line class has already drifted once that way (#1942) — a horizon changes in one place and " +
+                "the sentence describing it keeps the old number, which is worse than saying nothing.");
+        }
+
+        /* A placeholder with no argument renders empty; an argument with no placeholder is appended as noise.
+           Structured logging binds POSITIONALLY, so either one silently corrupts the tail of the message. */
+        var placeholders = format.Count(c => c == '{');
+        var argumentCount = arguments.Split(',').Length;
+        Assert.True(placeholders == argumentCount,
+            $"the summary line has {placeholders} placeholder(s) and {argumentCount} argument(s) — structured " +
+            "logging binds them positionally, so a mismatch shifts every value after it.");
+    }
+
+    /// <summary>
+    /// A field's initializer, from its signature to the terminating semicolon at nesting depth zero, with
+    /// comments and string contents removed so neither can truncate the scan or be mistaken for code. Returns
+    /// empty when the signature is not found, so a caller can FAIL rather than silently pass on a parse miss.
+    /// </summary>
+    private static string DeclarationInitializer(string source, string signature)
+    {
+        var start = source.IndexOf(signature, StringComparison.Ordinal);
+        if (start < 0)
+        {
+            return string.Empty;
+        }
+
+        var code = new System.Text.StringBuilder();
+        var depth = 0;
+
+        for (var i = start; i < source.Length; i++)
+        {
+            /* Comments: skipped entirely. */
+            if (source[i] == '/' && i + 1 < source.Length && source[i + 1] == '/')
+            {
+                while (i < source.Length && source[i] != '\n')
+                {
+                    i++;
+                }
+
+                continue;
+            }
+
+            if (source[i] == '/' && i + 1 < source.Length && source[i + 1] == '*')
+            {
+                var close = source.IndexOf("*/", i + 2, StringComparison.Ordinal);
+                if (close < 0)
+                {
+                    return string.Empty;
+                }
+
+                i = close + 1;
+                continue;
+            }
+
+            /* String and char literals: kept, because the whole point is spotting a quoted relation name, but
+               their CONTENTS must not move the depth counters or end the scan. */
+            if (source[i] == '"' || source[i] == '\'')
+            {
+                var quote = source[i];
+                code.Append(quote);
+                for (i++; i < source.Length && source[i] != quote; i++)
+                {
+                    code.Append(source[i]);
+                    if (source[i] == '\\' && i + 1 < source.Length)
+                    {
+                        code.Append(source[++i]);
+                    }
+                }
+
+                code.Append(quote);
+                continue;
+            }
+
+            code.Append(source[i]);
+
+            switch (source[i])
+            {
+                case '{':
+                case '(':
+                case '[':
+                    depth++;
+                    break;
+                case '}':
+                case ')':
+                case ']':
+                    depth--;
+                    break;
+                case ';' when depth == 0:
+                    return code.ToString();
+            }
+        }
+
+        return string.Empty;
     }
 
     /// <summary>

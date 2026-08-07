@@ -129,11 +129,32 @@ public partial class RemoteCollectorService
     private static int ConnectionTimeoutSeconds => App.ConnectionTimeoutSeconds;
 
     /// <summary>
-    /// Per-call timing fields set by each collector method.
-    /// Read by RunCollectorAsync after the collector completes.
+    /// What one collector run has to hand its own collection_log row: the #1180 fetch/store split each
+    /// collector method sets, and the #1837 note a run that SUCCEEDED but collected nothing leaves behind
+    /// (an enumeration that yielded 0 items, items whose enumeration probe failed). Read by
+    /// <see cref="RunCollectorAsync"/> once the collector completes.
     /// </summary>
-    private long _lastSqlMs;
-    private long _lastDuckDbMs;
+    internal sealed class RunTelemetry
+    {
+        public long SqlMs { get; set; }
+        public long StorageMs { get; set; }
+        public string? Note { get; set; }
+    }
+
+    /// <summary>
+    /// Per-run telemetry keyed by SERVER, because a collection cycle runs the servers in PARALLEL (one
+    /// task each, see RunCollectionCycleAsync) while the collectors within one server run sequentially.
+    /// As plain instance fields these three were shared across those parallel tasks: server B's reset at
+    /// the top of its run could blank server A's timings between A's write and A's collection_log read,
+    /// and once #1837 gave every enumeration run a note, A's "enumeration yielded 0 items" could land on
+    /// B's row for a collector that does not even enumerate. Keying by server is sufficient precisely
+    /// because of the sequential-within-a-server rule — two collectors on one server never overlap.
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<int, RunTelemetry> _runTelemetry = new();
+
+    /// <summary>This server's telemetry slot, created on first use.</summary>
+    internal RunTelemetry TelemetryFor(int serverId) =>
+        _runTelemetry.GetOrAdd(serverId, static _ => new RunTelemetry());
 
     /// <summary>
     /// Tracks health state per collector per server.
@@ -451,6 +472,16 @@ public partial class RemoteCollectorService
         int rowsCollected = 0;
         bool xeSessionUnavailable = false;
 
+        /* Clear the per-call fields HERE, not only inside the definition runner: everything below can
+           throw before the runner is ever entered — the XE session ensure for deadlocks /
+           blocked_process_report is the live example — and the catches all fall through to the
+           LogCollectionAsync at the end of this method. Reset only in the runner, such a row carried the
+           PREVIOUS collector's sql/storage milliseconds as if they were its own. */
+        var telemetry = TelemetryFor(GetServerId(server));
+        telemetry.SqlMs = 0;
+        telemetry.StorageMs = 0;
+        telemetry.Note = null;
+
         try
         {
             /* Target-gate collectors through the shared AppliesTo — the single authoritative gate surface
@@ -528,6 +559,7 @@ public partial class RemoteCollectorService
                 "deadlocks" => await CollectDeadlocksAsync(server, cancellationToken),
                 "server_config" => await CollectServerConfigAsync(server, cancellationToken),
                 "database_config" => await CollectDatabaseConfigAsync(server, cancellationToken),
+                "database_states" => await CollectDatabaseStatesAsync(server, cancellationToken),
                 "query_store" => await CollectQueryStoreAsync(server, cancellationToken),
                 "memory_grant_stats" => await CollectMemoryGrantStatsAsync(server, cancellationToken),
                 "waiting_tasks" => await CollectWaitingTasksAsync(server, cancellationToken),
@@ -548,13 +580,23 @@ public partial class RemoteCollectorService
                 "agent_status" => await CollectAgentStatusAsync(server, cancellationToken),
                 "ag_replica_states" => await CollectAgReplicaStatesAsync(server, cancellationToken),
                 "ag_database_replica_states" => await CollectAgDatabaseReplicaStatesAsync(server, cancellationToken),
+                "plan_correction" => await CollectPlanCorrectionAsync(server, cancellationToken),
+                "pvs_stats" => await CollectPvsStatsAsync(server, cancellationToken),
                 _ => throw new ArgumentException($"Unknown collector: {collectorName}")
             };
 
             _scheduleManager.MarkCollectorRunForServer(server.Id, collectorName, startTime);
 
+            /* Annotate a successful-but-empty run (#1837): errorMessage is provably null here — only the
+               catches below assign it — so this carries the runner's note (an enumeration that listed
+               zero databases, items whose enumeration probe failed) onto the collection_log row without
+               touching the SUCCESS status. Health tracking and every band/count read key on status, never
+               on error_message, so the note reaches the Collection Health Note column and the Collection
+               Log detail grid, and is inert everywhere else. */
+            errorMessage = telemetry.Note;
+
             var elapsed = (int)(DateTime.UtcNow - startTime).TotalMilliseconds;
-            AppLogger.Info("Collector", $"  [{server.DisplayName}] {collectorName} => {rowsCollected} rows in {elapsed}ms (sql:{_lastSqlMs}ms, duck:{_lastDuckDbMs}ms)");
+            AppLogger.Info("Collector", $"  [{server.DisplayName}] {collectorName} => {rowsCollected} rows in {elapsed}ms (sql:{telemetry.SqlMs}ms, duck:{telemetry.StorageMs}ms)");
         }
         catch (XeSessionEnsureException ex)
         {
@@ -597,8 +639,11 @@ public partial class RemoteCollectorService
             {
                 AppLogger.Warn("Collector", $"Collector '{collectorName}' column not found for server '{server.DisplayName}' (possible version incompatibility): {ex.Message}");
             }
-            else if (ex.Number == 229 || ex.Number == 297 || ex.Number == 300)
+            else if (ex.Number == 229 || ex.Number == 297 || ex.Number == 300 || ex.Number == 8189)
             {
+                /* 8189 is sys.traces' own denial (ALTER TRACE missing) — a legitimate least-privilege
+                   choice (#1823), so default_trace_events degrades as PERMISSIONS like every other
+                   denied collector instead of erroring every cycle. Mirrors Darling's classifier. */
                 status = "PERMISSIONS";
                 AppLogger.Warn("Collector", $"Collector '{collectorName}' permission denied for server '{server.DisplayName}': {ex.Message}");
             }
@@ -632,7 +677,7 @@ public partial class RemoteCollectorService
         RecordCollectorResult(GetServerId(server), collectorName, status, errorMessage, xeSessionUnavailable);
 
         // Log the collection attempt
-        await LogCollectionAsync(GetServerId(server), server.DisplayName, collectorName, startTime, status, errorMessage, rowsCollected, _lastSqlMs, _lastDuckDbMs);
+        await LogCollectionAsync(GetServerId(server), server.DisplayName, collectorName, startTime, status, errorMessage, rowsCollected, telemetry.SqlMs, telemetry.StorageMs);
     }
 
     /// <summary>
@@ -1237,6 +1282,81 @@ WHERE server_id = $3";
         {
             /* Fail toward first-run (all-history) — matches a fresh store with no log yet. */
             return false;
+        }
+    }
+
+    /// <summary>
+    /// The stored per-server state for one collector's declared keys (#1962) — the sibling of
+    /// <see cref="GetLastCollectedTimeAsync"/> for state no MAX() over the collected rows can produce.
+    /// Read only for the collectors that declare keys, so it costs the rest nothing. An empty result on
+    /// failure is the SAFE direction: every definition treats absent state as its conservative path
+    /// (default_trace_events re-reads the whole rollover set), so a broken read costs time, never events.
+    /// Darling's twin is <c>DarlingCollectorRunner.GetCollectorStateAsync</c>.
+    /// </summary>
+    protected async Task<Dictionary<string, string>> GetCollectorStateAsync(
+        int serverId, string collectorName, CancellationToken cancellationToken)
+    {
+        var state = new Dictionary<string, string>(StringComparer.Ordinal);
+        try
+        {
+            using var conn = _duckDb.CreateConnection();
+            await conn.OpenAsync(cancellationToken);
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT state_key, state_value FROM collector_state WHERE server_id = $1 AND collector_name = $2";
+            cmd.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = serverId });
+            cmd.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = collectorName });
+            using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                if (!reader.IsDBNull(1))
+                {
+                    state[reader.GetString(0)] = reader.GetString(1);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            /* Fail toward "no state" — the definition's conservative path, never a wrong-but-plausible one. */
+            _logger?.LogDebug(ex, "Reading collector state for {Collector} failed; using the no-state path", collectorName);
+        }
+        return state;
+    }
+
+    /// <summary>
+    /// Upserts what the definition observed this cycle (<see cref="PerformanceMonitor.Collectors.CollectorContext.PendingState"/>),
+    /// after the cycle completed — so a cycle that collected zero rows still records what it saw, which is
+    /// the whole point of keeping this state off the payload. Best-effort: a failed write leaves the older
+    /// value, and the next cycle re-derives from it or falls back.
+    /// </summary>
+    protected async Task SaveCollectorStateAsync(
+        int serverId, string collectorName, IReadOnlyDictionary<string, string> state, CancellationToken cancellationToken)
+    {
+        if (state.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            using var conn = _duckDb.CreateConnection();
+            await conn.OpenAsync(cancellationToken);
+            foreach (var entry in state)
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = @"
+INSERT OR REPLACE INTO collector_state (server_id, collector_name, state_key, state_value, updated_at)
+VALUES ($1, $2, $3, $4, $5)";
+                cmd.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = serverId });
+                cmd.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = collectorName });
+                cmd.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = entry.Key });
+                cmd.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = entry.Value });
+                cmd.Parameters.Add(new DuckDB.NET.Data.DuckDBParameter { Value = DateTime.UtcNow });
+                await cmd.ExecuteNonQueryAsync(cancellationToken);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogDebug(ex, "Storing collector state for {Collector} failed; next cycle uses the older value", collectorName);
         }
     }
 

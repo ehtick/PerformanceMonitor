@@ -44,8 +44,12 @@ public sealed class AlertEngineTests
         public bool LowDiskEnabled { get; set; }
         public bool LongRunningJobEnabled { get; set; }
         public bool FailedJobEnabled { get; set; }
+        public bool PvsEnabled { get; set; }
+        public bool DatabaseStateEnabled { get; set; }
         public int CpuThresholdPercent { get; set; } = 80;
         public int BlockingCountThreshold { get; set; } = 1;
+        /* #1839: 0 = off, the shipped default — a test must opt in for the wait gate to run at all. */
+        public int BlockingWaitSecondsThreshold { get; set; }
         public int DeadlockCountThreshold { get; set; } = 1;
         public int PoisonWaitThresholdMs { get; set; } = 500;
         public int LongRunningQueryThresholdMinutes { get; set; } = 30;
@@ -58,6 +62,9 @@ public sealed class AlertEngineTests
         public int TempDbSpaceThresholdPercent { get; set; } = 80;
         public int LowDiskThresholdPercent { get; set; } = 10;
         public int LowDiskThresholdGb { get; set; } = 5;
+        /* #1984: DarlingConfig defaults (40% / 1 GB); enable stays the class's opt-in OFF. */
+        public int PvsThresholdPercent { get; set; } = 40;
+        public int PvsFloorGb { get; set; } = 1;
         public int LongRunningJobMultiplier { get; set; } = 3;
         public int FailedJobLookbackMinutes { get; set; } = 60;
         public int CooldownMinutes { get; set; } = 5;
@@ -73,17 +80,29 @@ public sealed class AlertEngineTests
         public List<PoisonWaitDelta> PoisonWaits { get; } = new();
         public List<LongRunningQueryInfo> LongRunning { get; } = new();
         public List<VolumeFreeSpaceInfo> Volumes { get; } = new();
+        public List<PvsPressureInfo> PvsDatabases { get; } = new();
         public TempDbSpaceInfo? TempDb { get; set; }
         public List<AnomalousJobInfo> AnomalousJobs { get; } = new();
 
         public int BlockingFetches { get; private set; }
         public int DeadlockFetches { get; private set; }
+        public int BlockingWaitFetches { get; private set; }
+
+        /* #1839: null = the store holds no blocking snapshot at all (the shipped state of a server that
+           has never blocked); tests that exercise the gate assign a result. */
+        public CurrentBlockingWaitResult? BlockingWait { get; set; }
         public (int ThresholdMinutes, int MaxResults, bool Diag, bool WaitFor, bool Backups, bool Misc, bool Cdc, IReadOnlyList<string> Excluded)? LastLrqArgs { get; private set; }
 
         public Task<List<BlockedProcessAlertRow>> GetRecentBlockedProcessReportsAsync(string serverKey, int hoursBack, CancellationToken cancellationToken = default)
         {
             BlockingFetches++;
             return Task.FromResult(new List<BlockedProcessAlertRow>(Blocking));
+        }
+
+        public Task<CurrentBlockingWaitResult?> GetCurrentBlockingWaitAsync(string serverKey, CancellationToken cancellationToken = default)
+        {
+            BlockingWaitFetches++;
+            return Task.FromResult(BlockingWait);
         }
 
         public Task<List<DeadlockAlertRow>> GetRecentDeadlocksAsync(string serverKey, int hoursBack, CancellationToken cancellationToken = default)
@@ -111,6 +130,9 @@ public sealed class AlertEngineTests
         public Task<TempDbSpaceInfo?> GetTempDbSpaceAsync(string serverKey, CancellationToken cancellationToken = default) =>
             Task.FromResult(TempDb);
 
+        public Task<List<PvsPressureInfo>> GetPvsPressureAsync(string serverKey, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new List<PvsPressureInfo>(PvsDatabases));
+
         /* #1812: fakes report a FRESH snapshot by default so every pre-existing scenario keeps its
            meaning; the staleness tests flip SnapshotIsStale to model a dead collector. */
         public bool SnapshotIsStale { get; set; }
@@ -119,6 +141,17 @@ public sealed class AlertEngineTests
             Task.FromResult(SnapshotIsStale
                 ? AnomalousJobsResult.Stale
                 : new AnomalousJobsResult(SnapshotIsFresh: true, new List<AnomalousJobInfo>(AnomalousJobs)));
+
+        /* Database-state deviations the engine should fire on — the store's baseline/ignore comparison
+           is already applied, so tests set the deviating rows directly. */
+        public List<DatabaseStateInfo> DatabaseStates { get; } = new();
+        public int DatabaseStateFetches { get; private set; }
+
+        public Task<List<DatabaseStateInfo>> GetDatabaseStatesAsync(string serverKey, CancellationToken cancellationToken = default)
+        {
+            DatabaseStateFetches++;
+            return Task.FromResult(new List<DatabaseStateInfo>(DatabaseStates));
+        }
     }
 
     private sealed class FakeStateStore : IAlertStateStore
@@ -245,7 +278,10 @@ public sealed class AlertEngineTests
         Assert.Equal("80% (Total CPU)", fired.CurrentValue);    /* :82 current-value shape, :64 label */
         Assert.Equal("80%", fired.ThresholdValue);
         Assert.Null(fired.Context);                              /* :91-98 — CPU passes no context */
-        Assert.Null(fired.NumericCurrentValue);                  /* ...and no numerics */
+        /* #1830: the numerics are REQUIRED — without them the history stores text-parsed
+           "80% (Total CPU)", failed on the parenthesized label, and stored 0 for every row. */
+        Assert.Equal(80d, fired.NumericCurrentValue);
+        Assert.Equal(80d, fired.NumericThresholdValue);
         Assert.False(fired.Muted);
 
         /* Same breach 1 minute later: inside the 5-minute cooldown — no repeat (:72). */
@@ -463,6 +499,202 @@ public sealed class AlertEngineTests
         Assert.Equal("1", Assert.Single(h.Deliverer.Outcomes).CurrentValue);
     }
 
+    /* ---------------- blocking wait time (#1839) ---------------- */
+
+    /// <summary>A fresh snapshot totalling <paramref name="totalWaitMs"/> across <paramref name="sessions"/> SPIDs.</summary>
+    private static CurrentBlockingWaitResult WaitSnapshot(long totalWaitMs, int sessions = 3, bool fresh = true) =>
+        new(new DateTime(2026, 7, 1, 11, 59, 0), totalWaitMs, sessions, fresh);
+
+    [Fact]
+    public async Task BlockingWait_OffByDefault_NeverReadsOrFires()
+    {
+        /* The shipped state: threshold 0 with blocking alerts ON. The gate must not even ask the store —
+           an off feature that still costs a query per sweep per server is not off. */
+        var h = new Harness();
+        h.Settings.BlockingEnabled = true;
+        h.Adapter.BlockingWait = WaitSnapshot(600_000);
+
+        await h.Build().EvaluateServerAsync(Harness.Snapshot());
+
+        Assert.Equal(0, h.Adapter.BlockingWaitFetches);
+        Assert.DoesNotContain(h.Deliverer.Outcomes, o => o.MetricName == "Blocking Wait Time");
+    }
+
+    [Fact]
+    public async Task BlockingWait_FiresAtThresholdInclusive_WithRealNumericsAndContent()
+    {
+        /* At/above, not strictly above — the same inclusive comparison every other threshold uses. */
+        var h = new Harness();
+        h.Settings.BlockingEnabled = true;
+        h.Settings.BlockingWaitSecondsThreshold = 600;
+        h.Adapter.BlockingWait = WaitSnapshot(600_000, sessions: 3);
+        h.Adapter.Blocking.Add(BlockingRow(55));
+
+        await h.Build().EvaluateServerAsync(Harness.Snapshot());
+
+        var fired = Assert.Single(h.Deliverer.Outcomes, o => o.MetricName == "Blocking Wait Time");
+        Assert.Equal("600s across 3 blocked session(s)", fired.CurrentValue);
+        Assert.Equal("600s", fired.ThresholdValue);
+        /* #1830: the numerics must carry the real values — the display text is prose no parser recovers. */
+        Assert.Equal(600d, fired.NumericCurrentValue);
+        Assert.Equal(600d, fired.NumericThresholdValue);
+        /* The reporter asked for today's Blocking Detected content, built from this sweep's rows. */
+        Assert.NotNull(fired.Context);
+        Assert.False(string.IsNullOrWhiteSpace(fired.DetailText));
+    }
+
+    [Fact]
+    public async Task BlockingWait_BelowThreshold_DoesNotFire()
+    {
+        var h = new Harness();
+        h.Settings.BlockingEnabled = true;
+        h.Settings.BlockingWaitSecondsThreshold = 600;
+        h.Adapter.BlockingWait = WaitSnapshot(599_999);
+
+        await h.Build().EvaluateServerAsync(Harness.Snapshot());
+
+        Assert.Equal(1, h.Adapter.BlockingWaitFetches);
+        Assert.DoesNotContain(h.Deliverer.Outcomes, o => o.MetricName == "Blocking Wait Time");
+    }
+
+    [Fact]
+    public async Task BlockingWait_IsLevelTriggered_CooldownSuppressesThenRefiresWhileStillAbove()
+    {
+        /* The distinguishing behavior vs the count gate's edge trigger: blocking that STAYS above the
+           threshold keeps announcing itself every cooldown instead of going quiet after one alert. */
+        var h = new Harness();
+        h.Settings.BlockingEnabled = true;
+        h.Settings.BlockingWaitSecondsThreshold = 60;
+        h.Settings.CooldownMinutes = 5;
+        h.Adapter.BlockingWait = WaitSnapshot(120_000);
+        var engine = h.Build();
+
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+        Assert.Single(h.Deliverer.Outcomes, o => o.MetricName == "Blocking Wait Time");
+
+        /* Inside the cooldown, still above: no second alert. */
+        h.Now = h.Now.AddMinutes(4);
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+        Assert.Single(h.Deliverer.Outcomes, o => o.MetricName == "Blocking Wait Time");
+
+        /* Cooldown elapsed, still above: it re-fires — no edge required. */
+        h.Now = h.Now.AddMinutes(2);
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+        Assert.Equal(2, h.Deliverer.Outcomes.Count(o => o.MetricName == "Blocking Wait Time"));
+        Assert.Empty(h.Resolutions);
+    }
+
+    [Fact]
+    public async Task BlockingWait_ResolvesWhenItDropsBelow()
+    {
+        var h = new Harness();
+        h.Settings.BlockingEnabled = true;
+        h.Settings.BlockingWaitSecondsThreshold = 60;
+        h.Adapter.BlockingWait = WaitSnapshot(120_000);
+        var engine = h.Build();
+
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+        Assert.Single(h.Deliverer.Outcomes, o => o.MetricName == "Blocking Wait Time");
+
+        h.Adapter.BlockingWait = WaitSnapshot(1_000);
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+
+        var resolution = Assert.Single(h.Resolutions);
+        Assert.Equal("Blocking Wait Cleared", resolution.Title);
+        Assert.Equal("Blocking Wait Time", resolution.MetricName);
+        /* A resolution is not a history row — nothing new was delivered. */
+        Assert.Single(h.Deliverer.Outcomes, o => o.MetricName == "Blocking Wait Time");
+    }
+
+    [Fact]
+    public async Task BlockingWait_StaleSnapshot_NeitherFiresNorHoldsTheAlertActive()
+    {
+        /* #1812's rule: a stopped collector leaves a "latest" snapshot that reads as NOW. A level-
+           triggered gate on frozen rows would re-fire every cooldown forever, so staleness is no
+           evidence — and it RESOLVES rather than latching (see CurrentBlockingWaitResult). */
+        var h = new Harness();
+        h.Settings.BlockingEnabled = true;
+        h.Settings.BlockingWaitSecondsThreshold = 60;
+        h.Adapter.BlockingWait = WaitSnapshot(120_000);
+        var engine = h.Build();
+
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+        Assert.Single(h.Deliverer.Outcomes, o => o.MetricName == "Blocking Wait Time");
+
+        /* Same over-threshold numbers, now stale: no re-fire even once the cooldown has elapsed. */
+        h.Adapter.BlockingWait = WaitSnapshot(120_000, fresh: false);
+        h.Now = h.Now.AddMinutes(30);
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+
+        Assert.Single(h.Deliverer.Outcomes, o => o.MetricName == "Blocking Wait Time");
+        Assert.Equal("Blocking Wait Cleared", Assert.Single(h.Resolutions).Title);
+    }
+
+    [Fact]
+    public async Task BlockingWait_NoSnapshotAtAll_DoesNotFire()
+    {
+        /* A server that has never blocked has no snapshot row; null must read as "not above". */
+        var h = new Harness();
+        h.Settings.BlockingEnabled = true;
+        h.Settings.BlockingWaitSecondsThreshold = 60;
+        h.Adapter.BlockingWait = null;
+
+        await h.Build().EvaluateServerAsync(Harness.Snapshot());
+
+        Assert.Equal(1, h.Adapter.BlockingWaitFetches);
+        Assert.Empty(h.Deliverer.Outcomes);
+        Assert.Empty(h.Resolutions);
+    }
+
+    [Fact]
+    public async Task BlockingWait_FollowsTheBlockingEnabledToggle()
+    {
+        /* Turning blocking alerts off silences BOTH gates — one toggle, as a user reading it expects. */
+        var h = new Harness();
+        h.Settings.BlockingEnabled = false;
+        h.Settings.BlockingWaitSecondsThreshold = 60;
+        h.Adapter.BlockingWait = WaitSnapshot(120_000);
+
+        await h.Build().EvaluateServerAsync(Harness.Snapshot());
+
+        Assert.Equal(0, h.Adapter.BlockingWaitFetches);
+        Assert.Empty(h.Deliverer.Outcomes);
+    }
+
+    [Fact]
+    public async Task BlockingWait_IsADistinctMetricFromTheCountGate()
+    {
+        /* Both gates can be over threshold in the same sweep and must produce two separate alerts, so
+           muting or acknowledging one never silences the other. */
+        var h = new Harness();
+        h.Settings.BlockingEnabled = true;
+        h.Settings.BlockingCountThreshold = 1;
+        h.Settings.BlockingWaitSecondsThreshold = 60;
+        h.Adapter.Blocking.Add(BlockingRow(55));
+        h.Adapter.BlockingWait = WaitSnapshot(120_000);
+
+        await h.Build().EvaluateServerAsync(Harness.Snapshot());
+
+        Assert.Equal(
+            new[] { "Blocking Detected", "Blocking Wait Time" },
+            h.Deliverer.Outcomes.Select(o => o.MetricName).OrderBy(n => n, StringComparer.Ordinal).ToArray());
+    }
+
+    [Fact]
+    public async Task BlockingWait_Muted_IsStillDeliveredFlagged()
+    {
+        /* Lite's flow: a muted alert is recorded, not sent — the deliverer decides, the engine flags. */
+        var h = new Harness();
+        h.Settings.BlockingEnabled = true;
+        h.Settings.BlockingWaitSecondsThreshold = 60;
+        h.Adapter.BlockingWait = WaitSnapshot(120_000);
+        h.Muted = true;
+
+        await h.Build().EvaluateServerAsync(Harness.Snapshot());
+
+        Assert.True(Assert.Single(h.Deliverer.Outcomes, o => o.MetricName == "Blocking Wait Time").Muted);
+    }
+
     /* ---------------- deadlocks ---------------- */
 
     [Fact]
@@ -649,6 +881,102 @@ public sealed class AlertEngineTests
         Assert.Equal(3, h.Deliverer.Outcomes.Count);
     }
 
+    /* ---------------- persistent version store (#1984) ---------------- */
+
+    [Fact]
+    public async Task PvsPressure_FiresOnWorstDatabase_StandingBreachStaysQuiet_WorseningRefires()
+    {
+        var h = new Harness();
+        h.Settings.PvsEnabled = true;
+        var engine = h.Build();
+
+        /* Two ADR databases over the 40% trigger; the worst (highest %) names the alert. */
+        h.Adapter.PvsDatabases.Add(new PvsPressureInfo { DatabaseName = "shop", PvsSizeMb = 6144, DatabaseDataSizeMb = 10240 });
+        h.Adapter.PvsDatabases.Add(new PvsPressureInfo { DatabaseName = "ledger", PvsSizeMb = 2048, DatabaseDataSizeMb = 4096 });
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+        var fired = Assert.Single(h.Deliverer.Outcomes);
+        Assert.Equal("Version Store (PVS)", fired.MetricName);
+        Assert.Equal("shop PVS 60% of database (6.0 GB)", fired.CurrentValue);
+        Assert.Equal("40% of database and ≥ 1 GB", fired.ThresholdValue);
+        Assert.Equal(60d, fired.NumericCurrentValue!.Value, precision: 3);
+        Assert.Equal(40d, fired.NumericThresholdValue);
+        /* No severity tier: MS documents no "critical" PVS level, and inventing one is the folklore
+           the collector deliberately avoided. */
+        Assert.Null(fired.Severity);
+        /* Both breaching databases ride in the context, worst first (the incident renderer appends
+           its own dedup items after them, so the pin is on the headings, not the count). */
+        Assert.StartsWith("shop", fired.Context!.Details[0].Heading, StringComparison.Ordinal);
+        Assert.Contains(fired.Context.Details, d => d.Heading.StartsWith("ledger", StringComparison.Ordinal));
+
+        /* The SAME standing level does not re-fire after the cooldown — a large PVS stays allocated
+           even after its cause clears (measured on a live rig), so without the PvsAlertGate a
+           recovered incident would re-notify every cooldown for hours. */
+        h.Now = h.Now.AddMinutes(6);
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+        Assert.Single(h.Deliverer.Outcomes);
+
+        /* Rising past the 5-point worsening margin re-fires. */
+        h.Adapter.PvsDatabases[0].PvsSizeMb = 7168; /* 70% */
+        h.Now = h.Now.AddMinutes(6);
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+        Assert.Equal(2, h.Deliverer.Outcomes.Count);
+
+        /* Recovery announces and clears the worsening watermark... */
+        h.Adapter.PvsDatabases.Clear();
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+        var resolution = Assert.Single(h.Resolutions);
+        Assert.Equal("Version Store (PVS) Resolved", resolution.Title);
+        Assert.Equal("SRV-A: All version stores back below threshold", resolution.Message);
+
+        /* ...so a fresh breach at the ORIGINAL level alerts again (fresh = always notifies). */
+        h.Adapter.PvsDatabases.Add(new PvsPressureInfo { DatabaseName = "shop", PvsSizeMb = 6144, DatabaseDataSizeMb = 10240 });
+        h.Now = h.Now.AddMinutes(6);
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+        Assert.Equal(3, h.Deliverer.Outcomes.Count);
+    }
+
+    [Fact]
+    public async Task PvsPressure_FloorKeepsSmallDatabasesQuiet_AndZeroFloorRemovesIt()
+    {
+        /* 70% of a tiny database is megabytes, and nobody should be paged for megabytes: the GB
+           floor is an AND qualifier, unlike the low-disk pair's either-breach-fires OR. */
+        var h = new Harness();
+        h.Settings.PvsEnabled = true;
+        var engine = h.Build();
+
+        h.Adapter.PvsDatabases.Add(new PvsPressureInfo { DatabaseName = "tiny", PvsSizeMb = 512, DatabaseDataSizeMb = 732 });
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+        Assert.Empty(h.Deliverer.Outcomes);
+        /* Never-active means no resolution chatter either. */
+        Assert.Empty(h.Resolutions);
+
+        /* 0 removes the floor: percent alone decides. */
+        h.Settings.PvsFloorGb = 0;
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+        var fired = Assert.Single(h.Deliverer.Outcomes);
+        Assert.Equal("40% of database", fired.ThresholdValue);
+    }
+
+    [Fact]
+    public async Task PvsPressure_DisabledOrZeroPercent_DoesNotEvaluate()
+    {
+        var h = new Harness();
+        var engine = h.Build();
+        h.Adapter.PvsDatabases.Add(new PvsPressureInfo { DatabaseName = "shop", PvsSizeMb = 6144, DatabaseDataSizeMb = 10240 });
+
+        /* Disabled: the breaching row proves nothing was evaluated. */
+        h.Settings.PvsEnabled = false;
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+        Assert.Empty(h.Deliverer.Outcomes);
+
+        /* Percent 0 disables outright — it is the alert's ONLY trigger, so there is no second
+           dimension to fall back on (unlike low-disk). */
+        h.Settings.PvsEnabled = true;
+        h.Settings.PvsThresholdPercent = 0;
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+        Assert.Empty(h.Deliverer.Outcomes);
+    }
+
     /* ---------------- anomalous jobs ---------------- */
 
     [Fact]
@@ -810,6 +1138,8 @@ public sealed class AlertEngineTests
     {
         public Task<List<BlockedProcessAlertRow>> GetRecentBlockedProcessReportsAsync(string serverKey, int hoursBack, CancellationToken cancellationToken = default) =>
             throw new InvalidOperationException("store down");
+        public Task<CurrentBlockingWaitResult?> GetCurrentBlockingWaitAsync(string serverKey, CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("store down");
         public Task<List<DeadlockAlertRow>> GetRecentDeadlocksAsync(string serverKey, int hoursBack, CancellationToken cancellationToken = default) =>
             throw new InvalidOperationException("store down");
         public Task<List<PoisonWaitDelta>> GetPoisonWaitDeltasAsync(string serverKey, double thresholdMs, CancellationToken cancellationToken = default) =>
@@ -820,7 +1150,11 @@ public sealed class AlertEngineTests
             throw new InvalidOperationException("store down");
         public Task<TempDbSpaceInfo?> GetTempDbSpaceAsync(string serverKey, CancellationToken cancellationToken = default) =>
             throw new InvalidOperationException("store down");
+        public Task<List<PvsPressureInfo>> GetPvsPressureAsync(string serverKey, CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("store down");
         public Task<AnomalousJobsResult> GetAnomalousJobsAsync(string serverKey, int multiplier, CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("store down");
+        public Task<List<DatabaseStateInfo>> GetDatabaseStatesAsync(string serverKey, CancellationToken cancellationToken = default) =>
             throw new InvalidOperationException("store down");
     }
 
@@ -838,5 +1172,81 @@ public sealed class AlertEngineTests
 
         Assert.Equal(2, h.Deliverer.Outcomes.Count);
         Assert.Equal(new[] { "101", "202" }, h.Deliverer.Outcomes.Select(o => o.ServerKey).ToArray());
+    }
+
+    /* ---------------- database state (baseline deviation) ---------------- */
+
+    [Fact]
+    public async Task DatabaseState_Disabled_DoesNotFetch()
+    {
+        var h = new Harness();
+        h.Settings.DatabaseStateEnabled = false;
+        h.Adapter.DatabaseStates.Add(new DatabaseStateInfo { DatabaseName = "X", StateDesc = "OFFLINE", ExpectedState = "ONLINE" });
+        var engine = h.Build();
+
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+
+        Assert.Equal(0, h.Adapter.DatabaseStateFetches);
+        Assert.Empty(h.Deliverer.Outcomes);
+    }
+
+    [Fact]
+    public async Task DatabaseState_FiresPerDatabase_GradingSeverityByCurrentState()
+    {
+        var h = new Harness();
+        h.Settings.DatabaseStateEnabled = true;
+        h.Adapter.DatabaseStates.Add(new DatabaseStateInfo { DatabaseName = "Payments", StateDesc = "SUSPECT", ExpectedState = "ONLINE" });
+        h.Adapter.DatabaseStates.Add(new DatabaseStateInfo { DatabaseName = "Archive", StateDesc = "OFFLINE", ExpectedState = "ONLINE" });
+        var engine = h.Build();
+
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+
+        Assert.Equal(2, h.Deliverer.Outcomes.Count);
+        Assert.All(h.Deliverer.Outcomes, o => Assert.Equal("Database State", o.MetricName));
+
+        var suspect = h.Deliverer.Outcomes.Single(o => o.CurrentValue.StartsWith("Payments"));
+        Assert.Equal(PerformanceMonitor.Notifications.AlertSeverityLevel.Critical, suspect.Severity);
+        var offline = h.Deliverer.Outcomes.Single(o => o.CurrentValue.StartsWith("Archive"));
+        Assert.Equal(PerformanceMonitor.Notifications.AlertSeverityLevel.Warning, offline.Severity);
+    }
+
+    [Fact]
+    public async Task DatabaseState_CooldownSuppressesSecondFire_ThenResolvesWhenBackToExpected()
+    {
+        var h = new Harness();
+        h.Settings.DatabaseStateEnabled = true;
+        h.Adapter.DatabaseStates.Add(new DatabaseStateInfo { DatabaseName = "Payments", StateDesc = "OFFLINE", ExpectedState = "ONLINE" });
+        var engine = h.Build();
+
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+        Assert.Single(h.Deliverer.Outcomes);
+
+        /* Same deviation next sweep, inside the cooldown window — no second fire. */
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+        Assert.Single(h.Deliverer.Outcomes);
+
+        /* Database returns to its expected state — deviation clears, resolution announced. */
+        h.Adapter.DatabaseStates.Clear();
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+        Assert.Single(h.Deliverer.Outcomes);
+        Assert.Contains(h.Resolutions, r => r.MetricName == "Database State" && r.Message.Contains("Payments"));
+    }
+
+    [Fact]
+    public async Task DatabaseState_PendingCriticalFirstObservation_FiresCriticalWithNoBaselineMessage()
+    {
+        /* A critical first observation has no baseline (empty expected) — the store returns it as pending;
+           the engine must fire CRITICAL and word it as a first observation, not "expected UNKNOWN". */
+        var h = new Harness();
+        h.Settings.DatabaseStateEnabled = true;
+        h.Adapter.DatabaseStates.Add(new DatabaseStateInfo { DatabaseName = "Payments", StateDesc = "SUSPECT", ExpectedState = "" });
+        var engine = h.Build();
+
+        await engine.EvaluateServerAsync(Harness.Snapshot());
+
+        var o = Assert.Single(h.Deliverer.Outcomes);
+        Assert.Equal("Database State", o.MetricName);
+        Assert.Equal(PerformanceMonitor.Notifications.AlertSeverityLevel.Critical, o.Severity);
+        Assert.Contains("no baseline", o.ShortMessage);
     }
 }

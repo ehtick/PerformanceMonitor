@@ -41,6 +41,8 @@ public abstract class CollectorDefinitionBase<TRow> : ICollectorDefinition<TRow>
 
     public virtual string? PerDatabaseWatermarkColumn => null;
 
+    public virtual IReadOnlyList<string> StateKeys => System.Array.Empty<string>();
+
     public virtual int? PerItemRowCountWarnThreshold => null;
 
     public virtual int? PerItemTextByteBudget => null;
@@ -57,6 +59,8 @@ public abstract class CollectorDefinitionBase<TRow> : ICollectorDefinition<TRow>
 
     public virtual ValueTask ApplySupplementalAsync(List<TRow> rows, DbDataReader reader, CollectorContext context, CancellationToken cancellationToken)
         => ValueTask.CompletedTask;
+
+    public virtual bool EmitsProbeFailures => false;
 
     public virtual CollectorQuery? BuildEnumerationQuery(CollectorContext context) => null;
 

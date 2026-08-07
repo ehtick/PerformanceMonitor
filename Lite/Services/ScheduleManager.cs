@@ -43,13 +43,17 @@ public class ScheduleManager
             ["query_store"] = 2, ["query_snapshots"] = 1, ["cpu_utilization"] = 1,
             ["file_io_stats"] = 1, ["memory_stats"] = 1, ["memory_clerks"] = 2,
             ["memory_pressure_events"] = 5,
-            ["tempdb_stats"] = 1, ["perfmon_stats"] = 1, ["deadlocks"] = 1,
+            ["tempdb_stats"] = 1, ["perfmon_stats"] = 1, ["deadlocks"] = 2,
             ["memory_grant_stats"] = 1, ["waiting_tasks"] = 1,
             ["dmv_blocking_snapshot"] = 1,
             ["blocked_process_report"] = 1, ["running_jobs"] = 2,
             ["session_summary_stats"] = 2, ["system_health_events"] = 2,
             ["default_trace_events"] = 2, ["job_history"] = 2, ["agent_status"] = 2,
-            ["ag_replica_states"] = 1, ["ag_database_replica_states"] = 1
+            ["ag_replica_states"] = 1, ["ag_database_replica_states"] = 1,
+            /* plan_correction tracks query_store across the presets: same per-database enumeration
+               shape, same default tier, so an operator backing one off wants the other to follow. */
+            ["plan_correction"] = 2,
+            ["database_states"] = 1
         },
         ["Balanced"] = new(StringComparer.OrdinalIgnoreCase)
         {
@@ -59,13 +63,16 @@ public class ScheduleManager
             ["query_store"] = 5, ["query_snapshots"] = 1, ["cpu_utilization"] = 1,
             ["file_io_stats"] = 1, ["memory_stats"] = 1, ["memory_clerks"] = 5,
             ["memory_pressure_events"] = 5,
-            ["tempdb_stats"] = 1, ["perfmon_stats"] = 1, ["deadlocks"] = 1,
+            /* deadlocks follows its new 5-minute default tier (#1963) - Balanced mirrors the defaults. */
+            ["tempdb_stats"] = 1, ["perfmon_stats"] = 1, ["deadlocks"] = 5,
             ["memory_grant_stats"] = 1, ["waiting_tasks"] = 1,
             ["dmv_blocking_snapshot"] = 1,
             ["blocked_process_report"] = 1, ["running_jobs"] = 5,
             ["session_summary_stats"] = 5, ["system_health_events"] = 5,
             ["default_trace_events"] = 5, ["job_history"] = 5, ["agent_status"] = 5,
-            ["ag_replica_states"] = 1, ["ag_database_replica_states"] = 1
+            ["ag_replica_states"] = 1, ["ag_database_replica_states"] = 1,
+            ["plan_correction"] = 5,
+            ["database_states"] = 1
         },
         ["Low-Impact"] = new(StringComparer.OrdinalIgnoreCase)
         {
@@ -75,13 +82,15 @@ public class ScheduleManager
             ["query_store"] = 30, ["query_snapshots"] = 5, ["cpu_utilization"] = 5,
             ["file_io_stats"] = 10, ["memory_stats"] = 10, ["memory_clerks"] = 30,
             ["memory_pressure_events"] = 15,
-            ["tempdb_stats"] = 5, ["perfmon_stats"] = 5, ["deadlocks"] = 5,
+            ["tempdb_stats"] = 5, ["perfmon_stats"] = 5, ["deadlocks"] = 15,
             ["memory_grant_stats"] = 5, ["waiting_tasks"] = 5,
             ["dmv_blocking_snapshot"] = 5,
             ["blocked_process_report"] = 5, ["running_jobs"] = 30,
             ["session_summary_stats"] = 15, ["system_health_events"] = 15,
             ["default_trace_events"] = 15, ["job_history"] = 15, ["agent_status"] = 15,
-            ["ag_replica_states"] = 5, ["ag_database_replica_states"] = 5
+            ["ag_replica_states"] = 5, ["ag_database_replica_states"] = 5,
+            ["plan_correction"] = 30,
+            ["database_states"] = 5
         }
     };
 
@@ -619,9 +628,10 @@ public class ScheduleManager
             new() { Name = "memory_pressure_events", Enabled = true, FrequencyMinutes = 5, RetentionDays = 30, Description = "Memory pressure notifications from RING_BUFFER_RESOURCE_MONITOR" },
             new() { Name = "tempdb_stats", Enabled = true, FrequencyMinutes = 1, RetentionDays = 30, Description = "tempdb space usage from sys.dm_db_file_space_usage" },
             new() { Name = "perfmon_stats", Enabled = true, FrequencyMinutes = 1, RetentionDays = 30, Description = "Key performance counters from sys.dm_os_performance_counters" },
-            new() { Name = "deadlocks", Enabled = true, FrequencyMinutes = 1, RetentionDays = 30, Description = "Deadlocks from a dedicated PerformanceMonitor_Deadlock XE session (xml_deadlock_report)" },
+            new() { Name = "deadlocks", Enabled = true, FrequencyMinutes = 5, RetentionDays = 30, Description = "Deadlocks from a dedicated PerformanceMonitor_Deadlock XE session (xml_deadlock_report)" },
             new() { Name = "server_config", Enabled = true, FrequencyMinutes = 0, RetentionDays = 30, Description = "Server configuration (on-load only)" },
             new() { Name = "database_config", Enabled = true, FrequencyMinutes = 0, RetentionDays = 30, Description = "Database configuration (on-load only)" },
+            new() { Name = "database_states", Enabled = true, FrequencyMinutes = 1, RetentionDays = 30, Description = "Per-database state (sys.databases.state_desc) time series; feeds the baseline-deviation database-state alert (not collected on Azure SQL DB)" },
             new() { Name = "memory_grant_stats", Enabled = true, FrequencyMinutes = 1, RetentionDays = 30, Description = "Memory grant statistics from sys.dm_exec_query_memory_grants" },
             new() { Name = "waiting_tasks", Enabled = true, FrequencyMinutes = 1, RetentionDays = 7, Description = "Point-in-time waiting tasks from sys.dm_os_waiting_tasks" },
             new() { Name = "dmv_blocking_snapshot", Enabled = true, FrequencyMinutes = 1, RetentionDays = 30, Description = "Always-on point-in-time blocking snapshot from DMVs (BPR-independent fallback; works when blocked process threshold is unset, e.g. AWS RDS)" },
@@ -640,7 +650,9 @@ public class ScheduleManager
             new() { Name = "job_history", Enabled = true, FrequencyMinutes = 5, RetentionDays = 365, Description = "Retained SQL Agent job-run history from msdb.dbo.sysjobhistory (per-step results, retries, durations, failures) deduped on the instance_id high-water mark; up to a year retained for the Job History tab (not collected on Azure SQL DB)" },
             new() { Name = "agent_status", Enabled = true, FrequencyMinutes = 5, RetentionDays = 7, Description = "SQL Agent service status (Running/Stopped from sys.dm_server_services) and next scheduled run from msdb; drives the Job History tab header (not collected on Azure SQL DB)" },
             new() { Name = "ag_replica_states", Enabled = true, FrequencyMinutes = 1, RetentionDays = 30, Description = "Availability Group replica health (role, operational/connected state, recovery and synchronization health) from sys.dm_hadr_availability_replica_states; zero rows on a server with no AGs (not collected on Azure SQL DB)" },
-            new() { Name = "ag_database_replica_states", Enabled = true, FrequencyMinutes = 1, RetentionDays = 30, Description = "Availability Group per-database replica health (synchronization state, send/redo queue sizes and rates, secondary lag) from sys.dm_hadr_database_replica_states; zero rows on a server with no AGs (not collected on Azure SQL DB)" }
+            new() { Name = "ag_database_replica_states", Enabled = true, FrequencyMinutes = 1, RetentionDays = 30, Description = "Availability Group per-database replica health (synchronization state, send/redo queue sizes and rates, secondary lag) from sys.dm_hadr_database_replica_states; zero rows on a server with no AGs (not collected on Azure SQL DB)" },
+            new() { Name = "plan_correction", Enabled = true, FrequencyMinutes = 5, RetentionDays = 30, Description = "Automatic plan correction: per-database FORCE_LAST_GOOD_PLAN enablement from sys.database_automatic_tuning_options plus the engine's live recommendation set from sys.dm_db_tuning_recommendations, with the regressed query's text resolved through Query Store (SQL Server 2017+ and Azure; Enterprise/Developer edition)" },
+            new() { Name = "pvs_stats", Enabled = true, FrequencyMinutes = 60, RetentionDays = 90, Description = "Accelerated Database Recovery persistent version store size and cleanup state per database from sys.dm_tran_persistent_version_store_stats, with the aborted-transaction count and the skipped-page counters that say why cleanup is not reclaiming; SQL Server 2019+ only, always collected on Azure SQL DB (ADR is always on there)" }
         };
     }
 

@@ -140,13 +140,23 @@ WITH ranked AS (
         MAX(max_used_threads) AS max_used_threads,
         MAX(total_clr_time) AS total_clr_time,
         MAX(plan_generation_num) AS plan_generation_num,
-        MAX(CAST(delta_worker_time AS DOUBLE PRECISION) / NULLIF(sample_interval_seconds, 0) / 1000.0) AS worker_time_per_second
+        MAX(CAST(delta_worker_time AS DOUBLE PRECISION) / NULLIF(sample_interval_seconds, 0) / 1000.0) AS worker_time_per_second,
+        /* #2012: distinct statement texts merged into this group. query_hash is a SHAPE hash, so
+           ad-hoc literal variants collapse - > 1 means the representative text below labels a blend
+           (stage 2 folded host_object_name into the key, so INSERT...EXEC statements hosted by
+           DIFFERENT procs no longer merge; only ad-hoc blends and pre-upgrade NULL-host history
+           can still count > 1). DuckDB's 64-bit hash() stands in for Darling's #1767 content
+           digest: comparing fixed-size hashes instead of arbitrarily long batch texts (a review
+           note on the twin's asymmetry); a same-group 64-bit collision is negligible for a
+           display count. */
+        COUNT(DISTINCT hash(query_text)) AS distinct_texts,
+        host_object_name
     FROM v_query_stats
     WHERE server_id = $1
     AND   collection_time >= $2
     AND   collection_time <= $3
     AND   last_execution_time >= $2 + $5 * INTERVAL '1' MINUTE" + dbClause + @"
-    GROUP BY database_name, query_hash
+    GROUP BY database_name, query_hash, host_object_name
     HAVING SUM(delta_execution_count) > 0 OR SUM(delta_elapsed_time) > 0
     ORDER BY SUM(delta_elapsed_time) DESC
     LIMIT $4 + 5
@@ -190,6 +200,10 @@ LEFT JOIN LATERAL (
     WHERE server_id = $1
     AND   query_hash = r.query_hash
     AND   database_name = r.database_name
+    /* #2012 stage 2: the representative text must come from THIS group's own rows - without the
+       host constraint a hash shared across host objects could label one caller's row with
+       another caller's text (NOT DISTINCT FROM so ad-hoc NULL hosts still match ad-hoc rows). */
+    AND   host_object_name IS NOT DISTINCT FROM r.host_object_name
     AND   query_text IS NOT NULL
     ORDER BY collection_time DESC
     LIMIT 1
@@ -253,11 +267,13 @@ LIMIT $4";
                 TotalClrUs = reader.IsDBNull(37) ? 0 : reader.GetInt64(37),
                 PlanGenerationNum = reader.IsDBNull(38) ? 0 : reader.GetInt64(38),
                 WorkerTimePerSecond = reader.IsDBNull(39) ? 0 : ToDouble(reader.GetValue(39)),
-                QueryText = reader.IsDBNull(40) ? "" : reader.GetString(40),
-                QueryPlan = reader.IsDBNull(41) ? null : reader.GetString(41),
-                ModuleObjectName = reader.IsDBNull(42) ? "" : reader.GetString(42),
-                ModuleSchemaName = reader.IsDBNull(43) ? "" : reader.GetString(43),
-                ModuleDatabaseName = reader.IsDBNull(44) ? "" : reader.GetString(44)
+                DistinctTexts = reader.IsDBNull(40) ? 0 : reader.GetInt64(40),
+                HostObjectName = reader.IsDBNull(41) ? null : reader.GetString(41),
+                QueryText = reader.IsDBNull(42) ? "" : reader.GetString(42),
+                QueryPlan = reader.IsDBNull(43) ? null : reader.GetString(43),
+                ModuleObjectName = reader.IsDBNull(44) ? "" : reader.GetString(44),
+                ModuleSchemaName = reader.IsDBNull(45) ? "" : reader.GetString(45),
+                ModuleDatabaseName = reader.IsDBNull(46) ? "" : reader.GetString(46)
             });
         }
 
@@ -999,7 +1015,8 @@ current_period AS (
            SUM(ps.delta_execution_count) AS exec_count,
            SUM(ps.delta_elapsed_time)::DOUBLE PRECISION / NULLIF(SUM(ps.delta_execution_count), 0) / 1000.0 AS avg_duration_ms,
            SUM(ps.delta_worker_time)::DOUBLE PRECISION / NULLIF(SUM(ps.delta_execution_count), 0) / 1000.0 AS avg_cpu_ms,
-           SUM(ps.delta_physical_reads)::DOUBLE PRECISION / NULLIF(SUM(ps.delta_execution_count), 0) AS avg_reads
+           SUM(ps.delta_physical_reads)::DOUBLE PRECISION / NULLIF(SUM(ps.delta_execution_count), 0) AS avg_reads,
+           MAX(ps.sql_handle) AS sql_handle
     FROM top_procs tp
     INNER JOIN v_procedure_stats ps
       ON  ps.database_name IS NOT DISTINCT FROM tp.database_name
@@ -1015,7 +1032,8 @@ baseline_period AS (
            SUM(ps.delta_execution_count) AS exec_count,
            SUM(ps.delta_elapsed_time)::DOUBLE PRECISION / NULLIF(SUM(ps.delta_execution_count), 0) / 1000.0 AS avg_duration_ms,
            SUM(ps.delta_worker_time)::DOUBLE PRECISION / NULLIF(SUM(ps.delta_execution_count), 0) / 1000.0 AS avg_cpu_ms,
-           SUM(ps.delta_physical_reads)::DOUBLE PRECISION / NULLIF(SUM(ps.delta_execution_count), 0) AS avg_reads
+           SUM(ps.delta_physical_reads)::DOUBLE PRECISION / NULLIF(SUM(ps.delta_execution_count), 0) AS avg_reads,
+           MAX(ps.sql_handle) AS sql_handle
     FROM top_procs tp
     INNER JOIN v_procedure_stats ps
       ON  ps.database_name IS NOT DISTINCT FROM tp.database_name
@@ -1033,12 +1051,27 @@ SELECT COALESCE(c.database_name, b.database_name) AS database_name,
        b.exec_count AS baseline_exec_count,
        b.avg_duration_ms AS baseline_avg_duration_ms,
        b.avg_cpu_ms AS baseline_avg_cpu_ms,
-       b.avg_reads AS baseline_avg_reads
+       b.avg_reads AS baseline_avg_reads,
+       t.query_text
 FROM current_period c
 FULL OUTER JOIN baseline_period b
   ON  c.database_name IS NOT DISTINCT FROM b.database_name
   AND c.schema_name IS NOT DISTINCT FROM b.schema_name
-  AND c.object_name IS NOT DISTINCT FROM b.object_name;";
+  AND c.object_name IS NOT DISTINCT FROM b.object_name
+/* #1981: a REPRESENTATIVE statement of the procedure, resolved through the same normalized
+   sql_handle join the #1568 module attribution relies on (both stores persist the identical
+   CONVERT(varchar(130), ..., 1) text). procedure_stats captures no text of its own, so this is
+   the latest captured statement from inside the module - parity with the other two comparison
+   grids' text columns, labeled a statement rather than the definition. */
+LEFT JOIN LATERAL (
+    SELECT qs.query_text
+    FROM v_query_stats qs
+    WHERE qs.server_id = $1
+    AND   qs.sql_handle = COALESCE(c.sql_handle, b.sql_handle)
+    AND   qs.query_text IS NOT NULL
+    ORDER BY qs.collection_time DESC
+    LIMIT 1
+) t ON TRUE;";
 
         command.Parameters.Add(new DuckDBParameter { Value = serverId });
         command.Parameters.Add(new DuckDBParameter { Value = currentStart });
@@ -1065,6 +1098,7 @@ FULL OUTER JOIN baseline_period b
                 BaselineAvgDurationMs = reader.IsDBNull(8) ? 0 : ToDouble(reader.GetValue(8)),
                 BaselineAvgCpuMs = reader.IsDBNull(9) ? 0 : ToDouble(reader.GetValue(9)),
                 BaselineAvgReads = reader.IsDBNull(10) ? 0 : ToDouble(reader.GetValue(10)),
+                QueryText = reader.IsDBNull(11) ? "" : reader.GetString(11),
             });
         }
 
@@ -1419,6 +1453,18 @@ public class QueryStatsRow
     public string SqlHandle { get; set; } = "";
     public string PlanHandle { get; set; } = "";
     public string QueryText { get; set; } = "";
+
+    /// <summary>#2012: distinct statement texts merged into this group; > 1 means
+    /// <see cref="QueryText"/> is one representative of a blend (ad-hoc literal variants, or
+    /// pre-stage-2 history where <see cref="HostObjectName"/> hadn't split INSERT...EXEC
+    /// callers yet).</summary>
+    public long DistinctTexts { get; set; }
+
+    /// <summary>#2012 stage 2: the statement's hosting module (<c>schema.object</c>) captured at
+    /// collection from dm_exec_sql_text.objectid; null for ad-hoc/prepared text and for rows
+    /// collected before the column existed. Part of the group key, so same-hash statements hosted
+    /// by different procs (INSERT...EXEC) land in separate rows.</summary>
+    public string? HostObjectName { get; set; }
     public string? QueryPlan { get; set; }
     public bool HasQueryPlan => !string.IsNullOrEmpty(QueryPlan);
 
@@ -1428,12 +1474,15 @@ public class QueryStatsRow
     public string ModuleSchemaName { get; set; } = "";
     public string ModuleDatabaseName { get; set; } = "";
 
-    /// <summary>Grid "Module" column: <c>database.schema.object</c> when this statement's sql_handle matched a
-    /// cached module (procedure/function/trigger), else the literal <c>ad hoc</c> (#1568).</summary>
+    /// <summary>Grid "Module" column: the collection-time <see cref="HostObjectName"/> when present
+    /// (#2012 stage 2 — authoritative, resolved on the monitored server), else the #1568 sql_handle
+    /// stitch's <c>database.schema.object</c> for older rows, else the literal <c>ad hoc</c>.</summary>
     public string ModuleName =>
-        string.IsNullOrEmpty(ModuleObjectName)
-            ? "ad hoc"
-            : $"{ModuleDatabaseName}.{ModuleSchemaName}.{ModuleObjectName}";
+        !string.IsNullOrEmpty(HostObjectName)
+            ? $"{DatabaseName}.{HostObjectName}"
+            : string.IsNullOrEmpty(ModuleObjectName)
+                ? "ad hoc"
+                : $"{ModuleDatabaseName}.{ModuleSchemaName}.{ModuleObjectName}";
 
     public double TotalCpuMs => TotalCpuUs / 1000.0;
     public double TotalElapsedMs => TotalElapsedUs / 1000.0;

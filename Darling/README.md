@@ -35,7 +35,7 @@ Nothing is installed on the monitored SQL Servers by either edition beyond two l
 ### Prerequisites
 
 - **Windows** for the service host (Windows-service lifetime, DPAPI password protection) and for the viewer (WPF). Monitored servers can be SQL Server 2016–2025, Azure SQL Managed Instance, AWS RDS for SQL Server, or Azure SQL Database.
-- **A PostgreSQL store — bundled or your own.** In managed mode (the shipped default, see [Managed Bundled PostgreSQL](#managed-bundled-postgresql)) the service runs its own bundled PostgreSQL 18 + TimescaleDB and no database provisioning is needed. To bring your own instead, PostgreSQL 16 or newer is recommended (developed and validated against PostgreSQL 18) with a database and a login the service can create tables in.
+- **A PostgreSQL store — bundled or your own.** In managed mode (the shipped default, see [Managed Bundled PostgreSQL](#managed-bundled-postgresql)) the service runs its own bundled PostgreSQL 18 + TimescaleDB and no database provisioning is needed. To bring your own instead, PostgreSQL 16 or newer is recommended (developed and validated against PostgreSQL 18) with a database and a login the service can create tables in — and if that store has TimescaleDB, size its background workers before you rely on compression, because the stock PostgreSQL defaults cannot run the policies (see [Background workers](#background-workers-sizing-an-unmanaged-store-and-what-happens-if-you-dont)).
 - **TimescaleDB is optional and auto-adopted.** If the extension is installed (or pre-created by an administrator) in the store database, the service detects it at startup and automatically converts the collector tables to hypertables with compression; without it, the service runs in plain-PostgreSQL mode, which is fully supported. No configuration flag either way.
 - **.NET 10** to build and run.
 
@@ -77,7 +77,7 @@ Minimal working example — one server, integrated auth, bring-your-own PostgreS
 }
 ```
 
-**Integrated auth (recommended).** The service connects to monitored servers as the Windows account the service runs under. Grant that account the [permissions below](#permissions-on-monitored-servers).
+**Integrated auth (recommended).** The service connects to monitored servers as the Windows account the service runs under — there is no separate Windows credential to configure. Grant that account the [permissions below](#permissions-on-monitored-servers). The default install's virtual service account reaches *remote* servers as the collector machine's computer account (`DOMAIN\<machine>$`), so for integrated auth you will usually [run the service as a domain account or gMSA](#run-the-service-as-a-domain-account-or-gmsa) instead.
 
 **SQL auth.** Set `"auth": "sql"`, a `username`, and an `encryptedPassword` produced by the `--encrypt-password` verb:
 
@@ -85,7 +85,7 @@ Minimal working example — one server, integrated auth, bring-your-own PostgreS
 PerformanceMonitor.Darling.Service.exe --encrypt-password
 ```
 
-It prompts for the password on stdin (so the plaintext never lands in your shell history) and prints a base64 DPAPI blob. Paste that blob into the server's `"encryptedPassword"`. The blob is protected with **DPAPI LocalMachine scope**, so an administrator can encrypt it interactively and the service account can decrypt it later on the same machine — but it is machine-bound: run `--encrypt-password` **on the machine that will run the service**, and re-encrypt if you move `darling.json` to another machine. A plaintext `"password"` also works as a dev convenience, but the service logs a warning every time it is used.
+It prompts for the password on stdin (so the plaintext never lands in your shell history) and prints a base64 DPAPI blob. Paste that blob into the server's `"encryptedPassword"`. The blob is protected with **DPAPI LocalMachine scope**, so an administrator can encrypt it interactively and the service account can decrypt it later on the same machine — but it is machine-bound: run `--encrypt-password` **on the machine that will run the service**, and re-encrypt if you move `darling.json` to another machine. A plaintext `"password"` also works as a dev convenience, but the service logs a warning every time it is used. The same slot also takes an **`env:NAME` or `file:/path` reference** (#1804): the service reads the named environment variable or the file's (trimmed) contents at connect time, nothing secret lands in `darling.json`, and no warning is logged — the supported shape on non-Windows hosts, and compose-`secrets:`-friendly everywhere. A missing or empty reference target is a configuration error naming both the setting and the target, never a silent empty password.
 
 **excludedDatabases** (per server) removes databases from collection: per-database collectors skip them and the exclusion is spliced into the collector queries — the same filter Lite applies. There is a second, separate `alerts.excludedDatabases` list that excludes databases from blocking/deadlock/long-running-query **alert evaluation** without affecting collection.
 
@@ -99,6 +99,8 @@ PerformanceMonitor.Darling.Service.exe --test-connection
 
 (`--validate-config` is an alias.) It validates the file, then connects to and probes each server, printing a `[PASS]`/`[FAIL]` line per server (SQL major version, engine edition, and whether the account has msdb access for failed-job alerts). It exits `0` only when the file is valid **and** every server is reachable, so it doubles as a deployment gate. Add an explicit config path as a second argument if `darling.json` is not next to the exe and `DARLING_CONFIG` is not set. This is the same probe the Viewer's **Test Connection** button runs through the service.
 
+One identity caveat: the verb connects as **you**, the console user — not as the service account. For `"auth": "integrated"` servers a `[PASS]` proves the server is reachable and the config is well-formed, but the grants that matter at runtime are the *service account's*: the per-server connect lines in the service log are the real proof (see [Run the service as a domain account or gMSA](#run-the-service-as-a-domain-account-or-gmsa)).
+
 ### Run It — Console Mode
 
 The same executable serves interactive debugging and service installation; the Windows-service lifetime is a no-op when run from a console.
@@ -107,7 +109,45 @@ The same executable serves interactive debugging and service installation; the W
 Darling\PerformanceMonitor.Darling.Service\bin\Release\net10.0\PerformanceMonitor.Darling.Service.exe
 ```
 
-Watch the log output: you should see the config load (`Loaded configuration from ...`), the store migrate (`Postgres store ready (schema v34, ...)`), the TimescaleDB detection result, per-server connects, and then per-collector run lines with row counts.
+Watch the log output: you should see the config load (`Loaded configuration from ...`), the store migrate (`Postgres store ready (schema v44, ...)` — the number is whatever the current migration count is), the TimescaleDB detection result, per-server connects, and then per-collector run lines with row counts.
+
+### Run on Linux (Docker Compose or systemd) {#1804}
+
+The service is cross-platform .NET; only the **bundled zero-admin store** and DPAPI are Windows-specific. On Linux you pair the service with the official TimescaleDB image (compose, the recommended shape) or point it at PostgreSQL you already run (systemd), keeping `postgres.managed = false` either way. The Viewer stays a Windows desktop app — Linux hosts read the **web dashboard**, which the container exposes.
+
+**Compose (the whole stack as one deployment)** — everything lives in [`Darling/compose/`](compose/):
+
+```bash
+cd Darling/compose
+cp darling.sample.json darling.json        # edit: servers, alerting, tokens
+#   one secret per file — see secrets/README.md for the exact list
+docker compose up -d
+```
+
+Web dashboard on `http://<host>:5153` behind its token, MCP (if enabled) on `:5152` behind its bearer token. The port mappings are the exposure boundary: the container-aware bind gate honors `web.network`/`mcp.network` under `managed = false` **inside a container only**, and the tokens are still mandatory. Three rules worth knowing before they bite:
+
+- **Nothing secret goes in darling.json.** Every secret slot — the whole `postgres.connectionString`, server `password`s, `smtp.password`, the tokens — takes an `env:NAME` or `file:/run/secrets/<name>` reference. The compose file mounts each secret from `secrets/`.
+- **Start with a fresh store volume per deployment.** The control plane is store-authoritative after the first seed, so a reused volume's enable toggles override darling.json — by design.
+- **File permissions are yours on Linux.** The Windows build locks config/credentials down with ACLs; here the container boundary is the isolation, and the `secrets/` directory should be `chmod 700` with `600` files (the systemd shape should do the same for `darling.json` itself).
+
+**systemd + bring-your-own PostgreSQL** — download `PerformanceMonitorDarling-linux-x64-*.tar.gz` from the release, extract to `/opt/darling`, point `DARLING_CONFIG` at your config (connection string to your own PostgreSQL 15+ with TimescaleDB; the service degrades gracefully without TimescaleDB), and run `dotnet PerformanceMonitor.Darling.Service.dll` under a unit like:
+
+```ini
+[Unit]
+Description=PerformanceMonitor Darling
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/dotnet /opt/darling/PerformanceMonitor.Darling.Service.dll
+Environment=DARLING_CONFIG=/etc/darling/darling.json
+User=darling
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Use the same `env:`/`file:` secret references (systemd `LoadCredential=` pairs naturally with `file:`), and note `Microsoft.Data.SqlClient` needs `libgssapi-krb5-2` installed (`apt-get install libgssapi-krb5-2`) — the container image carries it already.
 
 ### Install as a Windows Service
 
@@ -133,9 +173,50 @@ Also register the service's Windows event source once, from the same elevated sh
 powershell -NoProfile -Command "New-EventLog -LogName Application -Source 'PerformanceMonitor Darling' -ErrorAction SilentlyContinue"
 ```
 
-The `obj=` clause runs the service under a **virtual service account** (`NT SERVICE\<service name>` — password-less, per-service SID, unprivileged; the same convention SQL Server itself uses). That is the right account for SQL-auth monitoring, and with `postgres.managed = true` it is more than a preference: PostgreSQL refuses to execute with administrative privileges, so don't run the service as LocalSystem — a least-privilege account keeps the bundled store's initdb/start path on ground PostgreSQL supports. For integrated auth to monitored servers, set a domain account (or gMSA) holding the SQL-side grants below instead, via **Services.msc → Log On** or `sc config ... obj=`. Note the space after `binPath=`, `start=`, and `obj=` — `sc` requires it.
+The `obj=` clause runs the service under a **virtual service account** (`NT SERVICE\<service name>` — password-less, per-service SID, unprivileged; the same convention SQL Server itself uses). That is the right account for SQL-auth monitoring, and with `postgres.managed = true` it is more than a preference: PostgreSQL refuses to execute with administrative privileges, so don't run the service as LocalSystem — a least-privilege account keeps the bundled store's initdb/start path on ground PostgreSQL supports. For integrated auth to monitored servers, [run the service as a domain account or gMSA](#run-the-service-as-a-domain-account-or-gmsa) instead. Note the space after `binPath=`, `start=`, and `obj=` — `sc` requires it.
 
 One managed-mode handoff gotcha: if you test-drove the service from a console first, the bundled store's data directory belongs to *your* account, and the service account may not be able to write it. Point the service at a fresh `postgres.dataDirectory` (or delete the test directory) rather than fighting ACLs.
+
+#### Run the service as a domain account or gMSA
+
+With `"auth": "integrated"`, the monitoring identity **is** the service's Log On account — nothing in `darling.json` names a Windows account, and there is no separate credential to set. The default virtual account carries only the *machine* identity onto the network (remote servers see `DOMAIN\<collector-machine>$`), so for integrated auth against remote servers you almost always want a real AD service account or, better, a gMSA. Switching is a Windows-side change plus a SQL-side grant, with one file-permission step in the middle that bites everyone who skips it:
+
+1. **Change the Log On account.** Stop the service, then **Services.msc → PerformanceMonitor Darling → Log On → This account** — that route also grants the account the *Log on as a service* right automatically. Or from an elevated prompt (with `sc config` you grant *Log on as a service* yourself, via secpol.msc or GPO):
+
+   ```
+   sc config "PerformanceMonitor Darling" obj= "DOMAIN\svc-account" password= "ThePassword"
+   ```
+
+   A gMSA works the same way with an empty password: `obj= "DOMAIN\gmsa-name$" password= ""`. Keep the account **out of the local Administrators group**: with `postgres.managed = true` the bundled PostgreSQL refuses to run with administrative privileges, exactly as it refuses LocalSystem.
+
+2. **Grant the account on every monitored server** — a Windows login holding the same [permissions below](#permissions-on-monitored-servers) (the `GRANT`s there apply to a Windows login unchanged):
+
+   ```sql
+   USE [master];
+   CREATE LOGIN [DOMAIN\svc-account] FROM WINDOWS;
+   ```
+
+3. **Re-grant the service's own files — the step people miss.** The service deliberately locks its files down to SYSTEM, Administrators, and the account it was *running as*; the new account is on none of those ACLs, and the service will fail to read its config or write its store. One-time, from an elevated prompt, before starting the service:
+
+   ```
+   icacls "C:\ProgramData\PerformanceMonitorDarling" /grant "DOMAIN\svc-account:(OI)(CI)F"
+   icacls "C:\PerformanceMonitorDarling\darling.json" /grant "DOMAIN\svc-account:F"
+   ```
+
+   Adjust the second path to wherever `darling.json` sits beside the service exe; the first covers the logs and, in managed mode, the store's data directory. On its next start the service re-asserts the tight ACL itself — now including the new account — so this does not need repeating.
+
+   In managed-store mode there is one more, and it needs **ownership**, not a grant: the store's superuser credential `pg-credential.dpapi` (beside the data directory, under `C:\ProgramData\PerformanceMonitorDarling` by default) is trusted only when *owned* by SYSTEM, Administrators, or the service account — an anti-pre-plant check — and `icacls /grant` changes permissions, never ownership, so after the switch the file is still owned by the *previous* service account and the service refuses it. Hand ownership to Administrators (trusted across any future account change, which is why not the new account itself) and grant the new account on the file directly — its ACL is protected and does **not** inherit the folder grant above:
+
+   ```
+   takeown /f "C:\ProgramData\PerformanceMonitorDarling\pg-credential.dpapi" /a
+   icacls "C:\ProgramData\PerformanceMonitorDarling\pg-credential.dpapi" /grant "DOMAIN\svc-account:F"
+   ```
+
+   The sibling role credentials (the admin/viewer/mcp `.dpapi` files) hit the same ownership check but self-heal — a role password can be re-asserted, a superuser's cannot — so expect one-time `discarding and regenerating` warnings on the first start, not faults.
+
+4. **Start the service and verify from its log** (`%ProgramData%\PerformanceMonitorDarling\logs`): the per-server connect lines are the proof that the *service account's* grants work. `--test-connection` from your console runs as you, not the service account — see the [pre-flight note above](#validate-the-config-pre-flight).
+
+Nothing else moves: anything encrypted with `--encrypt-password` (SQL-auth server passwords, SMTP) survives the account change, because those blobs are DPAPI **machine**-scope, not account-scope — and collected data is untouched. Later `install-darling.ps1` upgrades preserve a custom Log On account and harden `darling.json` for the account the service actually runs as.
 
 ### What the Service Does on Monitored Servers
 
@@ -152,33 +233,28 @@ Every failure in steps 2–3 is tolerated and logged: the deadlock/blocked-proce
 
 ### Permissions on Monitored Servers
 
-```sql
-USE [master];
-CREATE LOGIN [DarlingMonitor] WITH PASSWORD = N'YourStrongPassword';
-GRANT VIEW SERVER STATE TO [DarlingMonitor];
-GRANT ALTER ANY EVENT SESSION TO [DarlingMonitor];
+Darling needs the **same target-server grants as Lite**, so the copy-paste block lives in one place for both: **[Permissions in the root README](../README.md#lite--darling-on-premises)** — `VIEW SERVER STATE`, `CONNECT ANY DATABASE`, `VIEW ANY DEFINITION`, `ALTER ANY EVENT SESSION`, and the optional `ALTER TRACE`, `ALTER SETTINGS`, and msdb job-table grants, verified live against SQL Server 2025 with a scratch login carrying exactly them ([#1823](https://github.com/erikdarlingdata/PerformanceMonitor/issues/1823)). That block is authoritative; this section is the Darling-specific reading of it. Keeping one list instead of two is deliberate — a second copy is how the old one went stale.
 
--- Only if the instance hosts Availability Groups (see the table below)
-GRANT VIEW ANY DEFINITION TO [DarlingMonitor];
+**The one Darling-specific line:** for `"auth": "integrated"` the grants go to the Windows account **the service runs as**, so use `CREATE LOGIN [DOMAIN\svc-account] FROM WINDOWS;` in place of the block's `CREATE LOGIN ... WITH PASSWORD`. Everything after it is unchanged. See [Run the service as a domain account or gMSA](#run-the-service-as-a-domain-account-or-gmsa) for which account that actually is — it is not the one you ran `--test-connection` as.
 
--- Optional: SQL Agent job monitoring + failed-job alerts
-USE [msdb];
-CREATE USER [DarlingMonitor] FOR LOGIN [DarlingMonitor];
-ALTER ROLE [SQLAgentReaderRole] ADD MEMBER [DarlingMonitor];
-```
+What each grant buys you, and what breaks without it:
 
 | Grant | Why | If missing |
 |---|---|---|
 | `VIEW SERVER STATE` | All DMV collectors (wait stats, query stats, memory, CPU, file I/O, sessions, etc.) and the connect probe | Collection fails — this one is required |
 | `ALTER ANY EVENT SESSION` | Create/start the two XE sessions | Logged; deadlock and blocked-process collectors read zero rows (an admin can pre-create the sessions instead) |
+| `CONNECT ANY DATABASE` | The per-database collectors (`database_scoped_config`, `index_object_stats`, `database_size_stats`, `query_store_stats`) enter each database via `EXECUTE [db].sys.sp_executesql` | Databases the login cannot enter are skipped; without the grant that is every user database |
+| `VIEW ANY DEFINITION` | Catalog-view row visibility everywhere: `sys.tables` / `sys.indexes` / `sys.objects` for the index and object collectors, `sys.dm_db_partition_stats`, and the AG catalog views (`sys.availability_groups`, `sys.availability_replicas`) | **Silently zero rows** — catalog views hide rows rather than erroring, so missing objects look exactly like empty databases, and a real AG cluster looks identical to a server with no AGs |
 | `ALTER SETTINGS` | The `sp_configure` blocked-process-threshold bootstrap | Logged; set the threshold yourself (or via RDS Parameter Group) |
-| `SQLAgentReaderRole` on msdb | `running_jobs` collector and the failed/long-running-job alerts | Skipped gracefully — logged as a permissions skip, alerts return no jobs |
+| `ALTER TRACE` | The `default_trace_events` collector — `sys.traces` / `fn_trace_gettable` accept nothing less | `PERMISSIONS` skip in collection health; the default-trace tab stays empty |
+| msdb job-table `SELECT`s + `agent_datetime` `EXECUTE` | `running_jobs` / `job_history` / `agent_status` collectors and the failed/long-running-job alerts — all direct table reads; `SQLAgentReaderRole` alone leaves every one failing with error 229 | Skipped gracefully — logged as a permissions skip, alerts return no jobs |
 | `DBCC TRACESTATUS` permission | `trace_flags` snapshot | Degrades to zero rows with a warning |
-| `VIEW ANY DEFINITION` | The AG catalog views (`sys.availability_groups`, `sys.availability_replicas`) the `ag_replica_states` / `ag_database_replica_states` collectors join to the `sys.dm_hadr_*` DMVs | **Silently zero rows** — catalog views hide rows rather than erroring, so a real AG cluster looks identical to a server with no AGs. Not needed on an instance without Availability Groups |
 
-**Azure SQL Database:** connect to the one database you monitor (set the server entry's `"database"`), using a contained user with `VIEW DATABASE STATE`, matching the product's existing Azure guidance. The XE sessions are created database-scoped there (`ALTER ANY DATABASE EVENT SESSION`); SQL Agent collectors are skipped automatically.
+The msdb grants live inside a system database SQL Server setup can rewrite — re-check them after a CU or version upgrade.
 
-Collectors that hit a permission error (SQL errors 229/297/300) log a `PERMISSIONS` row in `collection_log` and retry on their next scheduled run — one denied collector never stops the rest.
+**Azure SQL Database:** connect to the one database you monitor (set the server entry's `"database"`), using a contained user with `VIEW DATABASE STATE` and `VIEW DEFINITION`, matching the product's existing Azure guidance. The XE sessions are created database-scoped there (`ALTER ANY DATABASE EVENT SESSION`); SQL Agent collectors are skipped automatically.
+
+Collectors that hit a permission error (SQL errors 229/297/300, plus 8189 from `sys.traces`) log a `PERMISSIONS` row in `collection_log` and retry on their next scheduled run — one denied collector never stops the rest.
 
 #### Which collectors run on which platform
 
@@ -196,7 +272,7 @@ Notes:
 
 - **Azure SQL DB** is the most restricted target: the six `!IsAzureSqlDb` collectors read server-scoped DMVs or on-disk artifacts that do not exist there, and the SQL Agent collectors have no Agent to read. Nothing about that is a permission problem, so it is not reported as one.
 - **AWS RDS** blocks direct `msdb` job reads specifically; the rest of the SQL Agent surface is unaffected.
-- **`HasMsdbAccess`** is probed per server at connect (`HAS_DBACCESS('msdb')`), so losing the `SQLAgentReaderRole` grant later moves those collectors from running to skipped without an error storm.
+- **`HasMsdbAccess`** is probed per server at connect and is exactly `HAS_DBACCESS('msdb')` — *any* access to msdb, not a specific role or table grant. Losing msdb access later moves those collectors from running to skipped without an error storm. A login that can enter msdb but lacks `SELECT` on the job tables passes this probe and is caught one layer down as a `PERMISSIONS` skip instead.
 - An unknown version (`SqlMajorVersion == 0`, i.e. detection has not completed yet) is treated as capable rather than skipped, so a collector is never silently dropped because a probe was slow.
 
 If a tab or column is empty and you expect data, check **Collection Health**: a collector skipped for platform reasons shows no runs at all, whereas one denied by permissions logs `PERMISSIONS` and is classified `NO_PERMISSIONS`. Those are different problems with different fixes — the first is expected on that platform, the second is a grant to add from the table above.
@@ -217,7 +293,7 @@ Two mutually exclusive modes — setting both `managed: true` and `connectionStr
 | `port` | `5641` | Managed mode only: the loopback port the bundled server listens on. Deliberately uncommon so it coexists with any PostgreSQL (5432) already on the machine. |
 | `dataDirectory` | *(null)* | Managed mode only: the cluster's data directory. `null` means `%ProgramData%\PerformanceMonitorDarling\pg`. |
 | `connectAs` | `"admin"` | Managed mode only: which least-privilege role the Viewer connects as — `"admin"` (reads everything + manages mute rules and dismisses alerts) or `"viewer"` (read-only; those write actions are hidden/disabled). See [Security & Least-Privilege Roles](#security--least-privilege-roles). Ignored in bring-your-own mode (the connection string picks the role). |
-| `connectionString` | *(required unless managed)* | Npgsql connection string for a store you provision yourself, e.g. `Host=localhost;Port=5432;Username=darling;Password=...;Database=darling` |
+| `connectionString` | *(required unless managed)* | Npgsql connection string for a store you provision yourself, e.g. `Host=localhost;Port=5432;Username=darling;Password=...;Database=darling`. You own that cluster's settings: if it has TimescaleDB, size its [background workers](#background-workers-sizing-an-unmanaged-store-and-what-happens-if-you-dont) — managed mode does this for you, this mode does not. |
 
 ### servers (array, at least one entry)
 
@@ -229,7 +305,7 @@ Two mutually exclusive modes — setting both `managed: true` and `connectionStr
 | `auth` | `"integrated"` | `"integrated"` or `"sql"` |
 | `username` | *(none)* | Required for `"sql"` |
 | `encryptedPassword` | *(none)* | DPAPI blob from `--encrypt-password` (preferred) |
-| `password` | *(none)* | Plaintext fallback — dev only, warned on every use |
+| `password` | *(none)* | A literal (dev only, warned on every use) or an `env:NAME` / `file:/path` reference (#1804) — references are the supported non-Windows shape and are not warned |
 | `readOnlyIntent` | `false` | Route to a readable AG secondary (`ApplicationIntent=ReadOnly`) |
 | `trustServerCertificate` | `false` | |
 | `encryptMode` | `"Mandatory"` | `Mandatory` / `Strict` / `Optional`; unknown values fail closed to `Mandatory` |
@@ -260,6 +336,7 @@ The shared alert engine's switches and thresholds. Every default mirrors Lite's 
 | `cpuMode` | `"total"` | `"total"` = SQL + other processes; `"sql"` = SQL process only |
 | `blockingEnabled` | `true` | |
 | `blockingCountThreshold` | `1` | Blocked-process count (rolling window) that trips the alert |
+| `blockingWaitSecondsThreshold` | `0` | Total blocked wait, in seconds, summed across the latest blocking snapshot; `0` = off. A second gate beside the count one, because a count cannot tell one session blocked for an hour from one blocked for a second. Reports as its own "Blocking Wait Time" alert, and unlike the count gate it is level-triggered: it re-fires every cooldown while the wait stays above the threshold and clears when it drops below |
 | `deadlockEnabled` | `true` | |
 | `deadlockCountThreshold` | `1` | Deadlock count (rolling window) that trips the alert |
 | `poisonWaitEnabled` | `true` | THREADPOOL / RESOURCE_SEMAPHORE / RESOURCE_SEMAPHORE_QUERY_COMPILE |
@@ -291,6 +368,7 @@ Email delivery is enabled when `host`, `from`, and `to` are all set — there is
 | `useSsl` | `true` | |
 | `username` | *(none)* | For authenticated relays |
 | `encryptedPassword` | *(none)* | Same `--encrypt-password` DPAPI pattern as SQL auth |
+| `password` | *(none)* | A literal or an `env:NAME` / `file:/path` reference (#1804) — the non-Windows email path |
 | `from` | `""` | |
 | `to` | `""` | Comma-separated recipients |
 | `emailCooldownMinutes` | `15` | Email/webhook channel cooldown (clamped 1–120) |
@@ -354,11 +432,11 @@ The embedded MCP server, over Streamable HTTP bound to `localhost` by default (s
   - *Author* — `validate_custom_view` (dry-run a definition against the catalog + composer rules, no save), `create_custom_view` (validate then save), `update_custom_view` (validate then replace in place, optimistic-concurrency on `version`), `delete_custom_view`.
   - *Self-test* — `run_custom_view_panel` (compile + run a single composed panel and return `{sql, rows, annotations}` — the composer's live preview, for checking a generated panel's data before saving).
 
-  The create/update/delete tools are the one view-authoring **write** surface; create/update run the SAME `ValidateDefinition` authority as `validate_custom_view`, so an invalid definition is rejected before it stores; every tool routes through the SAME store + validator + compile-and-run + catalog the web viewer's editor uses (no divergent second implementation). This write surface widens what an MCP token can do — see [Blast radius](#opt-in-network-endpoints-lan) below.
+  The create/update/delete tools are the one view-authoring **write** surface; create/update run the SAME `ValidateDefinition` authority as `validate_custom_view`, so an invalid definition is rejected before it stores; every tool routes through the SAME store + validator + compile-and-run + catalog the web viewer's editor uses (no divergent second implementation). This write surface is part of what the MCP token gates — see [What a token can reach](#opt-in-network-endpoints-lan) below.
 
-- **Three alert-tuning write tools (Darling-only)** — `update_alert_settings`, `create_mute_rule`, and `delete_mute_rule` let an MCP client TUNE the alert engine the fleet shares — the SAME config `get_alert_settings` / `get_mute_rules` read and the Viewer's Settings window writes. `update_alert_settings` is a PARTIAL update of the single global settings row: read via `get_alert_settings`, change fields, and send only those back in the same nested shape; every field is validated against the SAME ranges/enums the Settings window enforces BEFORE any write, an out-of-range or unknown field returns `{status:"invalid"}` and writes nothing, and the write self-bumps `config_version` so the running service hot-reloads within one collection sweep. `create_mute_rule` / `delete_mute_rule` reuse the SAME `PgMuteRuleStore` `get_mute_rules` reads through (and the same GUID id-generation the Viewer's mute-create path uses). None touches a monitored SQL Server or the collected data — only the shared alert configuration; SMTP/webhook delivery credentials are out of scope (the `mcp` role cannot read or write the secret columns). This widens what an MCP token can do — see [Blast radius](#opt-in-network-endpoints-lan) below.
+- **Three alert-tuning write tools (Darling-only)** — `update_alert_settings`, `create_mute_rule`, and `delete_mute_rule` let an MCP client TUNE the alert engine the fleet shares — the SAME config `get_alert_settings` / `get_mute_rules` read and the Viewer's Settings window writes. `update_alert_settings` is a PARTIAL update of the single global settings row: read via `get_alert_settings`, change fields, and send only those back in the same nested shape; every field is validated against the SAME ranges/enums the Settings window enforces BEFORE any write, an out-of-range or unknown field returns `{status:"invalid"}` and writes nothing, and the write self-bumps `config_version` so the running service hot-reloads within one collection sweep. `create_mute_rule` / `delete_mute_rule` reuse the SAME `PgMuteRuleStore` `get_mute_rules` reads through (and the same GUID id-generation the Viewer's mute-create path uses). None touches a monitored SQL Server or the collected data — only the shared alert configuration; SMTP/webhook delivery credentials are out of scope (the `mcp` role cannot read or write the secret columns). It is part of what the MCP token gates — see [What a token can reach](#opt-in-network-endpoints-lan) below.
 
-- **Two server-onboarding write tools (Darling-only)** — `add_servers` (BULK) and `remove_server` let an MCP client stand up or tear down FLEET monitoring conversationally ("monitor these twenty servers with this login"), the service-side twin of the Viewer's Add / Manage Servers dialogs. `add_servers` takes a JSON **array** of server objects (`host` required; optional `display_name` / `database` / `read_only_intent` / `multi_subnet_failover`; `auth` `Windows`/`SQL` with `username`+`password` for SQL; and the exposed TLS options `encrypt_mode` `Optional`/`Mandatory`/`Strict` + `trust_server_certificate`) and processes them **in order**: it validates each entry, PROBES the connection in-process (reusing the same `DarlingServerConnector.ProbeAsync` the `--test-connection` verb runs — the service holds the network path + credentials, so no `test_connect` command plane is needed), skips a case-folded duplicate (`duplicate`) of an already-monitored server or an earlier entry, DPAPI-encrypts the SQL password (the service identity, so it round-trips at collection time), and INSERTs the row mirroring the service's own seed shape. A server that fails to connect is `connection_failed` and the batch continues; Entra/MFA/Service-Principal/Managed-Identity auth is `invalid` (the service connects with Windows or SQL only). `remove_server` DELETEs a monitored server by name (resolved the same way every `server_name` is) — already-collected history is kept. Both write only the monitoring store's `config.config_monitored_servers` registry; neither runs anything on a monitored server beyond the one-time probe. **The SQL password travels to the endpoint inside `add_servers`' request** and is DPAPI-encrypted at rest (never returned) — this widens what an MCP token can do and puts a credential on the wire; see [Blast radius](#opt-in-network-endpoints-lan) below.
+- **Two server-onboarding write tools (Darling-only)** — `add_servers` (BULK) and `remove_server` let an MCP client stand up or tear down FLEET monitoring conversationally ("monitor these twenty servers with this login"), the service-side twin of the Viewer's Add / Manage Servers dialogs. `add_servers` takes a JSON **array** of server objects (`host` required; optional `display_name` / `database` / `read_only_intent` / `multi_subnet_failover`; `auth` `Windows`/`SQL` with `username`+`password` for SQL; and the exposed TLS options `encrypt_mode` `Optional`/`Mandatory`/`Strict` + `trust_server_certificate`) and processes them **in order**: it validates each entry, PROBES the connection in-process (reusing the same `DarlingServerConnector.ProbeAsync` the `--test-connection` verb runs — the service holds the network path + credentials, so no `test_connect` command plane is needed), skips a case-folded duplicate (`duplicate`) of an already-monitored server or an earlier entry, DPAPI-encrypts the SQL password (the service identity, so it round-trips at collection time), and INSERTs the row mirroring the service's own seed shape. A server that fails to connect is `connection_failed` and the batch continues; Entra/MFA/Service-Principal/Managed-Identity auth is `invalid` (the service connects with Windows or SQL only). `remove_server` DELETEs a monitored server by name (resolved the same way every `server_name` is) — already-collected history is kept. Both write only the monitoring store's `config.config_monitored_servers` registry; neither runs anything on a monitored server beyond the one-time probe. **The SQL password travels to the endpoint inside `add_servers`' request** and is DPAPI-encrypted at rest (never returned) — it is part of what the MCP token gates, and it puts a credential on the wire; see [What a token can reach](#opt-in-network-endpoints-lan) below.
 
 | Key | Default | Notes |
 |---|---|---|
@@ -430,6 +508,8 @@ The service migrates the store itself at startup — plain versioned SQL scripts
 | **V28** — Query Store replica role | `query_store_stats.replica_role` (SQL Server 2022+ AG secondary-replica attribution, #1546) and a refreshed `v_query_store_stats` |
 | **V29** — long-query completions collector | `collect.long_query_completions` + its index — the opt-in long-running-query completion trace's store table (#1496) |
 | **V30** — web dashboard config | `config_service.web_enabled` + `web_port` — the read-only web dashboard's live enable/port toggle, the twin of `mcp_enabled`/`mcp_port` (#1562) |
+| **V46** — automatic plan correction | `collect.plan_correction` + its index — the #1952 collector's store table (FORCE_LAST_GOOD_PLAN enablement plus the engine's live recommendation set). Additive and view-less, so a fresh store gets it from V1's generated schema and V46 is what an already-existing store gets |
+| **V47** — ADR persistent version store | `collect.pvs_stats` + its index + the `v_pvs_stats` passthrough view — the #1951 ADR version-store collector's store table. A fresh store gets the table from V1's generated schema; V47 is what an already-existing store gets, and the view is what keeps the Darling viewer's FinOps read byte-identical to Lite's |
 
 All timestamps in the store are **naive-UTC** `timestamp` columns — the product-wide cross-store contract (Lite's DuckDB does the same).
 
@@ -442,6 +522,42 @@ At startup, right after migration, the service attempts `CREATE EXTENSION IF NOT
 
 `IF NOT EXISTS` short-circuits before privilege checks, so a store whose administrator pre-created the extension works for a service login that could never create it.
 
+### Background workers: sizing an unmanaged store, and what happens if you don't
+
+**This section is for bring-your-own PostgreSQL only.** In managed mode the service sizes these itself on every start and there is nothing to do.
+
+Every TimescaleDB policy — compression, retention, continuous-aggregate refresh — runs in a **background worker**, and a policy that cannot get a worker does not run. PostgreSQL's stock `max_worker_processes = 8` is far below what this store needs, so an unmanaged store left at the defaults silently does very little compressing.
+
+Managed mode derives the two settings from the live hypertable count, and an unmanaged store wants the same numbers:
+
+```
+timescaledb.max_background_workers = <hypertables> + 2
+max_worker_processes               = 3 + timescaledb.max_background_workers + 8
+```
+
+Today that is **41** and **52** for 39 hypertables (the 38 collector tables plus `collection_log`). The `+ 2` is not slack — it is exactly TimescaleDB's own two built-in jobs, `policy_telemetry` and `policy_job_stat_history_retention`, so a fully migrated store holds precisely one job per worker:
+
+```sql
+SELECT proc_name, count(*) FROM timescaledb_information.jobs GROUP BY proc_name;
+```
+
+Both settings need a **server restart** (`max_worker_processes` is restart-only — a reload leaves the old value serving), and the hypertable count grows as collectors are added, so re-check it after a major upgrade rather than pinning 41/52 forever.
+
+**One store per cluster is the assumption.** `timescaledb.max_background_workers` is a **cluster-wide** pool shared by every database, while the derivation above is **per-store**. Managed mode puts one store on one cluster so the two coincide, but if you run **N Darling stores on one PostgreSQL cluster** — or share the cluster with any other TimescaleDB database — multiply both numbers by N. Each database with the extension loaded also permanently holds a scheduler slot out of that same pool, so the sharing starts before any policy fires.
+
+**What under-provisioning looks like.** The postmaster log (`pg.log`, or wherever your cluster logs) is where it shows up, in one of two shapes:
+
+```
+WARNING:  failed to launch job 1042 "Columnstore Policy [1042]": out of background workers
+WARNING:  ... failed to start a background worker
+```
+
+The first means TimescaleDB's own pool is full; the second means PostgreSQL's is. Neither is fatal and neither corrupts anything — the job is skipped and retried on its next schedule, so **light contention is benign** and you may see a couple of these without any consequence. It matters at scale: when the shortfall is persistent rather than momentary, compression falls behind the 1-day policy and the store grows at its uncompressed rate (measured compression is ~16.7x on perfmon and ~6.4x on the plan-XML-heavy `query_stats`, so the gap is large), retention stops reclaiming chunks, and the jobs that keep losing the race are the ones whose backlog is worst. `timescaledb_information.job_stats` is the check that settles it — a healthy store shows successes with no failures:
+
+```sql
+SELECT sum(total_runs), sum(total_successes), sum(total_failures) FROM timescaledb_information.job_stats;
+```
+
 ### Retention
 
 A purge runs on the first sweep after startup and then daily, driven by the same shared per-collector horizons Lite uses:
@@ -450,10 +566,26 @@ A purge runs on the first sweep after startup and then daily, driven by the same
 |---|---|
 | 7 days | `query_snapshots`, `waiting_tasks`, `running_jobs` |
 | 30 days | Most collector tables (wait/query/procedure/Query Store stats, CPU, memory, file I/O, tempdb, perfmon, deadlocks, blocking, sessions, config snapshots), plus `collection_log` and `analysis_findings` |
-| 90 days | `database_size_stats`, `index_object_stats` |
+| 90 days | `database_size_stats`, `index_object_stats`, `pvs_stats` |
 | 365 days | `server_properties` |
 
 On plain PostgreSQL the purge is DELETE-based. With TimescaleDB it switches to `drop_chunks` — a metadata-only detach of whole expired chunks (rows inside a partially-expired chunk survive until the whole chunk ages out; up to ~1 day of grace at the 1-day chunk width), with a per-table DELETE fallback for any table that is not a hypertable. Failure-isolated per table: one stuck purge is logged and retried the next day without stopping the sweep.
+
+#### The rollup tiers, on a TimescaleDB store
+
+The table above is the **collector** horizon, and for three tables it is not the binding one. `query_stats`, `procedure_stats` and `query_store_stats` are rolled up into hourly and daily continuous aggregates, and a separate tiered policy drops their raw chunks at **4 days** — the aggregates hold the history past that point, and a read is routed to whichever tier covers the window it asks for. On a store without TimescaleDB none of this exists and the collector horizons above are the whole story.
+
+| Tier | Horizon |
+|---|---|
+| Raw `query_stats`, `procedure_stats`, `query_store_stats` | 4 days |
+| Hourly **history** rollups | 90 days |
+| Daily **history** rollups | kept indefinitely (no policy) |
+| Baseline aggregates | 35 days |
+| `query_store_stats_interval_hourly`, `query_store_stats_interval_daily` | 7 days, 10 days |
+
+Every one of these is visible in `timescaledb_information.jobs`, and the last row is the one worth knowing before you look: those two are **internal dedup plumbing, not history**. The corrected Query Store rollups are built from them, nothing reads them directly, and each horizon is sized only to outlive whatever gates on it — 7 days has to exceed raw's 4, and the 10-day layer has to outlive the 7-day one it consumes. So a horizon SHORTER than the tier above it is correct there and costs no history, which is the opposite of how it reads at a glance. The service's startup summary line names all of these for the same reason.
+
+No raw tier is ever dropped before the aggregate that preserves it has caught up: each policy is created paused, and arms itself only once its rollup demonstrably covers what the tier below holds.
 
 ### Logs
 
@@ -463,7 +595,9 @@ Warnings and errors also go to the **Windows Application event log** (source `Pe
 
 ### The Viewer
 
-`PerformanceMonitor.Darling.Viewer.exe` is a WPF app that talks **only to the PostgreSQL store** — it never connects to your monitored SQL Servers. It reads the same `darling.json` the service uses, but only the `postgres` section, resolved in the same order (explicit path, then `DARLING_CONFIG`, then `darling.json` next to the binary) plus one viewer-only fallback: the parent directory, so the release zip's layout — viewer in a `viewer\` subfolder, `darling.json` beside the service exe — works with no setup. A viewer seat on another machine needs only a minimal `darling.json` containing the `postgres.connectionString`. If the file is missing it shows a hint instead of crashing.
+`PerformanceMonitor.Darling.Viewer.exe` is a WPF app that talks **only to the PostgreSQL store** — it never connects to your monitored SQL Servers. It reads the same `darling.json` the service uses, but only the `postgres` section, resolved in the same order (explicit path, then `DARLING_CONFIG`, then `darling.json` next to the binary) plus one viewer-only fallback: the parent directory, so the release zip's layout — viewer in a `viewer\` subfolder, `darling.json` beside the service exe — works with no setup. A viewer seat on **another machine** is set up by exporting that config folder from the service host — see [Connect a Remote Viewer](#connect-a-remote-viewer). If the file is missing it shows a hint instead of crashing.
+
+At startup the viewer writes **which of those rules won**, the absolute path it produced, and whether that file exists to `%APPDATA%\PerformanceMonitorDarling\logs\darling-viewer_yyyyMMdd.log` — before it tries to read the file, so a missing or malformed one still says where it looked. Once the file loads it adds a non-secret summary of what it parsed (host, port, username, database, SSL mode, search path, whether the connection string was read verbatim or derived from `postgres.managed`, and the certificate — the value as written, the absolute path it resolves to, the folder a relative one was anchored to, and whether that file exists). Credentials are never written. The same block appears in the connection-failure window with a **Copy details** button — see [Troubleshooting](#troubleshooting).
 
 The layout mirrors the Lite desktop app: a left sidebar lists the servers from the `servers` registry the service maintains, and the top tab strip holds three fixed **aggregate tabs** — Overview, Recommendations, and Alerts — alongside a closable **per-server tab** for each server you open. Overview (the all-servers server-cards grid) and Alerts (the all-servers alert history) span every server; Recommendations has its own server selector, independent of the sidebar. **Double-click a server** in the sidebar — or **double-click its Overview card** — to open (or focus) its tab, and close it with the × on the tab header; an empty-state panel is shown until the store has at least one server.
 
@@ -512,6 +646,87 @@ A monitored server that is down is retried every 60 seconds forever; a collector
 
 ---
 
+## Connect a Remote Viewer
+
+For the person sitting at a machine with **nothing installed on it**, whose only goal is looking at a Darling service that already runs somewhere else. Three steps, nothing to hand-edit.
+
+**The one service-side prerequisite.** The store has to be reachable from your LAN — a `postgres.network` block on the service host, which the `--configure-network` wizard writes for you. A store still on its loopback default accepts no remote viewer at all, and no amount of viewer-side configuration changes that. See [Store endpoint (viewer over the LAN)](#store-endpoint-viewer-over-the-lan) for that side; everything below assumes it is done.
+
+### 1. Export the handoff folder (on the service host)
+
+```
+PerformanceMonitor.Darling.Service.exe --export-viewer-config
+```
+
+It writes the viewer machine's **whole configuration folder** — connection string resolved, certificate copied, every field documented in place:
+
+```
+viewer-config\darling.json    the complete viewer config: the resolved connection string and
+                              "managed": false already set, every field explained in comments
+                              IN the file
+viewer-config\server.crt      the store's TLS certificate, the file the connection pins
+viewer-config\README.txt      the same field reference in plain text, including the valid
+                              "Root Certificate=" values and the one-line install instruction
+```
+
+The folder lands beside the service's own `darling.json` by default. Pass a directory to put it elsewhere (`--export-viewer-config D:\handoff`), and `--config <path>` if `darling.json` is not where the service would resolve it.
+
+**The exported `darling.json` contains a live database password** — that is what the viewer authenticates with. The verb says so before it writes, ACLs the file to SYSTEM + Administrators + the account running it + INTERACTIVE (the Viewer reads it interactively, the same posture as the admin/viewer credentials), and confirms the ACL took: if the secret is still readable by ordinary users it says so and exits non-zero. Copy the folder over a channel you trust and keep it ACL'd on the viewer machine.
+
+The verb refuses rather than clobbers: it will not export into the **service's own config directory** (that would overwrite the service's `darling.json` with the viewer's, destroying its servers, encrypted passwords and tokens), will not overwrite a file it did not write, and will not follow a junction or symlink. A destination it cannot use is named in the refusal.
+
+### 2. Copy the folder to the viewer machine
+
+Put the three files **next to `PerformanceMonitor.Darling.Viewer.exe`** — that works with nothing edited. (The Viewer ships in the same release zip as the service, in its `viewer\` subfolder; from source it is `dotnet build Darling/PerformanceMonitor.Darling.Viewer/PerformanceMonitor.Darling.Viewer.csproj -c Release`.)
+
+To keep the folder somewhere else instead, point the `DARLING_CONFIG` environment variable at the exported `darling.json`. That works unedited too: a bare or relative `Root Certificate` resolves against **the folder holding `darling.json`**, so the `server.crt` beside it is found wherever you keep the folder ([#1970](https://github.com/erikdarlingdata/PerformanceMonitor/issues/1970)). Keep the three files together and the folder can live anywhere.
+
+### 3. Start the Viewer
+
+That is the whole setup. Re-run the export after a credential or certificate rotation — the store's certificate regenerates when its bind IP changes — and copy the folder over again; it replaces its own previous output without ceremony.
+
+### If it does not connect
+
+The failure window carries a **Configuration this viewer used** block naming the `darling.json` it actually read, which rule picked it, and the host, port, username, database, SSL mode, search path and certificate path it parsed — with a **Copy details** button, and the same lines in `%APPDATA%\PerformanceMonitorDarling\logs\darling-viewer_yyyyMMdd.log`. Read it before changing anything: it separates *the viewer read a different file than you edited* from *it read your file and a value in it is wrong*. It never contains a password. See [Troubleshooting](#troubleshooting) for the individual failures.
+
+### Manual configuration (fallback)
+
+Only for the case where you want the connection string itself — to paste into a config that already exists, or to check what the viewer will dial. The export above is the supported path; this one is the same values, assembled by hand.
+
+```
+PerformanceMonitor.Darling.Service.exe --print-viewer-connection
+```
+
+It decrypts the `network.role` credential and prints a paste-ready connection string plus the server certificate PEM. Every warning is printed **before** the payload, but the payload is still a **live database password on STDOUT** — redirect it to an ACL'd file or pipe it to the clipboard (`... --print-viewer-connection | clip`); do not leave it in shell scrollback, CI logs, or a screenshare. The minimal viewer `darling.json` it targets is bring-your-own mode with the string pasted in verbatim (the string is consumed as-is), and the emitted PEM saved where `Root Certificate` points:
+
+```json
+{
+  "postgres": {
+    "managed": false,
+    "connectionString": "Host=192.168.1.205;Port=5641;Username=viewer;Password=...;Database=darling;Search Path=collect,config,public;SSL Mode=VerifyFull;Root Certificate=server.crt"
+  }
+}
+```
+
+`"managed": false` is not a typo next to the service's `"managed": true`: the flag says who **owns** the PostgreSQL, not who is connecting. A viewer left on `true` goes looking for a bundled local PostgreSQL that is not there. (The export sets it for you, which is the point.)
+
+**`Root Certificate=` — what the field accepts.** It is a path to the PEM the connection validates the store's certificate against, and under `SSL Mode=VerifyFull` it is what makes the check meaningful. A relative value anchors to **the folder holding the `darling.json` the viewer read**, never the process working directory, so how the Viewer was launched cannot change the answer:
+
+| Value | Resolves to |
+|---|---|
+| `server.crt` | that name in the folder holding `darling.json` — the exported layout, correct wherever the folder lives |
+| `certs\server.crt` | same anchor, one level down |
+| `C:\Darling\server.crt` | an absolute path, used exactly as written, for a certificate kept somewhere else |
+| omitted | nothing viewer-side to pin against: the store's certificate must already chain to a root the machine trusts. A managed store's certificate is **self-signed**, so it never does — omitting the field there fails `VerifyFull` |
+
+**Where the certificate comes from.** In managed mode the service generates `server.crt` / `server.key` **beside the data directory** (`%ProgramData%\PerformanceMonitorDarling\pg\` unless you set `postgres.dataDirectory`), with an IP SAN for the `network.listen` address and a DNS SAN for the machine hostname. It **auto-regenerates if the bind IP changes**, so verify-full keeps working after a `listen` change — and every viewer must then re-copy the new certificate, because an old copy stops matching. To rotate on demand, delete the pair beside the data directory; the service regenerates it on its next start.
+
+**Bring-your-own PostgreSQL.** Darling generates no certificate — your PostgreSQL's TLS is yours to configure — so `Root Certificate` points at the PEM that signed **your** server's certificate (the CA certificate, or the server's own certificate if it is self-signed), exactly the file you would hand `psql` as `sslrootcert`. The same relative-path anchoring applies, so keeping it beside `darling.json` is still the simplest layout.
+
+**Plaintext at rest on the viewer machine.** However you get there, the connection string holds the role password in cleartext in that machine's `darling.json` (there is no client-side secret store yet). That is acceptable for the read-only `viewer` credential on a single-operator, ACL'd profile; if you use `role: "admin"`, treat that file as a secret and NTFS-ACL it to your account. DPAPI-encrypting the viewer's BYO connection string is future hardening, out of scope today.
+
+---
+
 ## Troubleshooting
 
 **"Cannot load configuration"** (critical, service idles) — no `darling.json` was found at the resolved path. The message names the path it tried; copy `darling.sample.json` there or point `DARLING_CONFIG` at your file.
@@ -530,9 +745,11 @@ A monitored server that is down is retried every 60 seconds forever; a collector
 
 **`PERMISSIONS` rows in `collection_log`** — that collector's reads were denied (SQL errors 229/297/300). Check the [permissions](#permissions-on-monitored-servers); the collector retries every cycle and recovers as soon as the grant lands.
 
-**"Skipping recently-failed-job check"** (info) — the login has no msdb / `SQLAgentReaderRole` access, so failed-job alerts are skipped. Expected for minimal-privilege monitoring logins; grant the role if you want job alerts.
+**"Skipping recently-failed-job check"** (info) — the login cannot read `msdb.dbo.sysjobs` / `sysjobhistory`, so failed-job alerts are skipped. Expected for minimal-privilege monitoring logins. If you want job alerts, add the direct msdb table `SELECT`s from the [permissions](#permissions-on-monitored-servers) section — **not** `SQLAgentReaderRole`, which gates the `sp_help_job*` procedures this product never calls and leaves the reads failing with error 229.
 
 **"TimescaleDB setup failed — continuing in plain-PostgreSQL mode"** (warning) — the extension exists but conversion hit a problem. Everything still works (DELETE-based retention, plain tables); conversion is retried on the next service start.
+
+**"out of background workers" / "failed to start a background worker" in the postmaster log, or the store keeps growing despite compression** — bring-your-own stores only: the cluster has fewer worker slots than the store has policies, so compression and retention jobs are being skipped. An occasional one is benign (the job retries on its next schedule); persistent ones mean the store is effectively uncompressed. Size the two settings and restart the server — see [Background workers](#background-workers-sizing-an-unmanaged-store-and-what-happens-if-you-dont), and multiply them if the cluster hosts more than one store. `timescaledb_information.job_stats` tells you whether jobs are actually succeeding.
 
 **"Why are there 40+ postgres.exe processes?"** — the count is three populations, and only one is client connections: (1) PostgreSQL's own system processes (postmaster, checkpointer, WAL/background writers, autovacuum, stats); (2) **TimescaleDB background workers** — the managed conf sizes `timescaledb.max_background_workers` to the hypertable count + 2 (≈38), and every RUNNING compression/retention policy job is its own process, so the count legitimately surges during checkpoint/compression waves and falls back when they finish; (3) client backends — the service's pools are capped at 24, the co-located viewer's at 10. Decompose it live with: `SELECT backend_type, count(*) FROM pg_stat_activity GROUP BY backend_type ORDER BY 2 DESC;` — and remember Windows charges the shared buffer segment to every attached process's working set, so per-process memory numbers cannot be summed.
 
@@ -541,6 +758,10 @@ A monitored server that is down is retried every 60 seconds forever; a collector
 **MCP client cannot connect** — MCP defaults to off. Enable it live from the Viewer's Settings (the checkbox writes the control plane; the service starts the endpoint within seconds, no restart), or set `mcp.enabled: true` in `darling.json` for a file-seeded install. If the log says `Port 5152 is already in use — MCP server not started`, change `mcp.port`. The MCP server binds to `localhost` only unless you opt into a LAN endpoint (see [Opt-in Network Endpoints (LAN)](#opt-in-network-endpoints-lan)); a remote client that gets 401 is missing or mismatching the required bearer token, and one that is refused before any response is outside the configured `allowFrom` CIDR.
 
 **Recommendations tab says no findings** — analysis runs every 30 minutes per server but only once the store holds at least 24 hours of collected data for that server; a fresh install simply has not earned findings yet.
+
+**The Viewer will not connect** — the failure window carries a **Configuration this viewer used** block naming the `darling.json` it read (and which rule picked it: an explicit command-line path, `DARLING_CONFIG`, beside the viewer, or the service root), plus the host, port, username, database, SSL mode, search path and certificate path it parsed. Read it before changing anything: the two faults it separates are *the viewer read a different file than you edited* and *it read your file and a value in it is wrong*. **Copy details** puts the whole block on the clipboard for a bug report, and the same lines are in `%APPDATA%\PerformanceMonitorDarling\logs\darling-viewer_yyyyMMdd.log`. It never contains a password.
+
+**"Root Certificate ... exists: NO"** — with `SSL Mode=VerifyFull`, a **relative** `Root Certificate` path resolves against **the folder holding the `darling.json` the viewer read** — not the working directory, so how the viewer was launched no longer changes the answer. The diagnostics block prints that folder and the absolute path it actually opened; either put `server.crt` beside the config or make the `Root Certificate` value an absolute path. If you no longer have the certificate, re-run `--export-viewer-config` on the store host and copy the folder again (see [Connect a Remote Viewer](#connect-a-remote-viewer)) — it regenerates if the bind IP changes, so an old copy stops matching.
 
 ---
 
@@ -572,7 +793,7 @@ With `postgres.managed = true` (the sample's default), the service runs its own 
 }
 ```
 
-**What first run does.** The service looks for `pg-runtime\pgsql\` beside its binary, extracting it from `pg-runtime.zip` when only the zip is present (deleting the extracted directory is therefore always safe — it self-heals). If the data directory has no cluster, it generates a 32-character random password, protects it with DPAPI LocalMachine into `pg-credential.dpapi` beside the data directory (credential first, so a crash mid-initdb never strands a cluster nobody can log into), then runs `initdb` with `scram-sha-256` auth, data checksums, and UTF8/C locale. A marker-guarded block appended to `postgresql.conf` preloads TimescaleDB, sets the port, and restricts listening to `127.0.0.1`; a second versioned block sizes background workers up for the per-hypertable compression jobs (`timescaledb.max_background_workers = 28`, `max_worker_processes = 40` — PostgreSQL's default of 8 workers cannot launch them); a third versioned block sizes memory from the host's physical RAM for the up-to-500-servers case (`shared_buffers = min(25% RAM, 1GB)`, `effective_cache_size = 75% RAM`, `maintenance_work_mem = min(max(5% RAM, 1536MB), 25% RAM, 2048MB)`, and a deliberately-modest per-connection `work_mem = clamp(RAM/512, 16MB, 64MB)` — on an 8 GB box that is `shared_buffers 1024MB` / `work_mem 16MB`; the stock 128 MB / 4 MB defaults are fine at small scale but bottleneck at fleet scale). Later blocks re-state single settings that field measurement moved: a fifth caps `shared_buffers` for the co-located store, a sixth turns on the log-rotation ring, and a seventh carries the `maintenance_work_mem` floor that TimescaleDB's compression sort runs on (measured at ~+70% compression throughput on a 16 GB-class host, plateauing by 1536 MB). `postgresql.conf` takes the LAST assignment of a setting, so these override without rewriting anything. Every append is re-checked on every start, so a crash between initdb and the append heals itself instead of silently degrading — and clusters initialized before a given block existed gain it on their next start (effective at the next PostgreSQL restart). Then `pg_ctl start`, `CREATE DATABASE darling`, and the normal startup path (migrations, TimescaleDB adoption — you should see `32/32 collector table(s) are hypertables`) continues exactly as in bring-your-own mode. The connection string is derived from the stored credential; the Viewer and the MCP host on the same machine derive it the same way, so nothing needs configuring there either.
+**What first run does.** The service looks for `pg-runtime\pgsql\` beside its binary, extracting it from `pg-runtime.zip` when only the zip is present (deleting the extracted directory is therefore always safe — it self-heals). If the data directory has no cluster, it generates a 32-character random password, protects it with DPAPI LocalMachine into `pg-credential.dpapi` beside the data directory (credential first, so a crash mid-initdb never strands a cluster nobody can log into), then runs `initdb` with `scram-sha-256` auth, data checksums, and UTF8/C locale. A marker-guarded block appended to `postgresql.conf` preloads TimescaleDB, sets the port, and restricts listening to `127.0.0.1`; a second versioned block sizes background workers up for the per-hypertable compression jobs, DERIVED from the live hypertable count so it cannot go stale as collectors are added (`timescaledb.max_background_workers = hypertables + 2`, `max_worker_processes = 3 + that + 8` — today 41 and 52 for 39 hypertables; PostgreSQL's default of 8 workers cannot launch them); a third versioned block sizes memory from the host's physical RAM for the up-to-500-servers case (`shared_buffers = min(25% RAM, 1GB)`, `effective_cache_size = 75% RAM`, `maintenance_work_mem = min(max(5% RAM, 1536MB), 25% RAM, 2048MB)`, and a deliberately-modest per-connection `work_mem = clamp(RAM/512, 16MB, 64MB)` — on an 8 GB box that is `shared_buffers 1024MB` / `work_mem 16MB`; the stock 128 MB / 4 MB defaults are fine at small scale but bottleneck at fleet scale). Later blocks re-state single settings that field measurement moved: a fifth caps `shared_buffers` for the co-located store, a sixth turns on the log-rotation ring, and a seventh carries the `maintenance_work_mem` floor that TimescaleDB's compression sort runs on (measured at ~+70% compression throughput on a 16 GB-class host, plateauing by 1536 MB). `postgresql.conf` takes the LAST assignment of a setting, so these override without rewriting anything. Every append is re-checked on every start, so a crash between initdb and the append heals itself instead of silently degrading — and clusters initialized before a given block existed gain it on their next start (effective at the next PostgreSQL restart). Then `pg_ctl start`, `CREATE DATABASE darling`, and the normal startup path (migrations, TimescaleDB adoption — you should see `N/N collector table(s) are hypertables`, both numbers equal and equal to the collector count; a converted count BELOW the total means some table stayed plain and the line above it says which) continues exactly as in bring-your-own mode. The connection string is derived from the stored credential; the Viewer and the MCP host on the same machine derive it the same way, so nothing needs configuring there either.
 
 **Why scram and not trust, even loopback-only.** Trust auth would hand superuser to any local code that can open a loopback socket — every other local user, and network-capable-but-not-filesystem-capable attack primitives like SSRF from a co-hosted app. With scram the credential travels on the wire, failed attempts are auditable, and access is confined to what can read the DPAPI-protected credential file. `listen_addresses = '127.0.0.1'` keeps the server unreachable off the machine on top — unless you deliberately opt into a LAN endpoint (see [Opt-in Network Endpoints (LAN)](#opt-in-network-endpoints-lan)), which reconciles `listen_addresses`, a `hostssl` pg_hba rule, and TLS on every start and is otherwise off.
 
@@ -586,7 +807,7 @@ With `postgres.managed = true` (the sample's default), the service runs its own 
 
 The store is split into two schemas so that no consumer connects with more privilege than it needs:
 
-- **`collect`** — the 32 collector hypertables plus the service-written, user-read metadata (`servers`, `collection_log`, `analysis_findings`, the `v_*` views). Read-only to everyone but the service.
+- **`collect`** — the collector hypertables (one per collector) plus the service-written, user-read metadata (`servers`, `collection_log`, `analysis_findings`, the `v_*` views). Read-only to everyone but the service.
 - **`config`** — exactly the tables a human operator changes through the Viewer or MCP: `config_mute_rules`, `config_alert_log` (alert dismissals), `config_edge_trigger_watermarks`, and `analysis_muted`.
 
 Table names are unchanged — only their schema moved — and the shared SQL keeps using the bare, unqualified names, resolved through `search_path = collect, config, public` (set as the database default and carried on the managed connection strings). This is deliberate: Darling's SQL is byte-identical to Lite's DuckDB SQL, and re-qualifying it would fork that twin.
@@ -596,8 +817,8 @@ Table names are unchanged — only their schema moved — and the shared SQL kee
 | Role | Privileges | Used by |
 |---|---|---|
 | `darling` | superuser / owner | the service (collection, migration, provisioning) |
-| `admin` | SELECT on both schemas + INSERT/UPDATE/DELETE on `config` only | the Viewer, by default (`connectAs: "admin"`) |
-| `viewer` | SELECT on both schemas + INSERT/UPDATE/DELETE on `config.custom_views` only (the web composer's saved views) | a locked-down Viewer (`connectAs: "viewer"`) |
+| `admin` | SELECT on both schemas — **including** the secret columns, which the Settings window reads — plus INSERT/UPDATE/DELETE on `config` only. No statement timeout | the Viewer, by default (`connectAs: "admin"`) |
+| `viewer` | SELECT on all of `collect`, and on `config` **minus the secret columns** of `config_monitored_servers` / `config_command` / `config_notification` (carved fail-closed, below) + INSERT/UPDATE/DELETE on `config.custom_views` only (the web composer's saved views). Runs under `statement_timeout = 15s` | a locked-down Viewer (`connectAs: "viewer"`), and the web dashboard |
 | `mcp` | `viewer`'s exact read surface + INSERT on `collect.analysis_findings` / `config.analysis_muted` + INSERT/UPDATE/DELETE on `config.custom_views` (the custom-view tools) + the alert-tuning writes (INSERT/UPDATE/DELETE on `config.config_mute_rules`, UPDATE on `config.config_alert_settings`, and the `config_service` reload-beacon columns) + the server-onboarding writes (INSERT/UPDATE/DELETE on `config.config_monitored_servers` — the credential column stays SELECT-carved, so it can WRITE a password blob but never READ one back) | the store identity the opt-in MCP **network** endpoint connects as (managed only); dormant until MCP is exposed on the LAN |
 
 `admin` cannot `DROP`, alter schema, touch `collect` data, or create objects — it can only do what the Viewer's mute-rule / alert-dismiss surfaces need. The `mcp` role is narrower still: it reads exactly what `viewer` reads (the secret config columns are carved out identically) and its writes are a small, enumerated set — the two analysis-table INSERTs (`analyze_server` + `mute_analysis_finding`), the single-table `config.custom_views` CRUD (the custom-view tools), the alert-tuning writes (`config.config_mute_rules` CRUD + a single-row `config.config_alert_settings` UPDATE, plus the two `config_service` beacon columns so a settings write's self-bump trigger can fire), and the server-onboarding writes (`config.config_monitored_servers` CRUD for `add_servers` / `remove_server` — its `config_monitored_servers` write fires the SAME `config_service` beacon trigger, already covered by that column grant) — so a token-holder on the network MCP endpoint can never reach the `config`-table service-credential pivot, the secret columns, or a service flag like `paused`. Even on `config_monitored_servers`, which it may write, the `encrypted_password` column stays in the fail-closed secret carve, so `mcp` can WRITE a credential blob (onboarding) but can never READ one back. `ALTER DEFAULT PRIVILEGES` means new collector tables auto-inherit SELECT for `admin`/`viewer`, so the model never drifts as collectors are added (every `mcp` write is an explicit single-table/single-column grant, deliberately not schema-wide).
@@ -623,7 +844,7 @@ The principal model assumes the **single-operator VM** this edition targets: `IN
 psql -h <host> -U <owner> -d darling -f Darling/tools/provision-roles.sql
 ```
 
-Edit the two password placeholders (and the database/owner names if yours differ) first. Then point a read-only Viewer's `connectionString` at the `viewer` role. **`provision-roles.sql` creates two login roles — `admin` and `viewer`** — the two the Viewer connects as. Managed mode creates a third, `mcp`, but BYO deliberately does not: the MCP **network** endpoint (the only consumer of the `mcp` role) is managed-mode-only, and a BYO operator governs their own PostgreSQL's network exposure. If you expose MCP through your own reverse proxy against a BYO store, point it at whichever least-privilege role you choose (the `viewer` role covers the read tools; `analyze_server`'s finding persistence and `mute_analysis_finding` need INSERT on `collect.analysis_findings` / `config.analysis_muted`).
+Edit the two password placeholders (and the database/owner names if yours differ) first. Then point a read-only Viewer's `connectionString` at the `viewer` role. **That script is the authoritative grant list for a BYO store** — it is what actually runs, the table above is its summary, and an `ALTER DEFAULT PRIVILEGES` in it means a store gaining collectors later needs no re-grant. Re-run it after a schema upgrade to cover new tables. **It creates two login roles — `admin` and `viewer`** — the two the Viewer connects as. Managed mode creates a third, `mcp`, but BYO deliberately does not: the MCP **network** endpoint (the only consumer of the `mcp` role) is managed-mode-only, and a BYO operator governs their own PostgreSQL's network exposure. If you expose MCP through your own reverse proxy against a BYO store, point it at whichever least-privilege role you choose (the `viewer` role covers the read tools; `analyze_server`'s finding persistence and `mute_analysis_finding` need INSERT on `collect.analysis_findings` / `config.analysis_muted`).
 
 ## Opt-in Network Endpoints (LAN)
 
@@ -637,7 +858,7 @@ The fastest path is the interactive wizard — run it on the **service host**:
 PerformanceMonitor.Darling.Service.exe --configure-network
 ```
 
-It shows the current exposure (read from the service's own resolvers), then walks you through the **store**, **MCP**, the **web dashboard**, any comma combination (e.g. `1,3`), or all three at once (or a **disable** that removes all exposure). Every answer is validated **by delegation to the exact checks the running service fail-closes on**, so the wizard can never write a config the service would refuse — it re-prompts with the resolver's own reason. It generates the MCP bearer / web access tokens for you (DPAPI-protected; each plaintext is printed once, so save it then), edits `darling.json` **in place preserving every comment** behind a timestamped `darling.json.bak-<timestamp>` backup, prints the scoped firewall command(s), the `--print-viewer-connection` handoff, and the web dashboard's browser login URL (`http://<listen>:<port>/?token=...`), and offers to restart the service to apply. `install-darling.ps1 -Network` runs it automatically right after the install reaches Running. The manual field reference below documents exactly what it writes.
+It shows the current exposure (read from the service's own resolvers), then walks you through the **store**, **MCP**, the **web dashboard**, any comma combination (e.g. `1,3`), or all three at once (or a **disable** that removes all exposure). Every answer is validated **by delegation to the exact checks the running service fail-closes on**, so the wizard can never write a config the service would refuse — it re-prompts with the resolver's own reason. It generates the MCP bearer / web access tokens for you (DPAPI-protected; each plaintext is printed once, so save it then), edits `darling.json` **in place preserving every comment** behind a timestamped `darling.json.bak-<timestamp>` backup, prints the scoped firewall command(s), the `--export-viewer-config` handoff, and the web dashboard's browser login URL (`http://<listen>:<port>/?token=...`), and offers to restart the service to apply. `install-darling.ps1 -Network` runs it automatically right after the install reaches Running. The manual field reference below documents exactly what it writes.
 
 ### Firewall rules (`--configure-firewall`)
 
@@ -705,25 +926,7 @@ On every start the service reconciles this against the live cluster: it adds the
   New-NetFirewallRule -DisplayName "PerformanceMonitor Darling store (port 5641)" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5641 -RemoteAddress 192.168.1.0/24
   ```
 
-**Remote-viewer handoff.** On the **service host**, run:
-
-```
-PerformanceMonitor.Darling.Service.exe --print-viewer-connection
-```
-
-It decrypts the `network.role` credential and prints a paste-ready connection string plus the server certificate PEM. It prints a **live database password to STDOUT** — redirect it to an ACL'd file or pipe it to the clipboard (`... --print-viewer-connection | clip`); do not leave it in shell scrollback, CI logs, or a screenshare. On the **viewer machine**, set a minimal `darling.json` to bring-your-own mode and paste the string in verbatim (no viewer code path changes — the string is consumed as-is), then save the emitted PEM where `Root Certificate` points:
-
-```json
-{
-  "postgres": {
-    "managed": false,
-    "connectionString": "Host=192.168.1.205;Port=5641;Username=viewer;Password=...;Database=darling;Search Path=collect,config,public;SSL Mode=VerifyFull;Root Certificate=server.crt"
-  }
-}
-```
-
-- **Certificate placement + rotation.** Save the emitted PEM at the `Root Certificate` path on the viewer machine (a bare `server.crt` resolves beside the viewer's working directory; an absolute path also works). The cert **auto-regenerates if the bind IP changes** (so verify-full keeps working after a `listen` change) — when that happens, clients must re-run `--print-viewer-connection` and replace their saved cert. To rotate on demand, **delete `server.crt` and `server.key`** beside the data directory; the service regenerates the pair on its next start.
-- **Plaintext at rest on the viewer machine.** The pasted connection string holds the role password in cleartext in the laptop's `darling.json` (there is no client-side secret store yet). That is acceptable for the read-only `viewer` credential on a single-operator, ACL'd profile; if you use `role: "admin"`, treat that file as a secret and NTFS-ACL it to your account. DPAPI-encrypting the viewer's BYO connection string is future hardening, out of scope today.
+**That is the service side. The viewer side is [Connect a Remote Viewer](#connect-a-remote-viewer)** — `--export-viewer-config` on this host writes the viewer machine's whole configuration folder (config, certificate, and a plain-text field reference), and that section covers copying it over, the certificate's placement and rotation, and the manual `--print-viewer-connection` fallback.
 
 ### MCP endpoint (assistant over the LAN)
 
@@ -747,9 +950,11 @@ When `listen` is a network address **and** a token is present **and** `allowFrom
 New-NetFirewallRule -DisplayName "Darling MCP" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5152 -RemoteAddress 192.168.1.0/24
 ```
 
-**Blast radius, stated honestly.** The token gates the entire read surface, `analyze_server` (which opens **live outbound connections to your monitored SQL Servers** — the plan-fetcher), the Custom Views management tools, which **create / modify / delete** the saved dashboards and notebooks in `config.custom_views`, the alert-tuning tools (`update_alert_settings` / `create_mute_rule` / `delete_mute_rule`), which change the shared alert configuration the service delivers on, *and* the server-onboarding tools (`add_servers` / `remove_server`), which **add or remove the monitored servers themselves** in `config.config_monitored_servers` — including storing a SQL-auth **credential** for a server it adds. Treat the token as a high-value secret. The store-side identity is still the least-privilege `mcp` role: read, the two analysis-table INSERTs, INSERT/UPDATE/DELETE on the single `config.custom_views` table (the same narrow write the web composer's `viewer` role has), the narrow alert-config writes (`config.config_mute_rules` CRUD + a single-row `config.config_alert_settings` UPDATE, plus the `config_service` reload-beacon columns), and the single-table `config.config_monitored_servers` CRUD. So a token-holder can read everything collected, trigger analysis, author custom views, tune alerting, and onboard/offboard servers — but can never reach the `config_command` service-credential pivot, the carved secret columns (SMTP/webhook credentials, and the monitored-server `encrypted_password` blob it can WRITE during onboarding but never READ back, all included), or a service flag like `paused`, and a stored view is structurally incapable of reading a config control-plane table (a composed query names only `collect.*` collector tables). Custom-view JSON and alert config carry no secrets.
+**What a token-holder can — and cannot — do.** Start with the boundary: **no MCP tool runs SQL an AI client wrote against your monitored servers.** No such tool exists, and a stored custom view cannot become one either — a composed query names only `collect.*` collector tables in the monitoring store. The only live contact with a monitored SQL Server is `analyze_server`'s plan fetch and `add_servers`' one-time connection probe, and both run the product's own fixed, read-only queries under the same least-privilege monitoring login the collectors use — the ceiling on what they can see is the ceiling you granted that login, and it has no write grants to hit. Everything else answers from the monitoring store.
 
-**A monitored-server credential rides `add_servers` — mind the wire.** `add_servers` accepts a SQL-auth `password` in its request JSON; the service DPAPI-encrypts it at rest (never returns it), but it travels to the MCP endpoint in the clear on the same plaintext HTTP the token does. That is one more reason to **front the MCP port with the TLS reverse proxy below** on any segment you do not fully trust — the password, like the token, is captured by an on-path attacker otherwise. Prefer Windows/integrated auth for onboarded servers where you can (no per-server secret crosses the wire at all).
+What the token does gate is the monitor's own configuration and collected data: the entire read surface, `analyze_server`, the Custom Views tools (create / modify / delete the saved dashboards and notebooks in `config.custom_views`), the alert-tuning tools (`update_alert_settings` / `create_mute_rule` / `delete_mute_rule`), and the server-onboarding tools (`add_servers` / `remove_server`), which edit the monitored-server registry in `config.config_monitored_servers` — including storing a SQL-auth credential for a server they add. The store-side identity is still the least-privilege `mcp` role: read, the two analysis-table INSERTs, INSERT/UPDATE/DELETE on the single `config.custom_views` table (the same narrow write the web composer's `viewer` role has), the narrow alert-config writes (`config.config_mute_rules` CRUD + a single-row `config.config_alert_settings` UPDATE, plus the `config_service` reload-beacon columns), and the single-table `config.config_monitored_servers` CRUD. So a token-holder can read everything collected, trigger analysis, author custom views, tune alerting, and onboard/offboard servers — and can never reach the `config_command` service-credential pivot, the carved secret columns (SMTP/webhook credentials, and the monitored-server `encrypted_password` blob it can WRITE during onboarding but never READ back, all included), or a service flag like `paused`. Custom-view JSON and alert config carry no secrets. Guard the token like the keys to your monitoring configuration — that is what it opens; your SQL Servers are not behind it.
+
+**`add_servers` carries a credential in its request.** A SQL-auth `password` rides the request JSON; the service DPAPI-encrypts it at rest and never returns it, but on the wire it is only as protected as the endpoint — the same plaintext HTTP the token rides. On a segment you do not fully trust, front the MCP port with the TLS reverse proxy below, and prefer Windows/integrated auth for onboarded servers where you can — then no per-server secret crosses the wire at all.
 
 **MCP has no TLS — the MITM control is a TLS reverse proxy.** A self-signed cert breaks real MCP clients, so the MCP endpoint is plain HTTP and the bearer token travels **cleartext on the segment**; an active on-path attacker (ARP spoof, rogue DHCP, compromised switch) could capture and replay it. The in-app CIDR bounds *who can route to* the port; it does **not** protect the wire. If your segment is not fully trusted, put a **TLS-terminating reverse proxy** in front of the MCP port and point clients at that — the named MITM control for this endpoint. (The store endpoint needs no such proxy: it has verify-full TLS built in.)
 
@@ -775,6 +980,6 @@ When `listen` is a network address **and** a token is present **and** `allowFrom
 New-NetFirewallRule -DisplayName "Darling Web" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5153 -RemoteAddress 192.168.1.0/24
 ```
 
-**Blast radius.** The web dashboard is **read-only over the collected store** — it connects as the least-privilege `viewer` role and hosts no write paths and no live-server queries (no `analyze_server`, no plan re-execution), so a token-holder can view everything collected but change nothing and reach no monitored server. That smaller blast radius is why loopback stays tokenless here while MCP's does not.
+**What a web token can reach.** The web dashboard is **read-only over the collected store** — it connects as the least-privilege `viewer` role and hosts no write paths and no live-server queries (no `analyze_server`, no plan re-execution). A token-holder can view everything collected, change nothing, and reach no monitored server — which is why loopback stays tokenless here while MCP's does not.
 
 **Web has no TLS either — same reverse-proxy control as MCP.** The token/cookie travels cleartext on the segment, so the in-app CIDR bounds *who can route to* the port but does not protect the wire. On an untrusted segment, put a TLS-terminating reverse proxy in front of the web port.

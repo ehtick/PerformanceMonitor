@@ -83,6 +83,26 @@ public static class PgMigrations
         new Migration(37, "ag-local-replica-and-disconnect-refire", V37Sql),
         new Migration(38, "query-payload-dimensions", PgSchemaGenerator.GenerateV38PayloadDimensions()),
         new Migration(39, "dim-feeding-fact-floor-indexes", V39Sql),
+        new Migration(40, "blocking-wait-threshold", V40Sql),
+        new Migration(41, "query-store-interval-identity", V41Sql),
+        new Migration(42, "pagerduty-webhook", V42Sql),
+        new Migration(43, "pagerduty-proxy", V43Sql),
+        new Migration(44, "collector-state", V44Sql),
+        /* 45 is permanently absent. It was reserved for the #1951 lane while that lane was still
+           unmerged, but #1952 landed first and took 46, and the runner applies only versions ABOVE
+           the store's MAX(version) — so a store already stamped 46 would have skipped a late-arriving
+           45 forever, leaving upgraded stores without a table fresh stores get from V1. #1951 was
+           renumbered to 47 rather than shipped into that hole. Version numbers only have to be unique
+           and ascending: a gap costs nothing and a collision would cost a store. */
+        new Migration(46, "plan-correction-collector", V46Sql),
+        new Migration(47, "pvs-stats", V47Sql),
+        new Migration(48, "pvs-pressure-alert", V48Sql),
+        new Migration(49, "database-state-alert", V49Sql),
+        new Migration(50, "server-tag-colour", V50Sql),
+        new Migration(51, "query-stats-host-object", V51Sql + "\n" + PgSchemaGenerator.GenerateQueryStatsResolvingView()),
+        new Migration(52, "finding-drilldown-json", V52Sql),
+        new Migration(53, "store-self-metrics", V53Sql),
+        new Migration(54, "plan-dim-gzip", V54Sql + "\n" + PgSchemaGenerator.GenerateQueryStatsResolvingView()),
     };
 
     /// <summary>
@@ -312,6 +332,71 @@ CREATE OR REPLACE VIEW v_deadlocks AS SELECT * FROM deadlocks;";
     private const string V28Sql = @"
 ALTER TABLE query_store_stats ADD COLUMN IF NOT EXISTS replica_role text;
 CREATE OR REPLACE VIEW v_query_store_stats AS SELECT * FROM query_store_stats;";
+
+    /// <summary>
+    /// V46 — the <c>plan_correction</c> collector table (#1952): what the engine's own automatic plan
+    /// correction is doing per database — the FORCE_LAST_GOOD_PLAN enablement state from
+    /// <c>sys.database_automatic_tuning_options</c>, and the live recommendation set from
+    /// <c>sys.dm_db_tuning_recommendations</c> with its details JSON shredded into typed columns and
+    /// the regressed query's text resolved through Query Store at collection time. Added additively
+    /// exactly like V29/V34 — a fresh store already has it (V1's
+    /// <see cref="PgSchemaGenerator.GenerateFullSchema"/> walks the collector catalog), so
+    /// <c>CREATE TABLE IF NOT EXISTS</c> is a no-op on fresh and the real create on upgrade. Column
+    /// order/types are exactly <see cref="PgSchemaGenerator.CreateTable"/>'s output for the
+    /// <see cref="PlanCorrectionCollector"/> catalog entry (prefix NOT NULL, payload nullable), which
+    /// <c>DarlingPlanCorrectionMigrationTests</c> asserts rather than leaving to this comment — the one
+    /// thing a hand-written literal can get wrong that a generated body cannot. No <c>v_*</c>
+    /// passthrough view (a post-V14 collector); the viewer reads the base table directly. Hypertable /
+    /// compression / 30-day retention flow from the catalog at runtime.
+    /// </summary>
+    private const string V46Sql = @"
+CREATE TABLE IF NOT EXISTS collect.plan_correction (
+    collection_id bigint NOT NULL,
+    collection_time timestamp NOT NULL,
+    server_id integer NOT NULL,
+    server_name text NOT NULL,
+    database_name text,
+    force_last_good_plan_desired_state text,
+    force_last_good_plan_actual_state text,
+    force_last_good_plan_reason text,
+    create_index_actual_state text,
+    drop_index_actual_state text,
+    recommendation_name text,
+    recommendation_type text,
+    recommendation_state text,
+    recommendation_state_reason text,
+    recommendation_reason text,
+    valid_since timestamp,
+    last_refresh timestamp,
+    score integer,
+    query_id bigint,
+    query_text text,
+    regressed_plan_id bigint,
+    last_good_plan_id bigint,
+    last_good_plan_forcing_type text,
+    last_good_plan_is_forced boolean,
+    last_good_plan_force_failure_reason text,
+    regressed_plan_execution_count bigint,
+    regressed_plan_cpu_time_average_ms double precision,
+    regressed_plan_error_count bigint,
+    last_good_plan_execution_count bigint,
+    last_good_plan_cpu_time_average_ms double precision,
+    last_good_plan_error_count bigint,
+    estimated_gain_seconds double precision,
+    is_executable_action boolean,
+    is_revertable_action boolean,
+    execute_action_initiated_by text,
+    execute_action_initiated_time timestamp,
+    execute_action_start_time timestamp,
+    execute_action_duration_seconds double precision,
+    revert_action_initiated_by text,
+    revert_action_initiated_time timestamp,
+    revert_action_start_time timestamp,
+    revert_action_duration_seconds double precision,
+    implementation_script text
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_correction_time ON collect.plan_correction(server_id, collection_time);";
 
     /// <summary>
     /// V29 — the <c>long_query_completions</c> collector table (#1496): long-running query completions
@@ -637,6 +722,342 @@ CREATE INDEX IF NOT EXISTS ix_query_stats_digest_floor
 CREATE INDEX IF NOT EXISTS ix_procedure_stats_digest_floor
     ON procedure_stats (collection_time)
     WHERE query_plan_digest IS NOT NULL;";
+
+    /// <summary>
+    /// V40 — <c>config_alert_settings.blocking_wait_seconds_threshold</c>, the #1839 total-blocked-wait
+    /// gate. A second, independent blocking threshold beside the existing count one, because a count
+    /// cannot distinguish one session blocked for an hour from one blocked for a second.
+    /// <para>NOT NULL DEFAULT 0 = OFF, so an upgraded store alerts byte-for-byte as before and nobody
+    /// starts getting a new alert because they took an update — the same shipped-behavior-preserving
+    /// choice V37's re-fire column made. <c>ADD COLUMN IF NOT EXISTS</c> per the file's additive idiom;
+    /// config.-qualified because the migrate session runs under
+    /// <c>search_path = collect, config, public</c>.</para>
+    /// </summary>
+    private const string V40Sql = @"
+ALTER TABLE config.config_alert_settings
+    ADD COLUMN IF NOT EXISTS blocking_wait_seconds_threshold integer NOT NULL DEFAULT 0;";
+
+    /// <summary>
+    /// V41 — the REAL Query Store interval identity on <c>query_store_stats</c> (#1841 tier 2):
+    /// <c>runtime_stats_interval_id</c> (<c>sys.query_store_runtime_stats</c>' own interval key) and
+    /// <c>interval_start_time_utc</c> (<c>sys.query_store_runtime_stats_interval.start_time</c>, converted
+    /// to UTC at collection).
+    /// <para>Query Store rows are CUMULATIVE per-interval snapshots and the collector re-fetches the OPEN
+    /// interval every cycle, so every aggregate read must collapse an interval to its latest snapshot
+    /// before summing. Tier 1 (#1845) did that on the <c>first_execution_time</c> PROXY because the schema
+    /// exposed no interval key; this is the real one, and it is also the only honest x-axis for "when the
+    /// work ran" — <c>collection_time</c> dates an interval to the cycle that last FETCHED it, one bucket
+    /// late on Query Store's default 60-minute interval.</para>
+    /// <para>Both nullable and appended (identical physical column order for the binary COPY whether fresh —
+    /// V1 is generated from the current collector definition, which now includes them — or upgraded;
+    /// <c>ADD COLUMN IF NOT EXISTS</c> no-ops on fresh). Deliberately NOT backfilled: rows already stored
+    /// were collected without the identity and nothing can reconstruct it, so readers key on the real id
+    /// only when present and fall back to the tier-1 proxy otherwise. The trailing
+    /// <c>CREATE OR REPLACE VIEW</c> re-expands <c>v_query_store_stats</c>' pinned <c>SELECT *</c>
+    /// (Postgres freezes it at CREATE; append-only ADDs keep the refresh legal), mirroring V15/V27/V28.
+    /// Runs after V8, so the bare names resolve through <c>search_path = collect, config, public</c>.</para>
+    /// </summary>
+    private const string V41Sql = @"
+ALTER TABLE query_store_stats ADD COLUMN IF NOT EXISTS runtime_stats_interval_id bigint;
+ALTER TABLE query_store_stats ADD COLUMN IF NOT EXISTS interval_start_time_utc timestamp;
+CREATE OR REPLACE VIEW v_query_store_stats AS SELECT * FROM query_store_stats;";
+
+    /// <summary>
+    /// V42 — PagerDuty webhook channel (#1943). Adds two columns to <c>config.config_notification</c>:
+    /// <c>pagerduty_routing_key</c> (the 32-character Events API v2 integration key, stored as plaintext
+    /// but column-REVOKEd from the read-only viewer role — same secret tier as Teams/Slack/Generic webhook
+    /// URLs) and <c>pagerduty_use_eu_region</c> (boolean flag for EU data center endpoint). Both are
+    /// non-null with safe defaults (empty string / false) so existing rows get valid values without a data
+    /// migration. The routing key is carved from the viewer role's SELECT grant in
+    /// <c>DarlingManagedRoles.ViewerRestrictedConfigTables</c> and <c>Darling/tools/provision-roles.sql</c>;
+    /// the EU flag is non-secret and stays in the viewer's grant.
+    /// </summary>
+    private const string V42Sql = @"
+ALTER TABLE config.config_notification
+    ADD COLUMN IF NOT EXISTS pagerduty_routing_key text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS pagerduty_use_eu_region boolean NOT NULL DEFAULT FALSE;";
+
+    /// <summary>
+    /// V43 - PagerDuty proxy (#1945). The channel was the only webhook that could not route through a
+    /// proxy, and its endpoints are fixed public URLs, so a locked-down network that proxies webhook
+    /// egress could not use it at all. Non-secret like the sibling proxy columns (teams_proxy et al.),
+    /// so it stays in the viewer role's SELECT grant.
+    /// </summary>
+    private const string V43Sql = @"
+ALTER TABLE config.config_notification
+    ADD COLUMN IF NOT EXISTS pagerduty_proxy text NOT NULL DEFAULT '';";
+
+    /// <summary>
+    /// V44 — per-server collector state that is NOT derivable from the collected rows, so it cannot be a
+    /// MAX() over the collector's own table the way the <c>event_time</c> / <c>instance_id</c> watermarks
+    /// are (#1962). One collector declares state today: <c>default_trace_events</c> records the trace FILE
+    /// it read, and compares it next cycle to decide whether it can read only the current rollover file
+    /// (the measured 5.0x steady-state saving) or must re-read the whole set because the trace rolled.
+    /// The state cannot ride on the payload precisely because the cycles that need it most collect zero
+    /// rows — a server whose default trace churns through 20 MB files without producing any CURATED event
+    /// would never record a rollover, and so would never leave the expensive fallback.
+    ///
+    /// <para><b>Schema — <c>collect</c>, qualified.</b> Service-written state the operator never mutates,
+    /// so it belongs in <c>collect</c> beside <c>analysis_state</c> (V19) rather than the <c>config</c>
+    /// control plane; qualifying is belt-and-suspenders over the migrate session's
+    /// <c>search_path = collect, config, public</c>, exactly like V19. NOT a hypertable: it is a keyed
+    /// registry with one short row per (server, collector, key), and
+    /// <see cref="!:TimescaleSupport.HypertableTables"/> is catalog-driven, so a non-collector table is
+    /// excluded automatically. No <c>v_*</c> passthrough view — nothing outside the collector runner reads
+    /// it. <c>CREATE TABLE IF NOT EXISTS</c>, so a re-run is a no-op; a fresh store reaches it in
+    /// migration order like every other post-V8 addition. Lite's twin is <c>Schema.CreateCollectorStateTable</c>
+    /// — same columns, same key.</para>
+    /// </summary>
+    private const string V44Sql = @"
+CREATE TABLE IF NOT EXISTS collect.collector_state (
+    server_id integer NOT NULL,
+    collector_name text NOT NULL,
+    state_key text NOT NULL,
+    state_value text NOT NULL,
+    updated_at timestamp NOT NULL,
+    PRIMARY KEY (server_id, collector_name, state_key)
+);";
+
+    /// <summary>
+    /// V47 — the #1951 ADR persistent version store table for stores that already exist. A fresh store
+    /// gets this table from V1's <see cref="PgSchemaGenerator.GenerateFullSchema"/> (catalog-driven, so
+    /// registering <c>PvsStatsCollector</c> in <c>CollectorCatalog.All</c> is the whole fresh-install
+    /// story); an UPGRADED store ran V1 before the collector existed and would otherwise never get the
+    /// table, so it is spelled out here column-for-column in the generator's emission order. The
+    /// fresh-vs-upgraded shape pin in PgSchemaGeneratorTests compares the two, which is what keeps this
+    /// block honest if the payload ever changes.
+    ///
+    /// <para>Column types are the generator's mapping of the definition's 23 <c>PayloadColumns</c>: Varchar →
+    /// <c>text</c>, Integer → <c>integer</c>, SmallInt → <c>smallint</c>, BigInt → <c>bigint</c>, Boolean →
+    /// <c>boolean</c>, Timestamp → <c>timestamp</c>, Decimal(19,2) → <c>numeric(19,2)</c>, behind the four
+    /// standard prefix columns. Bare names resolve through the migrate session's
+    /// <c>search_path = collect, config, public</c> (V8); the table is <c>collect</c>-qualified anyway,
+    /// matching V44 and V34.</para>
+    ///
+    /// <para>The view statement is deliberately UNQUALIFIED while the table is <c>collect.</c>-qualified,
+    /// which looks inconsistent and is not: it resolves through the migrate session's
+    /// <c>search_path = collect, config, public</c> exactly like V10-V13's view statements, and the
+    /// drift guard in DarlingObservabilityTests scans every migration for the bare
+    /// <c>CREATE OR REPLACE VIEW v_x AS SELECT * FROM x</c> form. A <c>collect.</c>-qualified view would
+    /// be INVISIBLE to that guard — the guard that exists so a collector view can never be added without
+    /// its V14 refresh — and would drop out of <c>PgSchemaGenerator.AllPassthroughViews</c>, which the MCP
+    /// reader consults to answer "does this table have a v_* view".</para>
+    ///
+    /// <para>The <c>v_pvs_stats</c> passthrough view is what keeps the two viewers' SQL byte-identical.
+    /// Lite's <c>v_*</c> views are load-bearing there — they UNION the hot DuckDB table with the parquet
+    /// archive — and Darling's are the passthrough twin created for exactly that reason (V4/V5:
+    /// "completing the v_* twin of Lite's DuckDB view layer so every ported viewer query stays
+    /// byte-identical to Lite's"). Without it the Darling FinOps read would have to name the base table
+    /// and the two front ends would diverge in their first line. The AG collectors read base tables
+    /// directly and are the exception, not the pattern to copy for a grid twinned with Lite's.</para>
+    ///
+    /// <para>Everything else is automatic and deliberately NOT written here: the hypertable conversion,
+    /// compression policy and retention come from <see cref="!:TimescaleSupport"/>, which enumerates
+    /// <c>CollectorCatalog.All</c>, so a new collector table is converted on the next service start
+    /// without a hand-written <c>create_hypertable</c> — the same path ag_replica_states took in V34.</para>
+    /// </summary>
+    private const string V47Sql = @"
+CREATE TABLE IF NOT EXISTS collect.pvs_stats (
+    collection_id bigint NOT NULL,
+    collection_time timestamp NOT NULL,
+    server_id integer NOT NULL,
+    server_name text NOT NULL,
+    database_name text,
+    database_id integer,
+    is_accelerated_database_recovery_on boolean,
+    pvs_filegroup_id smallint,
+    persistent_version_store_size_mb numeric(19,2),
+    online_index_version_store_size_mb numeric(19,2),
+    database_data_size_mb numeric(19,2),
+    current_aborted_transaction_count bigint,
+    oldest_active_transaction_id bigint,
+    oldest_aborted_transaction_id bigint,
+    min_transaction_timestamp bigint,
+    online_index_min_transaction_timestamp bigint,
+    secondary_low_water_mark bigint,
+    offrow_version_cleaner_start_time timestamp,
+    offrow_version_cleaner_end_time timestamp,
+    aborted_version_cleaner_start_time timestamp,
+    aborted_version_cleaner_end_time timestamp,
+    pvs_off_row_page_skipped_low_water_mark bigint,
+    pvs_off_row_page_skipped_transaction_not_cleaned bigint,
+    pvs_off_row_page_skipped_oldest_active_xdesid bigint,
+    pvs_off_row_page_skipped_min_useful_xts bigint,
+    pvs_off_row_page_skipped_oldest_snapshot bigint,
+    pvs_off_row_page_skipped_oldest_aborted_xdesid bigint
+);
+
+CREATE INDEX IF NOT EXISTS idx_pvs_stats_time ON collect.pvs_stats(server_id, collection_time);
+
+CREATE OR REPLACE VIEW v_pvs_stats AS SELECT * FROM pvs_stats;";
+
+    /// <summary>
+    /// V48 — the #1984 PVS-pressure alert knobs on the singleton config_alert_settings row: an enable,
+    /// the percent-of-database trigger, and the GB floor qualifier (AND semantics — see AlertsConfig).
+    /// <para>Defaults ON at 40% / 1 GB, matching darling.json's <c>AlertsConfig</c> defaults — the
+    /// #754 shipped-on precedent for a brand-new percent-based alert, NOT V40's default-off (that was a
+    /// second gate on an EXISTING alert, where a non-zero default would have changed behavior someone had
+    /// already tuned). 40 warns meaningfully before MS's "close to 50% of the database size" = large.
+    /// <c>ADD COLUMN IF NOT EXISTS</c> per the file's additive idiom; config.-qualified because the
+    /// migrate session runs under <c>search_path = collect, config, public</c>.</para>
+    /// </summary>
+    private const string V48Sql = @"
+ALTER TABLE config.config_alert_settings
+    ADD COLUMN IF NOT EXISTS pvs_enabled boolean NOT NULL DEFAULT TRUE;
+ALTER TABLE config.config_alert_settings
+    ADD COLUMN IF NOT EXISTS pvs_threshold_percent integer NOT NULL DEFAULT 40;
+ALTER TABLE config.config_alert_settings
+    ADD COLUMN IF NOT EXISTS pvs_floor_gb integer NOT NULL DEFAULT 1;";
+
+    /// <summary>
+    /// V49 — the database-state alert. Two tables plus a settings column:
+    /// <para><c>collect.database_states</c> — the periodic per-database <c>state_desc</c> time series
+    /// the alert compares against. Added additively exactly like V34/V44: a fresh store already has it
+    /// (V1's <see cref="PgSchemaGenerator.GenerateFullSchema"/> walks the collector catalog, which now
+    /// includes <see cref="PerformanceMonitor.Collectors.DatabaseStateCollector"/>), so
+    /// <c>CREATE TABLE IF NOT EXISTS</c> is a no-op on fresh and the real create on upgrade. Column
+    /// order/types are exactly <see cref="PgSchemaGenerator.CreateTable"/>'s output for that catalog
+    /// entry (prefix NOT NULL, payload nullable) so the fresh-vs-upgraded shape pin holds. It gets the
+    /// default retrieval index. No <c>v_*</c> passthrough view (post-V14 collectors read the base table).</para>
+    /// <para><c>config.database_state_expected</c> — the per-(server, database) expected state the
+    /// baseline-deviation alert compares the current state against: auto-seeded from first observation
+    /// (non-critical states only — a critical first observation stays pending and alerts) and
+    /// user-editable (the override), with the <c>(ignore)</c> sentinel opting a database out. Lives in the
+    /// config control plane; the viewer role's SELECT grant is added in
+    /// <c>Darling/tools/provision-roles.sql</c> / <c>DarlingManagedRoles</c>.</para>
+    /// <para><c>config.config_alert_settings.database_state_enabled</c> — the master toggle, NOT NULL
+    /// DEFAULT true so an upgraded store enables it without a data migration.</para>
+    /// </summary>
+    private const string V49Sql = @"
+CREATE TABLE IF NOT EXISTS collect.database_states (
+    collection_id bigint NOT NULL,
+    collection_time timestamp NOT NULL,
+    server_id integer NOT NULL,
+    server_name text NOT NULL,
+    database_name text,
+    database_id integer,
+    state_desc text,
+    is_in_standby boolean
+);
+
+CREATE INDEX IF NOT EXISTS idx_database_states_time ON collect.database_states(server_id, collection_time);
+
+CREATE TABLE IF NOT EXISTS config.database_state_expected (
+    server_id integer NOT NULL,
+    database_name text NOT NULL,
+    expected_state text NOT NULL,
+    is_user_override boolean NOT NULL DEFAULT false,
+    updated_at timestamp NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),
+    PRIMARY KEY (server_id, database_name)
+);
+
+ALTER TABLE config.config_alert_settings
+    ADD COLUMN IF NOT EXISTS database_state_enabled boolean NOT NULL DEFAULT true;";
+
+    /// <summary>
+    /// V50 — a nullable colour for each server tag (#2008 stage 2a). Additive exactly like V33/V48: one
+    /// <c>ADD COLUMN IF NOT EXISTS</c> on <c>config.server_tags</c> (created back in V32), so it is a no-op
+    /// on a store already carrying it and the real add on an upgrade. There is no config-schema generator
+    /// for server_tags — the table exists only because V32 created it — so a fresh store reaches this column
+    /// by running V32 then V50 in order, the same path an upgraded store takes; nothing else needs editing.
+    /// <para>Deliberately nullable with NO backfill: existing tags stay NULL and render as a neutral pill
+    /// until a user picks a colour, while newly-created tags get a palette colour assigned at creation time
+    /// (rotated by tag id, in the viewer). Stored as <c>#RRGGBB</c> text — the viewer's only concern, the
+    /// service never reads server_tags — so no CHECK constraint is imposed here; the viewer writes only
+    /// palette values or a user pick.</para>
+    /// </summary>
+    private const string V50Sql = @"
+ALTER TABLE config.server_tags
+    ADD COLUMN IF NOT EXISTS colour text;";
+
+    /// <summary>
+    /// V51 — the statement's HOST OBJECT on query_stats (#2012 stage 2): <c>sys.dm_exec_sql_text.objectid</c>
+    /// resolved to schema.name at collection, NULL for ad-hoc/prepared text. This is what lets the
+    /// hash-grouped readers split <c>INSERT...EXEC</c> callers that share a <c>query_hash</c> (the hash
+    /// normalizes the callee away — reproduced and mis-attributed in live triage) while leaving the ad-hoc
+    /// literal-collapse behavior untouched (NULLs group as one). Appended LAST to match the collector's
+    /// append-only payload; nullable, no backfill — history rows stay NULL and read as "unknown host",
+    /// aging out with raw retention. TimescaleDB accepts a nullable ADD COLUMN on a compressed hypertable.
+    /// <para><c>v_query_stats</c> is NOT a passthrough on a V38+ store — it is the #1767 payload-RESOLVING
+    /// view (<see cref="PgSchemaGenerator.GenerateQueryStatsResolvingView"/>), so it must be rebuilt from
+    /// the generator, not replaced with <c>SELECT *</c> (which would silently return NULL query_text for
+    /// every digest-era row). And because the generator emits payload columns BEFORE the trailing digest
+    /// columns, the new column lands mid-list — an alteration <c>CREATE OR REPLACE VIEW</c> refuses
+    /// (append-at-end only) — hence DROP + recreate. Plain DROP, no CASCADE: nothing persistent depends
+    /// on the view; readers reference it per-query. The migration entry concatenates the regenerated view
+    /// after this constant, the V38 idiom, so the definition can never go stale here.</para>
+    /// </summary>
+    private const string V51Sql = @"
+ALTER TABLE query_stats
+    ADD COLUMN IF NOT EXISTS host_object_name text;
+DROP VIEW IF EXISTS v_query_stats;";
+
+    /// <summary>
+    /// V52 — the persisted finding drill-down (#2060): the evidence rows behind a finding
+    /// (parameter-sensitive plans, top spill queries, blocking chains) previously existed only on
+    /// the write path, so <c>get_analysis_findings</c> could say "13 plans showed the pattern"
+    /// while no surface could enumerate them. Additive nullable text column carrying the CAPPED
+    /// JSON (<c>DrillDownSerializer</c>: rows-per-section + total-size caps, explicit truncation
+    /// note — never a silent cap), written beside <c>remediation_action_json</c> with the same D2
+    /// rationale and read back into the finding. No backfill: pre-upgrade findings honestly return
+    /// no drill-down and age out with finding retention. A fresh store's V4 creates the table
+    /// without the column and this ALTER adds it later in the same ladder run — the V9 idiom.
+    /// </summary>
+    private const string V52Sql = @"
+ALTER TABLE analysis_findings
+    ADD COLUMN IF NOT EXISTS drill_down_json text;";
+
+    /// <summary>
+    /// V53 — the store self-metrics table (#2068): the hourly fleet-level sweep
+    /// (<see cref="StoreSelfMetrics"/>) persists the store's OWN size/compression/growth series here — one
+    /// row per hypertable (total / pre- / post-compression bytes, chunk count), one per payload dimension
+    /// table (total bytes, row count), and one whole-store summary row (pg_database_size + the
+    /// enabled-server count) per run — so capacity forecasting is a stored query instead of ad-hoc
+    /// archaeology over a chunk catalog whose raw window is 4 days.
+    /// <para>Deliberately a PLAIN table, and deliberately NOT a collector: it is not in
+    /// <c>CollectorCatalog.All</c>, so <see cref="TimescaleSupport"/>'s catalog-driven hypertable
+    /// conversion and DarlingRetention's catalog purge can never recurse onto the table that measures them
+    /// (pinned by test). At ~30 narrow rows/hour it needs neither chunks nor compression; its retention is
+    /// the sweep's own bounded DELETE (<see cref="StoreSelfMetrics.RetentionDays"/> days), no policy
+    /// machinery. No <c>v_*</c> passthrough view — not a collector table, nothing twins with Lite (a
+    /// single-server edition has no central store to measure). Fresh stores get the table from this
+    /// migration too (V1's generator walks the collector catalog, which this is not in — the V49
+    /// <c>config.database_state_expected</c> precedent), so fresh and upgraded stores take the same path.
+    /// <c>collect.</c>-qualified like V44/V47/V49; the (metric_time) index serves both the read surface's
+    /// windowed scans and the retention DELETE.</para>
+    /// </summary>
+
+    private const string V53Sql = @"
+CREATE TABLE IF NOT EXISTS collect.store_metrics (
+    metric_time timestamp NOT NULL,
+    object_name text NOT NULL,
+    object_kind text NOT NULL,
+    total_bytes bigint,
+    compressed_before_bytes bigint,
+    compressed_after_bytes bigint,
+    chunk_count integer,
+    row_count bigint,
+    enabled_server_count integer
+);
+
+CREATE INDEX IF NOT EXISTS idx_store_metrics_time ON collect.store_metrics(metric_time);";
+
+    /// <summary>
+    /// V54 — gzip-compressed plan-dimension content (#2069). The plan dim was 101 GB (69%) of the
+    /// production store under lz4 TOAST (8.9× on plan XML); app-level gzip measured 14.0× on the
+    /// same live content, and PG 18 has no zstd TOAST to do it in-engine. Additive bytea column:
+    /// new rows carry gzip bytes and NULL text, pre-upgrade rows keep text, readers take
+    /// gz-else-text and inflate in C#, and the dim's own GC turnover (~9 days) converts the store
+    /// with no rewrite. The existing V51-era text column becomes effectively nullable-by-use; the
+    /// NOT NULL constraint is dropped so gz-only rows can insert. The resolving view is re-emitted
+    /// from the generator with the gz column APPENDED (a legal CREATE OR REPLACE — additions at the
+    /// end only), and V38's generated body pre-adds the column for stores upgrading from below it.
+    /// </summary>
+    private const string V54Sql = @"
+ALTER TABLE query_plan_dim
+    ADD COLUMN IF NOT EXISTS query_plan_gz bytea;
+ALTER TABLE query_plan_dim
+    ALTER COLUMN query_plan_xml DROP NOT NULL;";
 
     /// <summary>
     /// V9 — the FinOps copy-parity fields that were user-input config or previously live-only:

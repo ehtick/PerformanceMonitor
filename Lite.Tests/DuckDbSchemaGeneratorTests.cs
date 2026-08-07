@@ -163,12 +163,13 @@ public sealed class DuckDbSchemaGeneratorTests
     }
 
     [Fact]
-    public void Generated_EmitsEveryCatalogTable_AndThirtySixIndexes()
+    public void Generated_EmitsEveryCatalogTable_AndThirtyNineIndexes()
     {
-        Assert.Equal(38, DuckDbSchemaGenerator.CreateTableStatements().Count());
+        Assert.Equal(41, DuckDbSchemaGenerator.CreateTableStatements().Count());
 
-        /* 38 collectors minus the two index-less config tables = 36 indexes. */
-        Assert.Equal(36, DuckDbSchemaGenerator.CreateIndexStatements().Count());
+        /* 41 collectors minus the two index-less config tables = 39 indexes (database_states is a
+           time-series collector and gets the default retrieval index). */
+        Assert.Equal(39, DuckDbSchemaGenerator.CreateIndexStatements().Count());
     }
 
     /// <summary>

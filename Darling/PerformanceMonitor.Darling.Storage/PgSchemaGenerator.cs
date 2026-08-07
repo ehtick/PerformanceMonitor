@@ -175,7 +175,8 @@ public static class PgSchemaGenerator
 
     /// <summary>
     /// The collectors whose <c>v_*</c> passthrough views were added AFTER the V8 schema split
-    /// (V10 latch/spinlock, V11 cpu-scheduler/plan-cache, V12 session-summary, V13 system-health),
+    /// (V10 latch/spinlock, V11 cpu-scheduler/plan-cache, V12 session-summary, V13 system-health,
+    /// V47 pvs_stats),
     /// so their views are NOT in <see cref="CollectViews"/> (which lists only the V4–V6 views V8
     /// moves). Referenced as the SAME collector instances the V10–V13 generators emit, so the set
     /// tracks the collector definitions rather than a parallel name list.
@@ -188,6 +189,7 @@ public static class PgSchemaGenerator
         PlanCacheStatsCollector.Instance,
         SessionSummaryStatsCollector.Instance,
         SystemHealthEventsCollector.Instance,
+        PvsStatsCollector.Instance,
     };
 
     /// <summary>
@@ -542,6 +544,26 @@ public static class PgSchemaGenerator
               .Append(" ADD COLUMN IF NOT EXISTS ").Append(dimension.DigestColumn).Append(" bytea;\n");
         }
 
+        /* The resolving view below is generated from the CURRENT collector definition, so it references
+           every payload column the collector has TODAY — including ones whose ALTER migration sits LATER
+           in the ladder (host_object_name lands at V51). A store upgrading from <38 runs this body against
+           its old table, and the view would fail on the first such column. Pre-adding every payload column
+           here (no-op on any store that already has them, same TypeFor the table generator uses) keeps V38
+           self-sufficient from any starting version — permanently, for every future payload column too. */
+        var querySchema = QueryStatsCollector.Instance;
+        foreach (var column in querySchema.PayloadColumns)
+        {
+            sb.Append("ALTER TABLE ").Append(querySchema.TargetTable)
+              .Append(" ADD COLUMN IF NOT EXISTS ").Append(column.Name)
+              .Append(' ').Append(TypeFor(column)).Append(";\n");
+        }
+
+        /* #2069, same reasoning as the payload-column pre-adds above: the generated view now
+           references the plan dim's compressed-content column, whose ALTER migration sits at V54 —
+           pre-add it here so a store upgrading from <38 survives the ladder in order. */
+        sb.Append("ALTER TABLE ").Append(PayloadDimensions.CompressedContentDimTable)
+          .Append(" ADD COLUMN IF NOT EXISTS ").Append(PayloadDimensions.CompressedContentColumn).Append(" bytea;\n");
+
         sb.Append('\n').Append(GenerateQueryStatsResolvingView());
         return sb.ToString();
     }
@@ -604,6 +626,12 @@ public static class PgSchemaGenerator
         {
             columns.Add($"    {Fact}.{dimension.DigestColumn}");
         }
+
+        /* #2069, after the digests (still a legal append-at-end): the gzip-compressed plan content.
+           New rows carry bytes here and NULL query_plan_xml; readers take gz-else-text and inflate
+           in C# — PostgreSQL cannot gunzip in SQL, so the view exposes the bytes rather than
+           pretending to resolve them. */
+        columns.Add($"    {AliasFor(PayloadDimensions.CompressedContentDimTable)}.{PayloadDimensions.CompressedContentColumn}");
 
         sb.Append(string.Join(",\n", columns)).Append('\n');
         sb.Append("FROM ").Append(schema.TargetTable).Append(" AS ").Append(Fact).Append('\n');

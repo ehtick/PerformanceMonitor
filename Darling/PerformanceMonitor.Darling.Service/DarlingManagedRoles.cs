@@ -132,14 +132,15 @@ public static class DarlingManagedRoles
             {
                 "id", "smtp_host", "smtp_port", "smtp_use_ssl", "smtp_from_address", "smtp_recipients",
                 "email_cooldown_minutes", "teams_proxy", "slack_proxy", "modified_at",
-                "generic_body_template", "generic_proxy",
+                "generic_body_template", "generic_proxy", "pagerduty_use_eu_region", "pagerduty_proxy",
             },
             /* generic_headers carries the Authorization bearer token itself, and generic_url is a bearer
-               secret like the sibling webhook URLs (#1506 / V26). */
+               secret like the sibling webhook URLs (#1506 / V26). pagerduty_routing_key is the Events API v2
+               integration key — a bearer secret like the webhook URLs. */
             SecretColumns: new[]
             {
                 "smtp_encrypted_password", "smtp_username", "teams_url", "slack_url",
-                "generic_url", "generic_headers",
+                "generic_url", "generic_headers", "pagerduty_routing_key",
             }),
     };
 
@@ -444,6 +445,9 @@ GRANT CONNECT ON DATABASE {database} TO {mcp};
 --    no sequence USAGE grant.
 GRANT INSERT, UPDATE, DELETE ON {config}.custom_views TO {viewer};
 GRANT INSERT, UPDATE, DELETE ON {config}.custom_views TO {mcp};
+-- The Viewer's per-database database-state override editor (#1986) writes config.database_state_expected:
+-- the same narrow single-table floor as custom_views. Created by V49, so provisioning runs after migration.
+GRANT INSERT, UPDATE, DELETE ON {config}.database_state_expected TO {viewer};
 
 -- 8. Alert tuning (the MCP alert-tuning write tools): the mcp role's alert-config writes, mirroring section 7's
 --    custom_views grant model (EXPLICIT single-table statements, NO ALTER DEFAULT PRIVILEGES). update_alert_settings

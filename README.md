@@ -93,7 +93,7 @@ All editions include real-time alerts (system tray + email + webhooks), charts a
 ## Quick Start — Lite
 
 1. Download **[`PerformanceMonitorLite-win-Setup.exe`](https://github.com/erikdarlingdata/PerformanceMonitor/releases/latest)** (requires [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/en-us/download/dotnet/10.0))
-2. Run the installer — it installs to `%LocalAppData%\PerformanceMonitorLite`, adds **Start Menu** and **Desktop** shortcuts, and registers the app under **Apps & Features** so it shows up in Windows search and can be uninstalled normally. Auto-update is wired in.
+2. Run the installer — it installs to `%LocalAppData%\PerformanceMonitorLite`, adds **Start Menu** and **Desktop** shortcuts, and registers the app under **Apps & Features** so it shows up in Windows search and can be uninstalled normally. Auto-update is wired in. Your data goes in `%LocalAppData%\PerformanceMonitorLite-Data`, a separate folder the installer never touches.
 3. Launch from the Start Menu or Desktop shortcut.
 4. Click **+ Add Server**, enter connection details, test, save.
 5. Double-click the server in the sidebar to connect.
@@ -101,6 +101,8 @@ All editions include real-time alerts (system tray + email + webhooks), charts a
 Data starts flowing within 1–5 minutes. That's it. No installation on your server, no Agent jobs, no sysadmin required.
 
 **Upgrading from zip?** Click **Import Settings** then **Import Data** in the sidebar and point both at your old Lite folder. Settings imports server connections, alert thresholds, SMTP config, and schedules. Data imports historical DuckDB + Parquet archives. **Auto-update users** (installed via Setup.exe) get updates automatically — no manual import needed.
+
+> **Warning — upgrading an install older than the data-relocation fix:** on those versions Lite kept its data *inside* the install directory, and re-running `Setup.exe` over an existing install deletes that directory before the new build ever runs. It takes the DuckDB store, the Parquet archive, the logs, and `settings.json` with it. Upgrade **in place** instead: **Help > About** downloads and applies the update without touching your data, or extract the portable ZIP over your existing copy. From this release on, data lives outside the install directory and is moved there automatically on first start, so `Setup.exe` is safe again. (Your monitored-server list is unaffected either way — it lives in `%ProgramData%\PerformanceMonitorLite\config` — and so are the passwords in Windows Credential Manager.)
 
 **Always On AG?** Enable **ReadOnlyIntent** in the connection settings to route Lite's monitoring queries to a readable secondary, keeping the primary clear. Enable **MultiSubnetFailover** for multi-subnet failover scenarios.
 
@@ -126,7 +128,7 @@ Data starts flowing within 1–5 minutes. That's it. No installation on your ser
 | memory_grant_stats | 1 min | `sys.dm_exec_query_memory_grants` |
 | tempdb_stats | 1 min | `sys.dm_db_file_space_usage` |
 | perfmon_stats | 1 min | `sys.dm_os_performance_counters` (deltas) |
-| deadlocks | 1 min | dedicated `PerformanceMonitor_Deadlock` XE session (`xml_deadlock_report`; `database_xml_deadlock_report` on Azure SQL DB) |
+| deadlocks | 5 min | dedicated `PerformanceMonitor_Deadlock` XE session (`xml_deadlock_report`; `database_xml_deadlock_report` on Azure SQL DB) |
 | dmv_blocking_snapshot | 1 min | `sys.dm_os_waiting_tasks` + `sys.dm_exec_*` (always-on blocking fallback when the blocked-process-report XE is unavailable) |
 | ag_replica_states | 1 min | `sys.dm_hadr_availability_replica_states` + `sys.availability_replicas` (Availability Group replica health; zero rows without AGs, not Azure SQL DB) |
 | ag_database_replica_states | 1 min | `sys.dm_hadr_database_replica_states` (per-database send/redo queues, rates, secondary lag; zero rows without AGs, not Azure SQL DB) |
@@ -135,6 +137,7 @@ Data starts flowing within 1–5 minutes. That's it. No installation on your ser
 | memory_clerks | 5 min | `sys.dm_os_memory_clerks` |
 | memory_pressure_events | 5 min | `sys.dm_os_ring_buffers` RING_BUFFER_RESOURCE_MONITOR |
 | query_store | 5 min | Query Store DMVs (per database) |
+| plan_correction | 5 min | `sys.dm_db_tuning_recommendations` + `sys.database_automatic_tuning_options` (automatic plan correction: FORCE_LAST_GOOD_PLAN enablement plus the engine's live regression recommendations, with the regressed query's text resolved through Query Store) |
 | plan_cache_stats | 5 min | `sys.dm_exec_cached_plans` (single-use vs reused plan-cache bloat) |
 | system_health_events | 5 min | `system_health` XE ring buffer (not Azure SQL DB) |
 | default_trace_events | 5 min | default trace via `sys.fn_trace_gettable` |
@@ -142,6 +145,7 @@ Data starts flowing within 1–5 minutes. That's it. No installation on your ser
 | agent_status | 5 min | `sys.dm_server_services` + `msdb.dbo.sysjobschedules` (not Azure SQL DB / RDS) |
 | running_jobs | 5 min | `msdb` job history with duration vs avg/p95 |
 | database_size_stats | 1 hour | `sys.master_files` + `FILEPROPERTY` + `dm_os_volume_stats` |
+| pvs_stats | 1 hour | `sys.dm_tran_persistent_version_store_stats` + `sys.databases` (ADR persistent version store size and cleanup state per database; SQL Server 2019+ only, always collected on Azure SQL DB) |
 | server_properties | on connect | `SERVERPROPERTY()` hardware and licensing metadata |
 | index_object_stats | Daily | `sys.dm_db_partition_stats` + `sys.dm_db_index_usage_stats` + `sys.dm_db_index_operational_stats` |
 | server_config | On connect | `sys.configurations` |
@@ -153,7 +157,7 @@ Darling runs this same shared collector set across a fleet of servers (latch sta
 
 ### Lite Data Storage
 
-All data is stored in `%LOCALAPPDATA%\PerformanceMonitorLite\` — separate from the executable, so auto-updates don't affect your data.
+All data is stored in `%LOCALAPPDATA%\PerformanceMonitorLite-Data\` — a different folder from the install directory (`%LOCALAPPDATA%\PerformanceMonitorLite\`), so neither an in-app update nor re-running `Setup.exe` can disturb it. Data from an older install is moved into the new folder automatically the first time this version starts.
 
 - **Hot data** in DuckDB 1.5.2 — non-blocking checkpoints, free block reuse, stable file size without periodic resets
 - **Archive** to Parquet with ZSTD compression (~10x reduction) — automatic monthly compaction keeps file count low (~75 files vs thousands)
@@ -165,9 +169,9 @@ All data is stored in `%LOCALAPPDATA%\PerformanceMonitorLite\` — separate from
 | File | Location | Purpose |
 |---|---|---|
 | `servers.json` | `%ProgramData%\PerformanceMonitorLite\config\` (machine-wide) | Server connections, shared across all Windows users on the machine. Passwords stay per-user in Windows Credential Manager. Optional **Utility Database** per server for community procs installed outside master. |
-| `settings.json` | `%LOCALAPPDATA%\PerformanceMonitorLite\config\` (per-user) | Retention, MCP server, startup behavior, alert thresholds, SMTP configuration |
-| `collection_schedule.json` | `%LOCALAPPDATA%\PerformanceMonitorLite\config\` (per-user) | Per-collector enable/disable and frequency |
-| `ignored_wait_types.json` | `%LOCALAPPDATA%\PerformanceMonitorLite\config\` (per-user) | 124 benign wait types excluded by default |
+| `settings.json` | `%LOCALAPPDATA%\PerformanceMonitorLite-Data\config\` (per-user) | Retention, MCP server, startup behavior, alert thresholds, SMTP configuration |
+| `collection_schedule.json` | `%LOCALAPPDATA%\PerformanceMonitorLite-Data\config\` (per-user) | Per-collector enable/disable and frequency |
+| `ignored_wait_types.json` | `%LOCALAPPDATA%\PerformanceMonitorLite-Data\config\` (per-user) | 124 benign wait types excluded by default |
 
 When a second Windows user on the same machine launches Lite, they see the shared `servers.json` immediately. SQL Auth and Entra MFA passwords are scoped to each user's own Credential Manager, so they'll be prompted once per server; Windows Auth works without any prompt.
 
@@ -175,7 +179,7 @@ When a second Windows user on the same machine launches Lite, they see the share
 
 ## Quick Start — Darling (headless)
 
-**Darling** is the always-on edition for teams that want 24/7 collection without a desktop app driving it: a Windows service collects from your servers around the clock into a central PostgreSQL store (TimescaleDB is detected and adopted automatically for compression and chunk-based retention), and a detached WPF viewer reads that store from any seat. It runs the same monitoring brain as Lite — collectors, alert engine, and analysis pipeline shared at the library level — with alerts over email and Teams/Slack webhooks and the same MCP tool surface available on request. An optional built-in read-only **web dashboard** (off by default, its own port 5153) serves the fleet overview, per-server drill-down, and alert history to any browser, so operators can watch the fleet without installing the viewer.
+**Darling** is the always-on edition for teams that want 24/7 collection without a desktop app driving it: a Windows service collects from your servers around the clock into a central PostgreSQL store (TimescaleDB is detected and adopted automatically for compression and chunk-based retention), and a detached WPF viewer reads that store from any seat. It runs the same monitoring brain as Lite — collectors, alert engine, and analysis pipeline shared at the library level — with alerts over email and webhooks (Teams, Slack, PagerDuty, and generic HTTP POST) and the same MCP tool surface available on request. An optional built-in read-only **web dashboard** (off by default, its own port 5153) serves the fleet overview, per-server drill-down, and alert history to any browser, so operators can watch the fleet without installing the viewer.
 
 1. Download **`PerformanceMonitorDarling-<version>.zip`** from the [latest release](https://github.com/erikdarlingdata/PerformanceMonitor/releases/latest) — the signed service and viewer with the bundled PostgreSQL + TimescaleDB runtime beside the service exe, so a from-zero install needs no database provisioning.
 2. Copy `darling.sample.json` to `darling.json` and add your servers (and optional SMTP / webhook delivery). In managed mode the service unpacks and runs its own PostgreSQL — no external database to set up.
@@ -257,9 +261,24 @@ All thresholds are configurable in Settings.
 
 - **System tray** — balloon notifications with a configurable per-metric cooldown (default: 5 minutes)
 - **Email (SMTP)** — styled HTML emails with a configurable per-metric cooldown (default: 15 minutes), plus configurable SMTP settings (server, port, SSL, authentication, recipients)
-- **Webhook** — HTTP POST to a configurable endpoint for integration with external alerting systems (Slack, Teams, PagerDuty, etc.)
+- **Microsoft Teams** — styled card messages with color-coded severity indicators sent to Teams channels via incoming webhooks
+- **Slack** — styled messages with color-coded severity indicators sent to Slack channels via incoming webhooks
+- **PagerDuty** — native Events API v2 integration that triggers PagerDuty incidents with proper severity mapping (critical/error/warning/info) and automatic incident correlation via dedup_key. Supports both US and EU data centers
+- **Generic webhook** — HTTP POST to any configurable endpoint for integration with other alerting systems (Opsgenie, n8n, custom automation, etc.)
 
 All cooldown periods are independently configurable in Settings under the Performance Alerts section.
+
+#### PagerDuty Setup
+
+To receive alerts in PagerDuty:
+
+1. In PagerDuty, create a service and add an **Events API v2** integration
+2. Copy the 32-character **Integration Key** (routing key)
+3. In Performance Monitor Settings, enable PagerDuty notifications and paste the routing key
+4. Check **Use EU data center** if your PagerDuty account is in the EU region
+5. Click **Send Test Notification** to verify the integration
+
+PagerDuty alerts include the metric name, server, current value, threshold, and severity. Repeated alerts for the same incident automatically correlate into a single PagerDuty incident via the dedup_key, preventing alert fatigue.
 
 ### Email Alerts
 
@@ -298,6 +317,8 @@ Lite and Darling query `msdb` directly on each collection cycle; all editions ex
 ## MCP Server (LLM Integration)
 
 Every edition includes an embedded [Model Context Protocol](https://modelcontextprotocol.io) server that exposes monitoring data to LLM clients like Claude Code and Cursor.
+
+The tools answer from the monitor's own collected store, and that is the boundary worth stating up front: **no MCP tool runs SQL an AI client wrote against your monitored servers.** The handful of write-capable tools (Darling's view authoring, alert tuning, and server onboarding) change the monitor's own configuration, and the only live contact with a monitored server — the analysis plan fetch and the onboarding connection probe — runs the product's own fixed, read-only queries under the same least-privilege monitoring login the collectors use.
 
 ### Setup
 
@@ -417,21 +438,55 @@ For a fleet of servers sharing one identity — one managed identity or one serv
 
 ### Lite / Darling (On-Premises)
 
-Nothing is installed on the target server. The login only needs:
+Nothing is installed on the target server. Below is the full least-privilege grant set, verified live against SQL Server 2025 with a scratch login ([#1823](https://github.com/erikdarlingdata/PerformanceMonitor/issues/1823)). **This block is the authoritative copy** — Lite and Darling need the identical grants, so the Darling operator guide points here rather than keeping a second list that can drift out of step:
 
 ```sql
 USE [master];
+
+/* Server-scoped DMVs - the required core. Also implies VIEW DATABASE STATE in every database. */
 GRANT VIEW SERVER STATE TO [YourLogin];
 
--- Optional: for Availability Group health (see the note below - without this
--- the AG collectors return zero rows on a server that HAS availability groups)
+/* Enter every current and future database, with no per-database users to maintain. The
+   per-database collectors (database scoped config, index/object stats, database size,
+   Query Store) skip databases the login cannot enter. */
+GRANT CONNECT ANY DATABASE TO [YourLogin];
+
+/* Catalog visibility. Catalog views enforce permissions by HIDING ROWS, not by erroring:
+   without this, sys.tables / sys.indexes (the index and object collectors) and the AG
+   catalog views return zero rows that look exactly like "no data" (see the AG note below). */
 GRANT VIEW ANY DEFINITION TO [YourLogin];
 
--- Optional: for SQL Agent job monitoring
+/* The deadlock / blocked-process Extended Events sessions. */
+GRANT ALTER ANY EVENT SESSION TO [YourLogin];
+
+/* Optional: the default-trace collector reads sys.traces, which requires ALTER TRACE -
+   VIEW SERVER STATE does not cover it. Note ALTER TRACE is not read-only (it also permits
+   creating and altering traces, and implies SHOWPLAN in every database); withhold it and
+   the collector records a PERMISSIONS skip instead. */
+GRANT ALTER TRACE TO [YourLogin];
+
+/* Optional: lets the app bootstrap 'blocked process threshold (s)' to 5 when it is still 0.
+   sp_configure + RECONFIGURE require ALTER SETTINGS; without it the bootstrap is logged and
+   skipped, blocked process reports stay empty, and you set the threshold yourself (or via an
+   RDS Parameter Group). Blocking stays visible either way through the DMV blocking snapshot. */
+GRANT ALTER SETTINGS TO [YourLogin];
+
+/* Optional: SQL Agent job monitoring + failed-job alerts. Direct table grants, deliberately
+   NOT SQLAgentReaderRole: that role gates the sp_help_job* procedures, which this product
+   never calls, and grants NO SELECT on the tables the collectors actually read - with only
+   the role, every Agent collector fails with error 229. */
 USE [msdb];
 CREATE USER [YourLogin] FOR LOGIN [YourLogin];
-ALTER ROLE [SQLAgentReaderRole] ADD MEMBER [YourLogin];
+GRANT SELECT ON dbo.sysjobs         TO [YourLogin];
+GRANT SELECT ON dbo.sysjobactivity  TO [YourLogin];
+GRANT SELECT ON dbo.sysjobhistory   TO [YourLogin];
+GRANT SELECT ON dbo.sysjobschedules TO [YourLogin];
+GRANT SELECT ON dbo.syscategories   TO [YourLogin];
+GRANT SELECT ON dbo.syssessions     TO [YourLogin];
+GRANT EXECUTE ON dbo.agent_datetime TO [YourLogin];
 ```
+
+Two operational notes. The msdb grants live inside a system database that SQL Server setup can rewrite — re-check them after a CU or version upgrade. And if a security review rejects `CONNECT ANY DATABASE`, the documented fallback is a real user per database (the same shape as the [FinOps loop below](#finops-index-analysis-per-database-grants), minus the `sql_expression_dependencies` grant) — at the cost of not covering databases created later.
 
 **Availability Groups need a second grant.** The `ag_replica_states` / `ag_database_replica_states` collectors read the AG *catalog views* (`sys.availability_groups`, `sys.availability_replicas`) alongside the `sys.dm_hadr_*` DMVs. The DMVs are covered by `VIEW SERVER STATE`, but [the catalog views require `VIEW ANY DEFINITION`](https://learn.microsoft.com/en-us/sql/database-engine/availability-groups/windows/monitor-availability-groups-transact-sql) — and catalog views enforce that by *hiding rows*, not by raising an error. So on a real AG cluster a login with only `VIEW SERVER STATE` gets zero rows, which looks exactly like a server with no availability groups. If your AG dashboards are empty, this grant is why.
 
@@ -439,7 +494,7 @@ Darling uses the same target-server grants; its bundled PostgreSQL store and ser
 
 ### FinOps Index Analysis (per-database grants)
 
-Applies to **all editions**. The FinOps Index Analysis tab runs `sp_IndexCleanup` against each user database you ask it to inspect, executing as your app login. The grants above (`VIEW SERVER STATE`, plus optional `SQLAgentReaderRole` on `msdb`) are *not* sufficient on their own — the login also needs a user mapping in every user database it will analyze, plus `VIEW DATABASE STATE`, `VIEW DEFINITION`, and `SELECT` on `sys.sql_expression_dependencies` in each.
+Applies to **all editions**. The FinOps Index Analysis tab runs `sp_IndexCleanup` against each user database you ask it to inspect, executing as your app login. The server-level grants above (`VIEW SERVER STATE` and friends) are *not* sufficient on their own — the login also needs a user mapping in every user database it will analyze, plus `VIEW DATABASE STATE`, `VIEW DEFINITION`, and `SELECT` on `sys.sql_expression_dependencies` in each.
 
 The third grant is the easy one to miss: by default only members of `db_owner` have `SELECT` on `sys.sql_expression_dependencies`, and `VIEW DEFINITION` does not include it. `sp_IndexCleanup` queries that catalog view (via three-part name to the target database) when checking for computed columns and check constraints that reference UDFs, so the failure only surfaces on databases that actually have those — which is why a smoke-test database may pass and a real workload database fails with `Msg 229`.
 
@@ -483,6 +538,7 @@ Azure SQL Database doesn't support server-level logins. Create a **contained dat
 -- Connect to your target database (not master)
 CREATE USER [SQLServerPerfMon] WITH PASSWORD = 'YourStrongPassword';
 GRANT VIEW DATABASE STATE TO [SQLServerPerfMon];
+GRANT VIEW DEFINITION     TO [SQLServerPerfMon];
 ```
 
 For [Managed Identity or Service Principal](#authentication) authentication, create the contained user from the identity's display name instead of a password — an Azure AD admin must already be configured on the logical server:
@@ -491,11 +547,12 @@ For [Managed Identity or Service Principal](#authentication) authentication, cre
 -- Connect to your target database (not master)
 CREATE USER [your-managed-identity-or-app-registration-name] FROM EXTERNAL PROVIDER;
 GRANT VIEW DATABASE STATE TO [your-managed-identity-or-app-registration-name];
+GRANT VIEW DEFINITION     TO [your-managed-identity-or-app-registration-name];
 ```
 
 For a large fleet, grant an Entra **group** instead of provisioning each identity individually where your architecture allows it. SQL Agent and msdb are not available on Azure SQL Database — those collectors are skipped automatically.
 
-> `VIEW DATABASE STATE` is what lets the `sys.dm_os_*` DMVs return server hardware inventory (CPU count, physical memory, socket and core topology) and memory metrics on each monitored database. If the contained user lacks it, edition, version, and storage still resolve from permission-free scalars, so the FinOps **Server Inventory** grid keeps the server's row and shows a non-alarming "Hardware Note" that hardware inventory is unavailable, instead of dropping the entire row (#1535).
+> `VIEW DEFINITION` is the database-scoped form of the catalog-visibility grant explained above: without it, `sys.tables` / `sys.indexes` return zero rows to the index and object collectors — silently, not as an error. `VIEW DATABASE STATE` is what lets the `sys.dm_os_*` DMVs return server hardware inventory (CPU count, physical memory, socket and core topology) and memory metrics on each monitored database. If the contained user lacks it, edition, version, and storage still resolve from permission-free scalars, so the FinOps **Server Inventory** grid keeps the server's row and shows a non-alarming "Hardware Note" that hardware inventory is unavailable, instead of dropping the entire row (#1535).
 
 ### Azure SQL Managed Instance
 

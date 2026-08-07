@@ -371,6 +371,8 @@ public partial class MainWindow
             }
 
             await _dataService.InsertMuteRuleAsync(ViewerDataService.BuildServerSilenceRule(server.DisplayName));
+            /* #2031: flip the sidebar's muted-bell immediately — the poll would catch up anyway. */
+            server.SetSilenced(true);
             StatusText.Text = $"Silenced all alerts for '{server.DisplayName}'. Right-click → Unsilence to restore.";
         }
         catch (ViewerReadOnlyException ex)
@@ -418,6 +420,8 @@ public partial class MainWindow
                 await _dataService.DeleteMuteRuleAsync(rule.Id);
             }
 
+            /* #2031: flip the sidebar's muted-bell immediately — the poll would catch up anyway. */
+            server.SetSilenced(false);
             StatusText.Text = $"Unsilenced '{server.DisplayName}'.";
         }
         catch (ViewerReadOnlyException ex)
@@ -432,6 +436,36 @@ public partial class MainWindow
         {
             ViewerLogger.Error("ServerManagement", "Failed to unsilence the server", ex);
             StatusText.Text = $"Could not unsilence the server: {ex.Message}";
+        }
+    }
+
+    /// <summary>
+    /// Refreshes every server's whole-server-silence indicator (#2031) from the store's mute rules — the
+    /// sidebar muted-bell and the context menu's Silence/Unsilence exclusivity both read the resulting
+    /// <see cref="DarlingServer.IsSilenced"/> flag. Rides the alert poll (the same cadence as the badge), over
+    /// the WHOLE fleet like the badge does, so a silence created from another seat (or over MCP) surfaces here
+    /// within a poll tick. Never throws — a broken read must not disturb the refresh loop.
+    /// </summary>
+    private async Task UpdateServerSilencedAsync()
+    {
+        if (_dataService is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var rules = await _dataService.GetMuteRulesAsync();
+            var active = rules.Where(r => r.Enabled && !r.IsExpired).ToList();
+
+            foreach (var server in _fleet.All)
+            {
+                server.SetSilenced(active.Any(r => ViewerDataService.IsWholeServerSilence(r, server.DisplayName)));
+            }
+        }
+        catch (Exception ex)
+        {
+            ViewerLogger.Warn("ServerManagement", $"Silenced-state refresh failed: {ex.Message}");
         }
     }
 
@@ -682,6 +716,7 @@ public partial class MainWindow
         {
             SidebarColumn.Width = new GridLength(40);
             SidebarHeaderText.Visibility = Visibility.Collapsed;
+            ServerSearchRow.Visibility = Visibility.Collapsed;
             ServerList.Visibility = Visibility.Collapsed;
             SidebarFooter.Visibility = Visibility.Collapsed;
             ServersHintText.Visibility = Visibility.Collapsed;
@@ -691,6 +726,7 @@ public partial class MainWindow
         {
             SidebarColumn.Width = new GridLength(280);
             SidebarHeaderText.Visibility = Visibility.Visible;
+            ServerSearchRow.Visibility = Visibility.Visible;
             ServerList.Visibility = Visibility.Visible;
             SidebarFooter.Visibility = Visibility.Visible;
             ServersHintText.Visibility = ServerList.Items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;

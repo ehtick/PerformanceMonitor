@@ -117,7 +117,7 @@ public partial class ProcedureHistoryWindow : Window
         var xs = _historyData.Select(r => r.CollectionTime.AddMinutes(Services.ServerTimeHelper.UtcOffsetMinutes).ToOADate()).ToArray();
         var ys = _historyData.Select(r => GetMetricValue(r, tag)).ToArray();
 
-        var scatter = HistoryChart.Plot.Add.Scatter(xs, ys);
+        var scatter = HistoryChart.Plot.Add.TimeSeries(xs, ys);
         scatter.Color = ScottPlot.Color.FromHex(ChartPalette.SeriesColor("MetricTrend"));
         ChartStyle.StyleScatter(scatter);
         scatter.LegendText = label;
@@ -130,7 +130,9 @@ public partial class ProcedureHistoryWindow : Window
         _chartHover.Clear();
         _chartHover.Add(scatter, label);
 
-        HistoryChart.Plot.Axes.DateTimeTicksBottom();
+        /* #1831: the DateChange variant routes labels through the shared formatter, which converts
+           for the display mode — plain DateTimeTicksBottom() rendered raw server time. */
+        HistoryChart.Plot.Axes.DateTimeTicksBottomDateChange();
         ApplyTheme(HistoryChart);
 
         HistoryChart.Refresh();
